@@ -1,93 +1,136 @@
-use bevy::input::mouse::AccumulatedMouseScroll;
+use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
-use std::f32::consts::PI;
+use std::f32::consts::{PI, TAU};
 use std::ops::Range;
+
+/// Translation settings
+const TRANSLATION_SENSITIVITY: f32 = 0.12;
+const PAN_SENSITIVITY: f32 = 0.02;
+const TRANSLATION_TRACKING_DECAY_RATE: f32 = 4.;
+
+/// Rotation settings
+const ORBIT_SENSITIVITY: f32 = 0.4 * (PI / 180.0);
+const ROTATION_TRACKING_DECAY_RATE: f32 = 8.;
+const PITCH_RANGE: Range<f32> = 20.0 * (PI / 180.0)..89.0 * (PI / 180.0);
+
+/// Zoom settings
+const ZOOM_RANGE: Range<f32> = 4. ..40.;
+const ZOOM_SENSITIVITY: f32 = 0.01;
+const SCROLL_LINE_SENSITIVITY: f32 = 4.;
+const SCROLL_PIXEL_SENSITIVITY: f32 = 0.5;
+const ZOOM_TRACKING_DECAY_RATE: f32 = 12.;
+
+/// Camera controls
+const ORBIT_KEY: KeyCode = KeyCode::ShiftLeft;
+const ZOOM_KEY: KeyCode = KeyCode::ControlLeft;
 
 pub struct CameraPlugin;
 
-#[derive(Debug, Resource)]
-struct CameraSettings {
-    pub zoom_range: Range<f32>,
-    pub zoom_speed: f32,
-    pub translation_speed: f32,
-    pub rotation_speed: f32,
-    pub orbit_speed: f32,
-    pub pan_speed: f32,
-}
-
-impl CameraSettings {
-    fn default() -> Self {
-        Self {
-            zoom_range: (PI / 5.)..(PI - 0.2),
-            zoom_speed: 0.25,
-            translation_speed: 5.0,
-            rotation_speed: 2.0,
-            orbit_speed: 2.0,
-            pan_speed: 1.6,
-        }
-    }
+#[derive(States, Debug, Clone, PartialEq, Eq, Hash)]
+enum CameraAction {
+    Translate,
+    Pan,
+    Orbit,
+    Zoom,
 }
 
 #[derive(Component)]
 #[require(Transform, InheritedVisibility)]
-struct CameraTarget;
+struct PanOrbitCamera {
+    target: Vec3,
+    radius: f32,
+    pitch: f32,
+    yaw: f32,
+}
+
+fn not_panning(state: Res<State<CameraAction>>) -> bool {
+    *state != CameraAction::Pan
+}
 
 impl Plugin for CameraPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(CameraSettings::default())
-            .add_systems(Startup, setup)
-            .add_systems(
-                Update,
-                (
-                    camera_translation,
-                    camera_zoom,
-                    camera_rotation,
-                    camera_pan,
-                    camera_orbit,
-                ),
-            );
+        app.insert_state(CameraAction::Translate)
+            .add_systems(Startup, spawn_camera)
+            .add_systems(Update, (action_input, scroll_zoom))
+            .add_systems(FixedUpdate, translate.run_if(not_panning))
+            .add_systems(FixedUpdate, pan.run_if(in_state(CameraAction::Pan)))
+            .add_systems(FixedUpdate, orbit.run_if(in_state(CameraAction::Orbit)))
+            .add_systems(FixedUpdate, zoom.run_if(in_state(CameraAction::Zoom)))
+            .add_systems(PostUpdate, smooth_tracking);
     }
 }
 
-fn setup(
-    camera_settings: Res<CameraSettings>,
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    // Spawn camera with orthographic projection
+fn spawn_camera(mut commands: Commands) {
     commands
         .spawn((
-            Name::new("CameraTarget"),
-            CameraTarget {},
-            Transform::from_xyz(0.0, 0.0, 0.0),
+            Name::new("PanOrbitCamera"),
+            PanOrbitCamera {
+                target: Vec3::ZERO,
+                radius: 5.0,
+                pitch: 25.0f32.to_radians(),
+                yaw: 30.0f32.to_radians(),
+            },
         ))
         .with_children(|parent| {
-            parent.spawn((
-                Name::new("Camera"),
-                Camera3d::default(),
-                Projection::from(PerspectiveProjection {
-                    fov: camera_settings.zoom_range.start,
-                    ..default()
-                }),
-                Transform::from_xyz(5.0, 6.0, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
-            ));
-            // Indicator for the camera target
-            parent.spawn((
-                Mesh3d(meshes.add(Sphere::new(0.1))),
-                MeshMaterial3d(materials.add(Color::srgb(0.8, 0.3, 0.2))),
-                Transform::from_xyz(0.0, 0.0, 0.0),
-            ));
+            parent.spawn((Name::new("Camera"), Camera3d::default()));
         });
 }
 
-fn camera_translation(
-    mut target_query: Query<&mut Transform, With<CameraTarget>>,
-    camera_query: Query<&GlobalTransform, With<Camera>>,
-    camera_settings: Res<CameraSettings>,
+fn action_input(
+    input: Res<ButtonInput<KeyCode>>,
+    mouse_input: Res<ButtonInput<MouseButton>>,
+    mut next_state: ResMut<NextState<CameraAction>>,
+) {
+    if mouse_input.pressed(MouseButton::Left) {
+        if input.pressed(ORBIT_KEY) {
+            next_state.set(CameraAction::Orbit);
+        } else if input.pressed(ZOOM_KEY) {
+            next_state.set(CameraAction::Zoom);
+        } else {
+            next_state.set(CameraAction::Pan);
+        }
+    } else {
+        next_state.set(CameraAction::Translate);
+    }
+}
+
+fn smooth_tracking(
+    mut controller_query: Query<(&mut Transform, &PanOrbitCamera), With<PanOrbitCamera>>,
+    mut camera_query: Query<&mut Transform, (With<Camera>, Without<PanOrbitCamera>)>,
     time: Res<Time>,
+) {
+    for (mut root_transform, controller) in &mut controller_query {
+        let mut camera_transform = camera_query.single_mut();
+        let target_rotation =
+            Quat::from_euler(EulerRot::YXZ, controller.yaw, -controller.pitch, 0.0);
+
+        camera_transform.rotation.smooth_nudge(
+            &target_rotation,
+            ROTATION_TRACKING_DECAY_RATE,
+            time.delta_secs(),
+        );
+        let mut smooth_radius = camera_transform.translation.length();
+        smooth_radius.smooth_nudge(
+            &controller.radius,
+            ZOOM_TRACKING_DECAY_RATE,
+            time.delta_secs(),
+        );
+        camera_transform.translation = Vec3::ZERO + camera_transform.back() * smooth_radius;
+        root_transform.translation.smooth_nudge(
+            &controller.target,
+            TRANSLATION_TRACKING_DECAY_RATE,
+            time.delta_secs(),
+        );
+    }
+}
+
+fn translate(
+    mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
+    camera_q: Query<&GlobalTransform, (With<Camera>, Without<PanOrbitCamera>)>,
     input: Res<ButtonInput<KeyCode>>,
 ) {
+    // TODO: Ray-casting is still a better approach
+    let mut controller = controller_q.single_mut();
     let mut direction = Vec3::ZERO;
     if input.pressed(KeyCode::KeyW) {
         direction -= Vec3::Z;
@@ -102,120 +145,80 @@ fn camera_translation(
         direction += Vec3::X;
     }
 
-    let camera_global_transform = camera_query.single();
-    let mut world_translation = camera_global_transform.rotation() * direction;
+    let camera_transform = camera_q.single();
+    let mut world_translation = camera_transform.rotation() * direction;
     // Remove the vertical component of the direction vector
     world_translation.y = 0.0;
-    target_query.single_mut().translation +=
-        world_translation * time.delta_secs() * camera_settings.translation_speed;
+    controller.target += world_translation.normalize_or_zero() * TRANSLATION_SENSITIVITY;
 }
 
-fn camera_rotation(
-    mut query: Query<&mut Transform, With<CameraTarget>>,
-    time: Res<Time>,
-    input: Res<ButtonInput<KeyCode>>,
-    camera_settings: Res<CameraSettings>,
+fn pan(
+    mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
+    camera_q: Query<&GlobalTransform, (With<Camera>, Without<PanOrbitCamera>)>,
+    mut mouse_motion: EventReader<MouseMotion>,
 ) {
-    let rotation = time.delta_secs() * camera_settings.rotation_speed;
-    if input.pressed(KeyCode::KeyQ) {
-        query.single_mut().rotate_y(-rotation);
+    let total_motion: Vec2 = mouse_motion.read().map(|motion| motion.delta).sum();
+    let translation_vector = Vec3::new(total_motion.x, 0.0, total_motion.y);
+    let camera_transform = camera_q.single();
+    let mut world_translation = camera_transform.rotation() * translation_vector;
+    world_translation.y = 0.0;
+
+    let mut controller = controller_q.single_mut();
+    controller.target -= world_translation * PAN_SENSITIVITY;
+}
+
+fn orbit(
+    mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
+    mut mouse_motion: EventReader<MouseMotion>,
+) {
+    let mut total_motion: Vec2 = mouse_motion.read().map(|motion| motion.delta).sum();
+    total_motion.y = -total_motion.y;
+
+    let orbit = -total_motion * ORBIT_SENSITIVITY;
+    let mut controller = controller_q.single_mut();
+    controller.yaw += orbit.x;
+    controller.pitch += orbit.y;
+    controller.pitch = controller.pitch.clamp(PITCH_RANGE.start, PITCH_RANGE.end);
+    // wrap around, to stay between +- 180 degrees
+    if controller.yaw > PI {
+        controller.yaw -= TAU;
     }
-    if input.pressed(KeyCode::KeyE) {
-        query.single_mut().rotate_y(rotation);
+    if controller.yaw < -PI {
+        controller.yaw += TAU;
+    }
+    if controller.pitch > PI {
+        controller.pitch -= TAU;
+    }
+    if controller.pitch < -PI {
+        controller.pitch += TAU;
     }
 }
 
-fn camera_zoom(
-    mut camera_query: Query<&mut Transform, (With<Camera>, Without<CameraTarget>)>,
-    camera_settings: Res<CameraSettings>,
-    mouse_wheel_input: Res<AccumulatedMouseScroll>,
+fn scroll_zoom(
+    mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
+    mut evr_scroll: EventReader<MouseWheel>,
 ) {
-    let delta_zoom = -mouse_wheel_input.delta.y * camera_settings.zoom_speed;
-    let mut camera_transform = camera_query.single_mut();
-    let direction = -camera_transform.translation.normalize_or_zero();
-    // TODO - Clamp the zoom range based on the distance from the target?
-    camera_transform.translation += direction * delta_zoom;
-}
-
-fn camera_pan(
-    mut target_query: Query<&mut Transform, With<CameraTarget>>,
-    camera_query: Query<&GlobalTransform, With<Camera>>,
-    mut last_mouse_position: Local<Option<Vec2>>,
-    camera_settings: Res<CameraSettings>,
-    mouse_input: Res<ButtonInput<MouseButton>>,
-    key_input: Res<ButtonInput<KeyCode>>,
-    window: Single<&Window>,
-    time: Res<Time>,
-) {
-    // TODO - Refactor to use ray-casting or something similar
-    if let Some(cursor_position) = window.cursor_position() {
-        if mouse_input.pressed(MouseButton::Left) && !key_input.pressed(KeyCode::ControlLeft) {
-            if let Some(last_position) = *last_mouse_position {
-                let delta = cursor_position - last_position;
-                let camera_global_transform = camera_query.single();
-                let right = camera_global_transform.right();
-                let forward = -camera_global_transform.forward();
-                let world_delta = (right * delta.x + forward * delta.y)
-                    * camera_settings.pan_speed
-                    * time.delta_secs();
-                let mut transform = target_query.single_mut();
-                transform.translation -= world_delta;
-                transform.translation.y = 0.0;
-            }
-
-            *last_mouse_position = Some(cursor_position);
-        } else {
-            *last_mouse_position = None;
+    let mut zoom = 0.;
+    for ev in evr_scroll.read() {
+        zoom -= ev.y;
+        match ev.unit {
+            MouseScrollUnit::Line => zoom *= SCROLL_LINE_SENSITIVITY * ZOOM_SENSITIVITY,
+            MouseScrollUnit::Pixel => zoom *= SCROLL_PIXEL_SENSITIVITY * ZOOM_SENSITIVITY,
         }
     }
+
+    let mut controller = controller_q.single_mut();
+    controller.radius *= (-zoom).exp();
+    controller.radius = controller.radius.clamp(ZOOM_RANGE.start, ZOOM_RANGE.end);
 }
 
-fn camera_orbit(
-    target_query: Query<&Transform, With<CameraTarget>>,
-    mut camera_query: Query<&mut Transform, (With<Camera>, Without<CameraTarget>)>,
-    mut last_mouse_position: Local<Option<Vec2>>,
-    camera_settings: Res<CameraSettings>,
-    mouse_input: Res<ButtonInput<MouseButton>>,
-    key_input: Res<ButtonInput<KeyCode>>,
-    window: Single<&Window>,
-    time: Res<Time>,
+fn zoom(
+    mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
+    mut mouse_motion: EventReader<MouseMotion>,
 ) {
-    // TODO - Some issues on top-down view
-    if let Some(cursor_position) = window.cursor_position() {
-        if mouse_input.pressed(MouseButton::Left) && key_input.pressed(KeyCode::ControlLeft) {
-            if let Some(last_position) = *last_mouse_position {
-                let delta = cursor_position - last_position;
-                let target_transform = target_query.single();
-                let mut camera_transform = camera_query.single_mut();
+    let total_motion: Vec2 = mouse_motion.read().map(|motion| motion.delta).sum();
 
-                let yaw = -delta.x * camera_settings.orbit_speed * time.delta_secs();
-                let pitch = delta.y * camera_settings.orbit_speed * time.delta_secs();
-
-                let target_position = target_transform.translation;
-
-                // Translate camera to origin for rotation
-                let offset = camera_transform.translation - target_position;
-
-                // Apply yaw (rotation around Y-axis in world space)
-                let yaw_rotation = Quat::from_rotation_y(yaw);
-
-                // Apply pitch (rotation around the camera's local X-axis)
-                let right = offset.normalize().cross(Vec3::Y).normalize(); // Camera's right vector
-                let pitch_rotation = Quat::from_axis_angle(right, pitch);
-
-                // Combine rotations and apply to the offset
-                let rotated_offset = yaw_rotation * pitch_rotation * offset;
-
-                // Update the camera's position
-                camera_transform.translation = target_position + rotated_offset;
-
-                // Make the camera look at the target
-                camera_transform.look_at(target_position, Vec3::Y);
-            }
-
-            *last_mouse_position = Some(cursor_position);
-        } else {
-            *last_mouse_position = None;
-        }
-    }
+    let mut controller = controller_q.single_mut();
+    controller.radius *= (total_motion.y * ZOOM_SENSITIVITY).exp();
+    controller.radius = controller.radius.clamp(ZOOM_RANGE.start, ZOOM_RANGE.end);
 }
