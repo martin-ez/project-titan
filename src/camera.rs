@@ -3,29 +3,38 @@ use bevy::prelude::*;
 use std::f32::consts::{PI, TAU};
 use std::ops::Range;
 
-/// Translation settings
+/// Speed of the camera when translating with WASD
 const TRANSLATION_SENSITIVITY: f32 = 0.12;
-const PAN_SENSITIVITY: f32 = 0.02;
-const TRANSLATION_TRACKING_DECAY_RATE: f32 = 4.;
-
-/// Rotation settings
+/// How much the speed of the camera increases when zooming out
+const TRANSLATION_ZOOM_MULTIPLIER: f32 = 0.04;
+/// Smoothing factor for the camera translation
+const TRANSLATION_SMOOTHING: f32 = 4.;
+/// Damping factor for the panning inertia
+const PAN_INERTIA_DAMPING: f32 = 0.08;
+/// Radians per pixel of mouse motion
 const ORBIT_SENSITIVITY: f32 = 0.4 * (PI / 180.0);
-const ROTATION_TRACKING_DECAY_RATE: f32 = 8.;
+/// Smoothing factor for the camera rotation
+const ROTATION_SMOOTHING: f32 = 8.;
+/// Minimum and maximum pitch allowed for the camera
 const PITCH_RANGE: Range<f32> = 20.0 * (PI / 180.0)..89.0 * (PI / 180.0);
-
-/// Zoom settings
-const ZOOM_RANGE: Range<f32> = 4. ..40.;
+/// Exponent per pixel of mouse motion
 const ZOOM_SENSITIVITY: f32 = 0.01;
+/// Minimum and maximum radius allowed for the camera
+const ZOOM_RADIUS_RANGE: Range<f32> = 4. ..40.;
+/// For devices with a notched scroll wheel
 const SCROLL_LINE_SENSITIVITY: f32 = 4.;
+/// For devices with smooth scrolling (e.g. touchpad)
 const SCROLL_PIXEL_SENSITIVITY: f32 = 0.5;
-const ZOOM_TRACKING_DECAY_RATE: f32 = 12.;
-
-/// Camera controls
+/// Smoothing factor for the camera zoom
+const ZOOM_SMOOTHING: f32 = 12.;
+/// Key binding for orbiting the camera
 const ORBIT_KEY: KeyCode = KeyCode::ShiftLeft;
+/// Key binding for orbiting the camera
 const ZOOM_KEY: KeyCode = KeyCode::ControlLeft;
 
 pub struct CameraPlugin;
 
+/// The action the camera is currently performing, based on the player's input
 #[derive(States, Debug, Clone, PartialEq, Eq, Hash)]
 enum CameraAction {
     Translate,
@@ -34,6 +43,7 @@ enum CameraAction {
     Zoom,
 }
 
+/// Internal state for the camera, use to construct its transform
 #[derive(Component)]
 #[require(Transform, InheritedVisibility)]
 struct PanOrbitCamera {
@@ -51,11 +61,10 @@ impl Plugin for CameraPlugin {
     fn build(&self, app: &mut App) {
         app.insert_state(CameraAction::Translate)
             .add_systems(Startup, spawn_camera)
-            .add_systems(Update, (action_input, scroll_zoom))
+            .add_systems(Update, (update_action, scroll_zoom, pan))
             .add_systems(FixedUpdate, translate.run_if(not_panning))
-            .add_systems(FixedUpdate, pan.run_if(in_state(CameraAction::Pan)))
             .add_systems(FixedUpdate, orbit.run_if(in_state(CameraAction::Orbit)))
-            .add_systems(FixedUpdate, zoom.run_if(in_state(CameraAction::Zoom)))
+            .add_systems(FixedUpdate, mouse_zoom.run_if(in_state(CameraAction::Zoom)))
             .add_systems(PostUpdate, smooth_tracking);
     }
 }
@@ -66,7 +75,7 @@ fn spawn_camera(mut commands: Commands) {
             Name::new("PanOrbitCamera"),
             PanOrbitCamera {
                 target: Vec3::ZERO,
-                radius: 5.0,
+                radius: 8.0,
                 pitch: 25.0f32.to_radians(),
                 yaw: 30.0f32.to_radians(),
             },
@@ -76,7 +85,8 @@ fn spawn_camera(mut commands: Commands) {
         });
 }
 
-fn action_input(
+/// Update the camera action based on the player's input
+fn update_action(
     input: Res<ButtonInput<KeyCode>>,
     mouse_input: Res<ButtonInput<MouseButton>>,
     mut next_state: ResMut<NextState<CameraAction>>,
@@ -94,6 +104,7 @@ fn action_input(
     }
 }
 
+/// Smoothly update the camera's position and rotation based on the internal state.
 fn smooth_tracking(
     mut controller_query: Query<(&mut Transform, &PanOrbitCamera), With<PanOrbitCamera>>,
     mut camera_query: Query<&mut Transform, (With<Camera>, Without<PanOrbitCamera>)>,
@@ -106,30 +117,26 @@ fn smooth_tracking(
 
         camera_transform.rotation.smooth_nudge(
             &target_rotation,
-            ROTATION_TRACKING_DECAY_RATE,
+            ROTATION_SMOOTHING,
             time.delta_secs(),
         );
         let mut smooth_radius = camera_transform.translation.length();
-        smooth_radius.smooth_nudge(
-            &controller.radius,
-            ZOOM_TRACKING_DECAY_RATE,
-            time.delta_secs(),
-        );
+        smooth_radius.smooth_nudge(&controller.radius, ZOOM_SMOOTHING, time.delta_secs());
         camera_transform.translation = Vec3::ZERO + camera_transform.back() * smooth_radius;
         root_transform.translation.smooth_nudge(
             &controller.target,
-            TRANSLATION_TRACKING_DECAY_RATE,
+            TRANSLATION_SMOOTHING,
             time.delta_secs(),
         );
     }
 }
 
+/// Translate the camera using the WASD keys
 fn translate(
     mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
     camera_q: Query<&GlobalTransform, (With<Camera>, Without<PanOrbitCamera>)>,
     input: Res<ButtonInput<KeyCode>>,
 ) {
-    // TODO: Ray-casting is still a better approach
     let mut controller = controller_q.single_mut();
     let mut direction = Vec3::ZERO;
     if input.pressed(KeyCode::KeyW) {
@@ -149,24 +156,78 @@ fn translate(
     let mut world_translation = camera_transform.rotation() * direction;
     // Remove the vertical component of the direction vector
     world_translation.y = 0.0;
-    controller.target += world_translation.normalize_or_zero() * TRANSLATION_SENSITIVITY;
+    let zoom_multiplier = (controller.radius * TRANSLATION_ZOOM_MULTIPLIER).exp();
+    controller.target +=
+        world_translation.normalize_or_zero() * TRANSLATION_SENSITIVITY * zoom_multiplier;
 }
 
+/// Pan the camera based on the mouse motion
+///
+/// This works by calculating the point at the intersection of the cursor ray and the ground plane,
+/// ensuring that point remains under the cursor as long as the user is holding the mouse button.
 fn pan(
-    mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
-    camera_q: Query<&GlobalTransform, (With<Camera>, Without<PanOrbitCamera>)>,
-    mut mouse_motion: EventReader<MouseMotion>,
+    mut controller_q: Query<(&mut PanOrbitCamera, &mut Transform), With<PanOrbitCamera>>,
+    camera: Single<(&Camera, &GlobalTransform)>,
+    window: Single<&Window>,
+    mut selected_point: Local<Option<Vec3>>,
+    mut inertia: Local<Option<Vec3>>,
+    action: Res<State<CameraAction>>,
+    time: Res<Time>,
 ) {
-    let total_motion: Vec2 = mouse_motion.read().map(|motion| motion.delta).sum();
-    let translation_vector = Vec3::new(total_motion.x, 0.0, total_motion.y);
-    let camera_transform = camera_q.single();
-    let mut world_translation = camera_transform.rotation() * translation_vector;
-    world_translation.y = 0.0;
+    let (camera, camera_transform) = *camera;
+    for (mut controller, mut transform) in &mut controller_q {
+        match action.get() {
+            CameraAction::Pan => {
+                if let Some(point) = cursor_ground_intersection(*window, camera, camera_transform) {
+                    if let Some(last_point) = *selected_point {
+                        let delta = last_point - point;
+                        controller.target += delta;
+                        transform.translation += delta;
+                        *inertia = Some(delta / time.delta_secs());
+                    } else {
+                        *selected_point = Some(point);
+                        *inertia = None;
+                    }
+                } else {
+                    *selected_point = None;
+                    *inertia = None;
+                }
+            }
+            CameraAction::Translate => {
+                // Move target based on the inertia
+                if let Some(inertia) = *inertia {
+                    controller.target += inertia * PAN_INERTIA_DAMPING;
+                }
 
-    let mut controller = controller_q.single_mut();
-    controller.target -= world_translation * PAN_SENSITIVITY;
+                *selected_point = None;
+                *inertia = None;
+            }
+            _ => {
+                *selected_point = None;
+                *inertia = None;
+            }
+        }
+    }
 }
 
+/// Calculate the intersection with the ground plane of the ray originating from the camera and
+/// passing through the cursor
+// TODO: We should modify this to track terrain and game objects instead
+fn cursor_ground_intersection(
+    window: &Window,
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+) -> Option<Vec3> {
+    window
+        .cursor_position()
+        .and_then(|cursor| camera.viewport_to_world(camera_transform, cursor).ok())
+        .and_then(|ray| {
+            ray.intersect_plane(Vec3::ZERO, InfinitePlane3d::default())
+                .map(|distance| ray.get_point(distance))
+        })
+}
+
+/// Orbit the camera around the target based on the mouse motion
 fn orbit(
     mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
     mut mouse_motion: EventReader<MouseMotion>,
@@ -194,6 +255,7 @@ fn orbit(
     }
 }
 
+/// Zoom the camera based on the scroll wheel or trackpad input
 fn scroll_zoom(
     mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
     mut evr_scroll: EventReader<MouseWheel>,
@@ -209,10 +271,13 @@ fn scroll_zoom(
 
     let mut controller = controller_q.single_mut();
     controller.radius *= (-zoom).exp();
-    controller.radius = controller.radius.clamp(ZOOM_RANGE.start, ZOOM_RANGE.end);
+    controller.radius = controller
+        .radius
+        .clamp(ZOOM_RADIUS_RANGE.start, ZOOM_RADIUS_RANGE.end);
 }
 
-fn zoom(
+/// Zoom the camera based on the mouse motion
+fn mouse_zoom(
     mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
     mut mouse_motion: EventReader<MouseMotion>,
 ) {
@@ -220,5 +285,7 @@ fn zoom(
 
     let mut controller = controller_q.single_mut();
     controller.radius *= (total_motion.y * ZOOM_SENSITIVITY).exp();
-    controller.radius = controller.radius.clamp(ZOOM_RANGE.start, ZOOM_RANGE.end);
+    controller.radius = controller
+        .radius
+        .clamp(ZOOM_RADIUS_RANGE.start, ZOOM_RADIUS_RANGE.end);
 }
