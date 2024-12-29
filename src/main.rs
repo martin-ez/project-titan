@@ -1,9 +1,46 @@
 use bevy::prelude::*;
+mod camera;
 
 fn main() {
-    App::new().add_systems(Startup, hello_world).run();
+    App::new()
+        .add_plugins(DefaultPlugins)
+        .add_plugins(camera::CameraPlugin)
+        .add_systems(Startup, setup_test_scene)
+        .run();
 }
 
-fn hello_world() {
-    println!("Hello, world!");
+fn setup_test_scene(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    // light
+    commands.spawn((
+        PointLight {
+            shadows_enabled: true,
+            ..default()
+        },
+        Transform::from_xyz(4.0, 8.0, 4.0),
+    ));
+    // plane
+    commands.spawn((
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(5.0, 5.0))),
+        MeshMaterial3d(materials.add(Color::srgb(0.3, 0.5, 0.3))),
+    ));
+    // cubes
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::default())),
+        MeshMaterial3d(materials.add(Color::srgb(0.8, 0.7, 0.6))),
+        Transform::from_xyz(1.5, 0.5, 1.5),
+    ));
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::default())),
+        MeshMaterial3d(materials.add(Color::srgb(0.8, 0.7, 0.6))),
+        Transform::from_xyz(1.5, 0.5, -1.5),
+    ));
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::default())),
+        MeshMaterial3d(materials.add(Color::srgb(0.8, 0.7, 0.6))),
+        Transform::from_xyz(-1.5, 0.5, 1.5),
+    ));
 }
