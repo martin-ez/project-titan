@@ -4,7 +4,7 @@ use std::f32::consts::FRAC_PI_2;
 const MAP_GRID_SIZE: i16 = 12;
 const MAP_GRID_GAP: f32 = 0.2;
 const MAP_TILE_SIZE: f32 = 10.;
-const MAP_TILE_WIDTH: f32 = MAP_TILE_SIZE / 2. * 1.73205080757; // sqrt(3)
+const MAP_TILE_WIDTH: f32 = MAP_TILE_SIZE / 2. * 1.732_050_8; // sqrt(3)
 const MAP_TILE_DEPTH: f32 = 0.25;
 
 pub struct MapPlugin;
