@@ -19,8 +19,8 @@ struct MapTile {
 }
 
 #[derive(SystemParam)]
-struct MapTileInitializeSystemParams<'w, 's> {
-    transform_q: Query<'w, 's, &'static mut Transform, With<MapTile>>,
+struct MapTileInitializeParams<'w, 's> {
+    query: Query<'w, 's, (&'static mut Transform, &'static mut Visibility), With<MapTile>>,
     commands: Commands<'w, 's>,
     meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
@@ -30,8 +30,21 @@ impl Plugin for MapPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, setup).add_systems(
             PreUpdate,
-            initialize_system::<MapTile, MapTileInitializeSystemParams>,
+            initialize_system::<MapTile, MapTileInitializeParams>,
         );
+    }
+}
+
+fn setup(mut commands: Commands) {
+    for x in -MAP_GRID_SIZE / 2..MAP_GRID_SIZE / 2 {
+        for y in -MAP_GRID_SIZE / 2..MAP_GRID_SIZE / 2 {
+            commands.spawn((
+                MapTile {
+                    coordinates: Vec2::new(x as f32, y as f32),
+                },
+                Visibility::Hidden,
+            ));
+        }
     }
 }
 
@@ -51,10 +64,14 @@ impl MapTile {
     }
 }
 
-impl Initialize<MapTileInitializeSystemParams<'_, '_>> for MapTile {
-    fn initialize(&mut self, entity: &Entity, params: &mut MapTileInitializeSystemParams) {
-        let mut transform = params.transform_q.get_mut(*entity).unwrap();
+impl Initialize<MapTileInitializeParams<'_, '_>> for MapTile {
+    fn initialize(&mut self, entity: &Entity, params: &mut MapTileInitializeParams) {
+        // Set the transform to the correct position
+        let (mut transform, mut visibility) = params.query.get_mut(*entity).unwrap();
         transform.translation = self.world_position();
+        *visibility = Visibility::Visible;
+
+        // Spawn the mesh
         params.commands.entity(*entity).with_children(|parent| {
             parent.spawn((
                 Mesh3d(
@@ -72,15 +89,5 @@ impl Initialize<MapTileInitializeSystemParams<'_, '_>> for MapTile {
                     )),
             ));
         });
-    }
-}
-
-fn setup(mut commands: Commands) {
-    for x in -MAP_GRID_SIZE / 2..MAP_GRID_SIZE / 2 {
-        for y in -MAP_GRID_SIZE / 2..MAP_GRID_SIZE / 2 {
-            commands.spawn(MapTile {
-                coordinates: Vec2::new(x as f32, y as f32),
-            });
-        }
     }
 }
