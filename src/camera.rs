@@ -1,3 +1,4 @@
+use crate::input::{CameraMovement, PlayerInput};
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use std::f32::consts::{PI, TAU};
@@ -27,21 +28,8 @@ const SCROLL_LINE_SENSITIVITY: f32 = 4.;
 const SCROLL_PIXEL_SENSITIVITY: f32 = 0.5;
 /// Smoothing factor for the camera zoom
 const ZOOM_SMOOTHING: f32 = 12.;
-/// Key binding for orbiting the camera
-const ORBIT_KEY: KeyCode = KeyCode::ShiftLeft;
-/// Key binding for orbiting the camera
-const ZOOM_KEY: KeyCode = KeyCode::ControlLeft;
 
 pub struct CameraPlugin;
-
-/// The action the camera is currently performing, based on the player's input
-#[derive(States, Debug, Clone, PartialEq, Eq, Hash)]
-enum CameraAction {
-    Translate,
-    Pan,
-    Orbit,
-    Zoom,
-}
 
 /// Internal state for the camera, use to construct its transform
 #[derive(Component)]
@@ -53,18 +41,22 @@ struct PanOrbitCamera {
     yaw: f32,
 }
 
-fn not_panning(state: Res<State<CameraAction>>) -> bool {
-    *state != CameraAction::Pan
+fn not_panning(state: Res<State<CameraMovement>>) -> bool {
+    *state != CameraMovement::Pan
 }
 
 impl Plugin for CameraPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_state(CameraAction::Translate)
-            .add_systems(Startup, spawn_camera)
-            .add_systems(Update, (update_action, scroll_zoom, pan))
-            .add_systems(FixedUpdate, translate.run_if(not_panning))
-            .add_systems(FixedUpdate, orbit.run_if(in_state(CameraAction::Orbit)))
-            .add_systems(FixedUpdate, mouse_zoom.run_if(in_state(CameraAction::Zoom)))
+        app.add_systems(Startup, spawn_camera)
+            .add_systems(Update, (scroll_zoom, pan))
+            .add_systems(
+                FixedUpdate,
+                (
+                    translate.run_if(not_panning),
+                    orbit.run_if(in_state(CameraMovement::Orbit)),
+                    mouse_zoom.run_if(in_state(CameraMovement::Zoom)),
+                ),
+            )
             .add_systems(PostUpdate, smooth_tracking);
     }
 }
@@ -83,25 +75,6 @@ fn spawn_camera(mut commands: Commands) {
         .with_children(|parent| {
             parent.spawn((Name::new("Camera"), Camera3d::default()));
         });
-}
-
-/// Update the camera action based on the player's input
-fn update_action(
-    input: Res<ButtonInput<KeyCode>>,
-    mouse_input: Res<ButtonInput<MouseButton>>,
-    mut next_state: ResMut<NextState<CameraAction>>,
-) {
-    if mouse_input.pressed(MouseButton::Left) {
-        if input.pressed(ORBIT_KEY) {
-            next_state.set(CameraAction::Orbit);
-        } else if input.pressed(ZOOM_KEY) {
-            next_state.set(CameraAction::Zoom);
-        } else {
-            next_state.set(CameraAction::Pan);
-        }
-    } else {
-        next_state.set(CameraAction::Translate);
-    }
 }
 
 /// Smoothly update the camera's position and rotation based on the internal state.
@@ -134,31 +107,11 @@ fn smooth_tracking(
 /// Translate the camera using the WASD keys
 fn translate(
     mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
-    camera_q: Query<&GlobalTransform, (With<Camera>, Without<PanOrbitCamera>)>,
-    input: Res<ButtonInput<KeyCode>>,
+    player_input: Res<PlayerInput>,
 ) {
     let mut controller = controller_q.single_mut();
-    let mut direction = Vec3::ZERO;
-    if input.pressed(KeyCode::KeyW) {
-        direction -= Vec3::Z;
-    }
-    if input.pressed(KeyCode::KeyS) {
-        direction += Vec3::Z;
-    }
-    if input.pressed(KeyCode::KeyA) {
-        direction -= Vec3::X;
-    }
-    if input.pressed(KeyCode::KeyD) {
-        direction += Vec3::X;
-    }
-
-    let camera_transform = camera_q.single();
-    let mut world_translation = camera_transform.rotation() * direction;
-    // Remove the vertical component of the direction vector
-    world_translation.y = 0.0;
     let zoom_multiplier = (controller.radius * TRANSLATION_ZOOM_MULTIPLIER).exp();
-    controller.target +=
-        world_translation.normalize_or_zero() * TRANSLATION_SENSITIVITY * zoom_multiplier;
+    controller.target += player_input.movement_vector * TRANSLATION_SENSITIVITY * zoom_multiplier;
 }
 
 /// Pan the camera based on the mouse motion
@@ -167,18 +120,16 @@ fn translate(
 /// ensuring that point remains under the cursor as long as the user is holding the mouse button.
 fn pan(
     mut controller_q: Query<(&mut PanOrbitCamera, &mut Transform), With<PanOrbitCamera>>,
-    camera: Single<(&Camera, &GlobalTransform)>,
-    window: Single<&Window>,
     mut selected_point: Local<Option<Vec3>>,
     mut inertia: Local<Option<Vec3>>,
-    action: Res<State<CameraAction>>,
+    player_input: Res<PlayerInput>,
+    action: Res<State<CameraMovement>>,
     time: Res<Time>,
 ) {
-    let (camera, camera_transform) = *camera;
     for (mut controller, mut transform) in &mut controller_q {
         match action.get() {
-            CameraAction::Pan => {
-                if let Some(point) = cursor_ground_intersection(*window, camera, camera_transform) {
+            CameraMovement::Pan => {
+                if let Some(point) = player_input.world_cursor_position {
                     if let Some(last_point) = *selected_point {
                         let delta = last_point - point;
                         controller.target += delta;
@@ -193,7 +144,7 @@ fn pan(
                     *inertia = None;
                 }
             }
-            CameraAction::Translate => {
+            CameraMovement::Translate => {
                 // Move target based on the inertia
                 if let Some(inertia) = *inertia {
                     controller.target += inertia * PAN_INERTIA_DAMPING;
@@ -208,23 +159,6 @@ fn pan(
             }
         }
     }
-}
-
-/// Calculate the intersection with the ground plane of the ray originating from the camera and
-/// passing through the cursor
-// TODO: We should modify this to track terrain and game objects instead
-fn cursor_ground_intersection(
-    window: &Window,
-    camera: &Camera,
-    camera_transform: &GlobalTransform,
-) -> Option<Vec3> {
-    window
-        .cursor_position()
-        .and_then(|cursor| camera.viewport_to_world(camera_transform, cursor).ok())
-        .and_then(|ray| {
-            ray.intersect_plane(Vec3::ZERO, InfinitePlane3d::default())
-                .map(|distance| ray.get_point(distance))
-        })
 }
 
 /// Orbit the camera around the target based on the mouse motion
