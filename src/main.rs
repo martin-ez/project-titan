@@ -3,6 +3,7 @@ mod camera;
 mod common;
 mod input;
 mod map;
+mod traffic;
 
 fn main() {
     App::new()
@@ -11,6 +12,7 @@ fn main() {
         .add_plugins(common::CommonPlugin)
         .add_plugins(input::PlayerInputPlugin)
         .add_plugins(map::MapPlugin)
+        .add_plugins(traffic::TrafficPlugin)
         .add_systems(Startup, setup_test_scene)
         .run();
 }
