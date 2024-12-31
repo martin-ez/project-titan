@@ -20,7 +20,7 @@ const PITCH_RANGE: Range<f32> = 20.0 * (PI / 180.0)..89.0 * (PI / 180.0);
 /// Exponent per pixel of mouse motion
 const ZOOM_SENSITIVITY: f32 = 0.01;
 /// Minimum and maximum radius allowed for the camera
-const ZOOM_RADIUS_RANGE: Range<f32> = 4. ..40.;
+const ZOOM_RADIUS_RANGE: Range<f32> = 8. ..100.;
 /// For devices with a notched scroll wheel
 const SCROLL_LINE_SENSITIVITY: f32 = 4.;
 /// For devices with smooth scrolling (e.g. touchpad)
@@ -75,9 +75,9 @@ fn spawn_camera(mut commands: Commands) {
             Name::new("PanOrbitCamera"),
             PanOrbitCamera {
                 target: Vec3::ZERO,
-                radius: 8.0,
-                pitch: 25.0f32.to_radians(),
-                yaw: 30.0f32.to_radians(),
+                radius: 20.0,
+                pitch: 30.0f32.to_radians(),
+                yaw: -90.0f32.to_radians(),
             },
         ))
         .with_children(|parent| {

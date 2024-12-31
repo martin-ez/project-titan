@@ -1,10 +1,12 @@
 use bevy::prelude::*;
 mod camera;
+mod map;
 
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(camera::CameraPlugin)
+        .add_plugins(map::MapPlugin)
         .add_systems(Startup, setup_test_scene)
         .run();
 }
@@ -21,11 +23,6 @@ fn setup_test_scene(
             ..default()
         },
         Transform::from_xyz(4.0, 8.0, 4.0),
-    ));
-    // plane
-    commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(5.0, 5.0))),
-        MeshMaterial3d(materials.add(Color::srgb(0.3, 0.5, 0.3))),
     ));
     // cubes
     commands.spawn((
