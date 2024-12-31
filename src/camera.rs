@@ -1,8 +1,8 @@
+use crate::input::{CameraMovement, PlayerInput};
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use std::f32::consts::{PI, TAU};
 use std::ops::Range;
-use crate::input::{CameraMovement, PlayerInput};
 
 /// Speed of the camera when translating with WASD
 const TRANSLATION_SENSITIVITY: f32 = 0.12;
@@ -49,9 +49,14 @@ impl Plugin for CameraPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, spawn_camera)
             .add_systems(Update, (scroll_zoom, pan))
-            .add_systems(FixedUpdate, translate.run_if(not_panning))
-            .add_systems(FixedUpdate, orbit.run_if(in_state(CameraMovement::Orbit)))
-            .add_systems(FixedUpdate, mouse_zoom.run_if(in_state(CameraMovement::Zoom)))
+            .add_systems(
+                FixedUpdate,
+                (
+                    translate.run_if(not_panning),
+                    orbit.run_if(in_state(CameraMovement::Orbit)),
+                    mouse_zoom.run_if(in_state(CameraMovement::Zoom)),
+                ),
+            )
             .add_systems(PostUpdate, smooth_tracking);
     }
 }
