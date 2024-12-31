@@ -41,10 +41,6 @@ struct PanOrbitCamera {
     yaw: f32,
 }
 
-fn not_panning(state: Res<State<CameraMovement>>) -> bool {
-    *state != CameraMovement::Pan
-}
-
 impl Plugin for CameraPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, spawn_camera)
@@ -52,7 +48,7 @@ impl Plugin for CameraPlugin {
             .add_systems(
                 FixedUpdate,
                 (
-                    translate.run_if(not_panning),
+                    translate.run_if(not(in_state(CameraMovement::Pan))),
                     orbit.run_if(in_state(CameraMovement::Orbit)),
                     mouse_zoom.run_if(in_state(CameraMovement::Zoom)),
                 ),

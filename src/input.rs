@@ -2,8 +2,7 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
 /// Key binding for panning the camera
-/// TODO: We probably want to pan with a key instead of a mouse button
-// const CAMERA_PAN_KEY: KeyCode = KeyCode::Space;
+const CAMERA_PAN_KEY: KeyCode = KeyCode::Space;
 /// Key binding for orbiting the camera
 const CAMERA_ORBIT_KEY: KeyCode = KeyCode::ShiftLeft;
 /// Key binding for orbiting the camera
@@ -39,8 +38,8 @@ pub struct PlayerInput {
     pub tap: bool,
 }
 
-impl PlayerInput {
-    pub fn default() -> Self {
+impl Default for PlayerInput {
+    fn default() -> Self {
         Self {
             world_cursor_position: None,
             movement_vector: Vec3::ZERO,
@@ -91,14 +90,12 @@ fn update_camera_movement_type(
     mouse_input: Res<ButtonInput<MouseButton>>,
     mut next_state: ResMut<NextState<CameraMovement>>,
 ) {
-    if mouse_input.pressed(MouseButton::Left) {
-        if input.pressed(CAMERA_ORBIT_KEY) {
-            next_state.set(CameraMovement::Orbit);
-        } else if input.pressed(CAMERA_ZOOM_KEY) {
-            next_state.set(CameraMovement::Zoom);
-        } else {
-            next_state.set(CameraMovement::Pan);
-        }
+    if input.pressed(CAMERA_ORBIT_KEY) {
+        next_state.set(CameraMovement::Orbit);
+    } else if input.pressed(CAMERA_ZOOM_KEY) {
+        next_state.set(CameraMovement::Zoom);
+    } else if input.pressed(CAMERA_PAN_KEY) || mouse_input.pressed(MouseButton::Middle) {
+        next_state.set(CameraMovement::Pan);
     } else {
         next_state.set(CameraMovement::Translate);
     }
