@@ -1,11 +1,13 @@
 use bevy::prelude::*;
 mod camera;
+mod input;
 mod map;
 
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(camera::CameraPlugin)
+        .add_plugins(input::PlayerInputPlugin)
         .add_plugins(map::MapPlugin)
         .add_systems(Startup, setup_test_scene)
         .run();
