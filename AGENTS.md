@@ -21,10 +21,16 @@ is ready to pick up is in the issue tracker, not here.
 ## Commands
 
 ```sh
-cargo run                 # play what is there
+cargo run --features dev  # play what is there, linking Bevy dynamically
 cargo test                # while you work
 scripts/gate.sh           # before you push
 ```
+
+`dev` is the fast iteration loop and nothing else: it ships Bevy as a shared
+library, so a build relinks in a fraction of the time. Nothing sits behind it
+but that, which is why the gate and CI never enable it — a second lint pass
+over a different linking strategy checks no code, and costs a full dylib link
+to find that out. A release build must not need `libbevy_dylib` beside it.
 
 The gate is every check CI can fail a pull request on, in the configuration CI
 uses: formatting, clippy over all targets, `cargo doc` and the tests under
