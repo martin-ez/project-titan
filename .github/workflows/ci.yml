@@ -18,6 +18,34 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# What a pull request costs here is the dependency cache missing, not this
+# crate compiling: on an exact cache hit the test job finishes in under a
+# minute, and on a partial one it spends twelve to twenty-two minutes building
+# Bevy again. So everything below is aimed at the cache hitting rather than at
+# running less.
+#
+# `cache-on-failure` is the first half of that. It defaults off, which makes a
+# broken build self-sustaining — the run fails, saves nothing, and the next one
+# starts cold and fails the same way. That is what kept the Linux jobs cold for
+# every run after the Bevy 0.19 upgrade landed without libwayland-dev.
+#
+# Cache size is the second half, and it is spent in Cargo.toml rather than
+# here: the debug info Bevy carries is most of what gets stored, and a
+# repository only gets 10 GiB of Actions cache before entries start evicting
+# each other.
+#
+# Levers weighed and not taken, so the next person does not re-weigh them:
+# dropping macos-latest from pull requests buys nothing, because a warm macOS
+# job is under a minute and the second platform is coverage rather than cost;
+# lowering opt-level for dependencies under test would stop `cargo run` and
+# `cargo test` sharing artifacts and so compile Bevy twice on a developer's
+# machine to save CI time the cache already saves; one build shared between the
+# checks and test jobs is not available, because clippy and rustc write
+# different fingerprints, which is why the checks job lints rather than checks;
+# and restricting the cache save to main — the usual answer to the 10 GiB
+# budget — would save nothing at all while this concurrency group still
+# cancels main's own runs.
+
 jobs:
   checks:
     name: static checks
@@ -33,12 +61,10 @@ jobs:
         uses: ./.github/actions/rust-changed
       - if: ${{ steps.changed.outputs.rust != 'false' }}
         uses: Swatinem/rust-cache@v2
-      # Bevy's Linux backend links against ALSA for audio and udev for gamepad
-      # enumeration, and both are resolved through pkg-config from build
-      # scripts, which run even under `cargo check`. The macOS runner uses
-      # CoreAudio and needs nothing installed.
+        with:
+          cache-on-failure: true
       - if: ${{ steps.changed.outputs.rust != 'false' }}
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+        uses: ./.github/actions/linux-build-deps
       # These share a job because each is a second or two of work behind the
       # cache restore and apt. `!cancelled()` keeps every check reporting after
       # an earlier one fails, so one run still says what separate jobs did.
@@ -89,10 +115,10 @@ jobs:
         uses: ./.github/actions/rust-changed
       - if: ${{ steps.changed.outputs.rust != 'false' }}
         uses: Swatinem/rust-cache@v2
-      # Bevy's Linux backend links against ALSA and udev. The macOS runner uses
-      # CoreAudio and needs nothing installed.
+        with:
+          cache-on-failure: true
       - if: ${{ runner.os == 'Linux' && steps.changed.outputs.rust != 'false' }}
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+        uses: ./.github/actions/linux-build-deps
       # The tests build a headless App, so no display is needed on either
       # runner: a test that requires a window is a test of the windowing
       # system rather than of this game.
