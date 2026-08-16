@@ -44,6 +44,14 @@ concurrency:
 # upgrade. A macOS regression is therefore caught by the gate rather than here,
 # and the dependency rule in AGENTS.md is checked by whoever adds one.
 #
+# Job count is the other half of the bill, and it is why the house style
+# checks sit inside the static checks job rather than in one of their own.
+# Actions rounds every job up to a whole minute, so a run costs at least as
+# many minutes as it starts jobs however fast each one is: six seconds of shell
+# in its own job bills the same minute as sixty. A private repository on the
+# free plan gets two thousand minutes a month, and at ten pull requests a day
+# that budget is spent on job count long before it is spent on compute.
+#
 # Levers weighed and not taken, so the next person does not re-weigh them:
 # lowering opt-level for dependencies under test would stop `cargo run` and
 # `cargo test` sharing artifacts and so compile Bevy twice on a developer's
@@ -65,6 +73,18 @@ jobs:
       # Every job runs on every push, and the ones below skip their own steps.
       # Gating the job instead would stop it reporting, and a required check
       # that never reports blocks a pull request rather than passing it.
+      # AGENTS.md rules that rustc and clippy cannot express: no inline
+      # comments, doc comment budgets, no TODO markers, no prose outside the
+      # code beyond a folder README and the design under docs/, no
+      # documentation of unbuilt features.
+      - run: scripts/check-style.sh
+      # The body check and the gate have no game to be tested through an App,
+      # so they carry their cases with them, and those run wherever the scripts
+      # can change.
+      - if: ${{ !cancelled() }}
+        run: scripts/check-pr-body.sh --selftest
+      - if: ${{ !cancelled() }}
+        run: scripts/gate.sh --selftest
       - id: changed
         uses: ./.github/actions/rust-changed
       - if: ${{ steps.changed.outputs.rust != 'false' }}
@@ -89,24 +109,6 @@ jobs:
       # the test job, where plain `cargo test` covers doctests.
       - if: ${{ !cancelled() && steps.changed.outputs.rust != 'false' }}
         run: cargo doc --no-deps
-
-  style:
-    name: house style
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # AGENTS.md rules that rustc and clippy cannot express: no inline
-      # comments, doc comment budgets, no TODO markers, no prose outside the
-      # code beyond a folder README and the design under docs/, no
-      # documentation of unbuilt features.
-      - run: scripts/check-style.sh
-      # The body check and the gate have no game to be tested through an App,
-      # so they carry their cases with them, and those run wherever the scripts
-      # can change.
-      - if: ${{ !cancelled() }}
-        run: scripts/check-pr-body.sh --selftest
-      - if: ${{ !cancelled() }}
-        run: scripts/gate.sh --selftest
 
   test:
     name: test
