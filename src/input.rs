@@ -11,7 +11,6 @@ const CAMERA_ZOOM_KEY: KeyCode = KeyCode::ControlLeft;
 pub struct PlayerInputPlugin;
 
 /// The current desired action of the player, controlled by the UI or keyboard shortcuts
-// TODO: Allow to change this via UI
 #[derive(States, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PlayerAction {
     Select,
@@ -72,14 +71,12 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut window_q: Query<&mut Window, With<PrimaryWindow>>,
 ) {
-    // Spawn indicator for the player's cursor, hidden by default
     commands.spawn((
         EditingTargetIndicator {},
         Visibility::Hidden,
         Mesh3d(meshes.add(Sphere::new(0.1))),
         MeshMaterial3d(materials.add(Color::srgb(0.1, 0.2, 0.9))),
     ));
-    // Hide the cursor
     let mut primary_window = window_q.single_mut();
     primary_window.cursor_options.visible = false;
 }
@@ -134,16 +131,16 @@ fn get_movement_vector(
         direction += Vec3::X;
     }
 
-    let mut world_translation = camera_transform.rotation() * direction;
-    // Remove the vertical component of the direction vector
-    world_translation.y = 0.0;
-    world_translation.normalize_or_zero()
+    ground_plane_direction(camera_transform.rotation() * direction)
+}
+
+/// Flatten a direction onto the ground plane, as a unit vector or nothing.
+fn ground_plane_direction(direction: Vec3) -> Vec3 {
+    Vec3::new(direction.x, 0.0, direction.z).normalize_or_zero()
 }
 
 /// Calculate the intersection with the ground plane of the ray originating from the camera and
 /// passing through the cursor
-// TODO: We should modify this to track terrain and game objects instead
-// TODO: We need a snapping functionality so it is easier to edit buildings and roads
 fn get_world_cursor_position(
     window: Single<&Window>,
     camera: &Camera,
@@ -168,5 +165,22 @@ fn update_indicator(
         *visibility = Visibility::Visible;
     } else {
         *visibility = Visibility::Hidden;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tilted_direction_flattens_onto_the_ground_plane() {
+        let flattened = ground_plane_direction(Vec3::new(1.0, 4.0, 0.0));
+        assert_eq!(flattened.y, 0.0);
+        assert_eq!(flattened, Vec3::X);
+    }
+
+    #[test]
+    fn a_direction_straight_up_flattens_to_nothing() {
+        assert_eq!(ground_plane_direction(Vec3::Y), Vec3::ZERO);
     }
 }

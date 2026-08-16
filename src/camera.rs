@@ -141,7 +141,6 @@ fn pan(
                 }
             }
             CameraMovement::Translate => {
-                // Move target based on the inertia
                 if let Some(inertia) = *inertia {
                     controller.target += inertia * PAN_INERTIA_DAMPING;
                 }
@@ -170,18 +169,18 @@ fn orbit(
     controller.yaw += orbit.x;
     controller.pitch += orbit.y;
     controller.pitch = controller.pitch.clamp(PITCH_RANGE.start, PITCH_RANGE.end);
-    // wrap around, to stay between +- 180 degrees
-    if controller.yaw > PI {
-        controller.yaw -= TAU;
-    }
-    if controller.yaw < -PI {
-        controller.yaw += TAU;
-    }
-    if controller.pitch > PI {
-        controller.pitch -= TAU;
-    }
-    if controller.pitch < -PI {
-        controller.pitch += TAU;
+    controller.yaw = wrap_to_half_turn(controller.yaw);
+    controller.pitch = wrap_to_half_turn(controller.pitch);
+}
+
+/// Bring an angle back inside a half turn either side of zero.
+fn wrap_to_half_turn(angle: f32) -> f32 {
+    if angle > PI {
+        angle - TAU
+    } else if angle < -PI {
+        angle + TAU
+    } else {
+        angle
     }
 }
 
@@ -218,4 +217,24 @@ fn mouse_zoom(
     controller.radius = controller
         .radius
         .clamp(ZOOM_RADIUS_RANGE.start, ZOOM_RADIUS_RANGE.end);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_angle_past_half_a_turn_wraps_below_it() {
+        assert!((wrap_to_half_turn(PI + 0.5) - (-PI + 0.5)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn an_angle_below_minus_half_a_turn_wraps_above_it() {
+        assert!((wrap_to_half_turn(-PI - 0.5) - (PI - 0.5)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn an_angle_inside_the_range_is_left_alone() {
+        assert_eq!(wrap_to_half_turn(1.0), 1.0);
+    }
 }

@@ -20,7 +20,6 @@ fn setup_test_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // light
     commands.spawn((
         PointLight {
             shadows_enabled: true,
@@ -28,7 +27,6 @@ fn setup_test_scene(
         },
         Transform::from_xyz(4.0, 8.0, 4.0),
     ));
-    // cubes
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::default())),
         MeshMaterial3d(materials.add(Color::srgb(0.8, 0.7, 0.6))),
