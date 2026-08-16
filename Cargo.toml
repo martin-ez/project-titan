@@ -7,7 +7,7 @@ edition = "2021"
 dev = ["bevy/dynamic_linking"]
 
 [dependencies]
-bevy = { version = "0.19.1" }
+bevy = { version = "0.19.1", features = ["bevy_dev_tools"] }
 log = { version = "*", features = ["max_level_debug", "release_max_level_warn"] }
 
 [profile.dev]
