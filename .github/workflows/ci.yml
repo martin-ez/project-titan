@@ -49,12 +49,12 @@ jobs:
       # fingerprints. --all-targets reaches the tests, which are where most of
       # this crate's code is exercised.
       - if: ${{ !cancelled() && steps.changed.outputs.rust != 'false' }}
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --all-targets
       # Undocumented public items fail via missing_docs; broken intra-doc links
       # fail via RUSTDOCFLAGS. The examples themselves are compiled and run by
       # the test job, where plain `cargo test` covers doctests on both hosts.
       - if: ${{ !cancelled() && steps.changed.outputs.rust != 'false' }}
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --no-deps
 
   style:
     name: house style
@@ -97,4 +97,4 @@ jobs:
       # runner: a test that requires a window is a test of the windowing
       # system rather than of this game.
       - if: ${{ steps.changed.outputs.rust != 'false' }}
-        run: cargo test --all-features
+        run: cargo test

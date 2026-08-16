@@ -3,8 +3,11 @@ name = "titan"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+dev = ["bevy/dynamic_linking"]
+
 [dependencies]
-bevy = { version = "0.15.0", features = ["dynamic_linking"] }
+bevy = { version = "0.15.0" }
 log = { version = "*", features = ["max_level_debug", "release_max_level_warn"] }
 
 [profile.dev]

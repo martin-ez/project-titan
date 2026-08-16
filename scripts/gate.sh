@@ -284,17 +284,17 @@ selftest() {
 	st_is 0 "$rc" "a clean gate exits 0"
 	st_has "$out" "every check CI can fail" "a clean gate says the whole gate passed"
 
-	two="clippy${TAB}cargo clippy --all-targets --all-features
-documentation${TAB}cargo doc --no-deps --all-features"
+	two="clippy${TAB}cargo clippy --all-targets
+documentation${TAB}cargo doc --no-deps"
 	rc=0
 	out="$(summarise "$two")" || rc=$?
 	st_is 1 "$rc" "a failure exits 1"
 	st_has "$out" "2 checks failed" "the summary counts them"
 	st_has "$out" "clippy" "the summary names the first failure"
 	st_has "$out" "documentation" "the summary names the second"
-	st_has "$out" "cargo clippy --all-targets --all-features" \
+	st_has "$out" "cargo clippy --all-targets" \
 		"each failure carries its command"
-	st_has "$out" "cargo doc --no-deps --all-features" \
+	st_has "$out" "cargo doc --no-deps" \
 		"the command is the one that reproduces it"
 	st_hasnt "$out" "passed" "a gate with a failure never says passed"
 
@@ -338,14 +338,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - run: cargo test --all-features
+      - run: cargo test
       - run: |
           git diff origin/main...HEAD > /tmp/pr.diff
           cargo bench --all-features
 EOF
 
 	out="$(ci_commands "$workflow")"
-	st_has "$out" "cargo test --all-features" "a one-line run: step is a command"
+	st_has "$out" "cargo test" "a one-line run: step is a command"
 	st_has "$out" "cargo bench --all-features" \
 		"a cargo line after the first of a run: block is one too"
 	st_hasnt "$out" "actions/checkout" "a uses: step is not a command"
@@ -397,8 +397,8 @@ run_check "house style" "" scripts/check-style.sh
 run_check "pull request body rules" "" scripts/check-pr-body.sh --selftest
 run_check "no co-authored commits" "git log --format='%B' origin/main..HEAD" no_coauthors
 run_check "formatting" "cargo fmt --all" cargo fmt --all -- --check
-run_check "clippy" "" cargo clippy --all-targets --all-features
-run_check "documentation" "" cargo doc --no-deps --all-features
-run_check "tests" "" cargo test --all-features
+run_check "clippy" "" cargo clippy --all-targets
+run_check "documentation" "" cargo doc --no-deps
+run_check "tests" "" cargo test
 
 summarise "$failures"
