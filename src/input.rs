@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
+use bevy::window::{CursorOptions, PrimaryWindow};
 
 /// Key binding for panning the camera
 const CAMERA_PAN_KEY: KeyCode = KeyCode::Space;
@@ -69,32 +69,38 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut window_q: Query<&mut Window, With<PrimaryWindow>>,
-) {
+    mut cursor_q: Query<&mut CursorOptions, With<PrimaryWindow>>,
+) -> Result {
     commands.spawn((
         EditingTargetIndicator {},
         Visibility::Hidden,
         Mesh3d(meshes.add(Sphere::new(0.1))),
         MeshMaterial3d(materials.add(Color::srgb(0.1, 0.2, 0.9))),
     ));
-    let mut primary_window = window_q.single_mut();
-    primary_window.cursor_options.visible = false;
+    let mut cursor_options = cursor_q.single_mut()?;
+    cursor_options.visible = false;
+    Ok(())
 }
 
 /// Update the camera movement type based on the player's input
 fn update_camera_movement_type(
     input: Res<ButtonInput<KeyCode>>,
     mouse_input: Res<ButtonInput<MouseButton>>,
+    current_state: Res<State<CameraMovement>>,
     mut next_state: ResMut<NextState<CameraMovement>>,
 ) {
-    if input.pressed(CAMERA_ORBIT_KEY) {
-        next_state.set(CameraMovement::Orbit);
+    let wanted = if input.pressed(CAMERA_ORBIT_KEY) {
+        CameraMovement::Orbit
     } else if input.pressed(CAMERA_ZOOM_KEY) {
-        next_state.set(CameraMovement::Zoom);
+        CameraMovement::Zoom
     } else if input.pressed(CAMERA_PAN_KEY) || mouse_input.pressed(MouseButton::Middle) {
-        next_state.set(CameraMovement::Pan);
+        CameraMovement::Pan
     } else {
-        next_state.set(CameraMovement::Translate);
+        CameraMovement::Translate
+    };
+
+    if *current_state.get() != wanted {
+        next_state.set(wanted);
     }
 }
 
@@ -104,12 +110,13 @@ fn update_player_input(
     mouse_input: Res<ButtonInput<MouseButton>>,
     window: Single<&Window>,
     camera: Query<(&Camera, &GlobalTransform)>,
-) {
-    let (camera, camera_transform) = camera.single();
+) -> Result {
+    let (camera, camera_transform) = camera.single()?;
     movement_vector.world_cursor_position =
         get_world_cursor_position(window, camera, camera_transform);
     movement_vector.movement_vector = get_movement_vector(input, camera_transform);
     movement_vector.tap = mouse_input.just_pressed(MouseButton::Left);
+    Ok(())
 }
 
 /// Calculate the movement vector based on the player's input (WASD) and the camera's orientation
@@ -158,14 +165,15 @@ fn get_world_cursor_position(
 fn update_indicator(
     mut indicator_q: Query<(&mut Transform, &mut Visibility), With<EditingTargetIndicator>>,
     player_input: Res<PlayerInput>,
-) {
-    let (mut indicator, mut visibility) = indicator_q.single_mut();
+) -> Result {
+    let (mut indicator, mut visibility) = indicator_q.single_mut()?;
     if let Some(point) = player_input.world_cursor_position {
         indicator.translation = point;
         *visibility = Visibility::Visible;
     } else {
         *visibility = Visibility::Hidden;
     }
+    Ok(())
 }
 
 #[cfg(test)]

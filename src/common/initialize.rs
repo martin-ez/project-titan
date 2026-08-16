@@ -1,3 +1,4 @@
+use bevy::ecs::component::Mutable;
 use bevy::ecs::system::{StaticSystemParam, SystemParam};
 use bevy::prelude::*;
 
@@ -16,7 +17,7 @@ pub trait Initialize<P: SystemParam> {
 
 /// Generic system that runs initialization code for components that implement the `Initialize`
 /// trait, removing the `NeedsInitialization` marker.
-pub fn initialize_system<T: Component + Initialize<P>, P: SystemParam>(
+pub fn initialize_system<T: Component<Mutability = Mutable> + Initialize<P>, P: SystemParam>(
     mut query: Query<(&mut T, Entity), With<NeedsInitialization>>,
     params: StaticSystemParam<P>,
     mut commands: Commands,

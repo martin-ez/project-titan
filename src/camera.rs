@@ -78,9 +78,9 @@ fn smooth_tracking(
     mut controller_query: Query<(&mut Transform, &PanOrbitCamera), With<PanOrbitCamera>>,
     mut camera_query: Query<&mut Transform, (With<Camera>, Without<PanOrbitCamera>)>,
     time: Res<Time>,
-) {
+) -> Result {
     for (mut root_transform, controller) in &mut controller_query {
-        let mut camera_transform = camera_query.single_mut();
+        let mut camera_transform = camera_query.single_mut()?;
         let target_rotation =
             Quat::from_euler(EulerRot::YXZ, controller.yaw, -controller.pitch, 0.0);
 
@@ -98,16 +98,18 @@ fn smooth_tracking(
             time.delta_secs(),
         );
     }
+    Ok(())
 }
 
 /// Translate the camera using the WASD keys
 fn translate(
     mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
     player_input: Res<PlayerInput>,
-) {
-    let mut controller = controller_q.single_mut();
+) -> Result {
+    let mut controller = controller_q.single_mut()?;
     let zoom_multiplier = (controller.radius * TRANSLATION_ZOOM_MULTIPLIER).exp();
     controller.target += player_input.movement_vector * TRANSLATION_SENSITIVITY * zoom_multiplier;
+    Ok(())
 }
 
 /// Pan the camera based on the mouse motion
@@ -159,18 +161,19 @@ fn pan(
 /// Orbit the camera around the target based on the mouse motion
 fn orbit(
     mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
-    mut mouse_motion: EventReader<MouseMotion>,
-) {
+    mut mouse_motion: MessageReader<MouseMotion>,
+) -> Result {
     let mut total_motion: Vec2 = mouse_motion.read().map(|motion| motion.delta).sum();
     total_motion.y = -total_motion.y;
 
     let orbit = -total_motion * ORBIT_SENSITIVITY;
-    let mut controller = controller_q.single_mut();
+    let mut controller = controller_q.single_mut()?;
     controller.yaw += orbit.x;
     controller.pitch += orbit.y;
     controller.pitch = controller.pitch.clamp(PITCH_RANGE.start, PITCH_RANGE.end);
     controller.yaw = wrap_to_half_turn(controller.yaw);
     controller.pitch = wrap_to_half_turn(controller.pitch);
+    Ok(())
 }
 
 /// Bring an angle back inside a half turn either side of zero.
@@ -187,8 +190,8 @@ fn wrap_to_half_turn(angle: f32) -> f32 {
 /// Zoom the camera based on the scroll wheel or trackpad input
 fn scroll_zoom(
     mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
-    mut evr_scroll: EventReader<MouseWheel>,
-) {
+    mut evr_scroll: MessageReader<MouseWheel>,
+) -> Result {
     let mut zoom = 0.;
     for ev in evr_scroll.read() {
         zoom -= ev.y;
@@ -198,25 +201,27 @@ fn scroll_zoom(
         }
     }
 
-    let mut controller = controller_q.single_mut();
+    let mut controller = controller_q.single_mut()?;
     controller.radius *= (-zoom).exp();
     controller.radius = controller
         .radius
         .clamp(ZOOM_RADIUS_RANGE.start, ZOOM_RADIUS_RANGE.end);
+    Ok(())
 }
 
 /// Zoom the camera based on the mouse motion
 fn mouse_zoom(
     mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
-    mut mouse_motion: EventReader<MouseMotion>,
-) {
+    mut mouse_motion: MessageReader<MouseMotion>,
+) -> Result {
     let total_motion: Vec2 = mouse_motion.read().map(|motion| motion.delta).sum();
 
-    let mut controller = controller_q.single_mut();
+    let mut controller = controller_q.single_mut()?;
     controller.radius *= (total_motion.y * ZOOM_SENSITIVITY).exp();
     controller.radius = controller
         .radius
         .clamp(ZOOM_RADIUS_RANGE.start, ZOOM_RADIUS_RANGE.end);
+    Ok(())
 }
 
 #[cfg(test)]

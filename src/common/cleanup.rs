@@ -28,7 +28,7 @@ impl Plugin for CleanupPlugin {
 
 fn destroy_entities_system(mut commands: Commands, query: Query<Entity, With<Destroy>>) {
     for entity in query.iter() {
-        commands.entity(entity).despawn_recursive();
+        commands.entity(entity).despawn();
     }
 }
 
@@ -37,6 +37,6 @@ fn destroy_on_state_change_system(
     query: Query<Entity, With<DestroyOnStateChange>>,
 ) {
     for entity in query.iter() {
-        commands.entity(entity).despawn_recursive();
+        commands.entity(entity).despawn();
     }
 }
