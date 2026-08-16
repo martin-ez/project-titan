@@ -1,0 +1,57 @@
+name: tracking
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  settle:
+    name: settle tracked issues
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The body is attacker-controlled on a fork, so it is read from the
+      # environment rather than interpolated into the script.
+      #
+      # `start` derives the branch name and the claim marker from one string,
+      # so the head ref *is* the agent id holding the issue. Setting
+      # TITAN_AGENT from it makes the holder match, which is what keeps `done`
+      # and `release` from needing --force — and what makes a mismatch, where
+      # some other agent holds the issue, fail loudly instead of stealing it.
+      - name: close or release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITAN_AGENT: ${{ github.event.pull_request.head.ref }}
+          BODY: ${{ github.event.pull_request.body }}
+          MERGED: ${{ github.event.pull_request.merged }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          refs="$(printf '%s' "$BODY" | scripts/track.sh refs)"
+          if [ -z "$refs" ]; then
+            echo "::notice::This pull request tracks no issue, so nothing was settled."
+            exit 0
+          fi
+
+          status=0
+          for n in $refs; do
+            if [ "$MERGED" != "true" ]; then
+              # An abandoned branch returns its issue to the queue now, rather
+              # than a day later when `doctor` reports the claim as stale.
+              scripts/track.sh release "$n" || status=1
+              continue
+            fi
+            state="$(scripts/track.sh show "$n" --json | jq -r .state)" || state=""
+            case "$state" in
+              OPEN)   scripts/track.sh done "$n" -m "Closed by #$PR." || status=1 ;;
+              CLOSED) echo "::notice::#$n is already closed; nothing to settle." ;;
+              *)      echo "::error::Could not read the state of #$n."; status=1 ;;
+            esac
+          done
+          exit $status

@@ -1,0 +1,66 @@
+name: PR hygiene
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+  # A merge group has no pull request to read a title or a body from, so every
+  # step below is skipped there and the job reports on the strength of what it
+  # already checked at the queue entrance. It runs rather than being gated off
+  # because a required check that reports nothing drops the entry from the queue.
+  merge_group:
+
+jobs:
+  hygiene:
+    name: pull request hygiene
+    runs-on: ubuntu-latest
+    env:
+      REVIEWABLE: ${{ github.event_name == 'pull_request' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The title and body are attacker-controlled on a fork, so they are read
+      # from the environment rather than interpolated into the script.
+      - name: title
+        if: ${{ env.REVIEWABLE == 'true' }}
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          echo "title: $TITLE"
+          if [ "${#TITLE}" -gt 50 ]; then
+            echo "::error::Title is ${#TITLE} characters; the limit is 50 (AGENTS.md 4.4)."
+            exit 1
+          fi
+          if ! printf '%s' "$TITLE" |
+            grep -qE '^(feat|fix|docs|test|refactor|perf|build|ci|chore|revert)(\([a-z0-9-]+\))?: .+'; then
+            echo "::error::Title must read 'type(scope): summary' (AGENTS.md 4.2)."
+            exit 1
+          fi
+
+      # The body reaches main as the squashed commit message, so a break an
+      # agent put in for a 72-column diff lands in the history where nothing
+      # will re-flow it.
+      - name: unwrapped body
+        if: ${{ env.REVIEWABLE == 'true' }}
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: printf '%s' "$BODY" | scripts/check-pr-body.sh
+
+      - name: no co-authors
+        if: ${{ env.REVIEWABLE == 'true' }}
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if git log --format='%B' "$BASE..$HEAD" | grep -inE '^co-authored-by:'; then
+            echo "::error::A commit carries a Co-authored-by trailer (AGENTS.md 4.5)."
+            exit 1
+          fi
+          if printf '%s' "$BODY" | grep -inE 'co-authored-by:|generated with \[?claude'; then
+            echo "::error::The body carries a co-author or tool attribution (AGENTS.md 4.5)."
+            exit 1
+          fi

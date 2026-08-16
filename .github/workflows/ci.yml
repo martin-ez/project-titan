@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # The merge queue builds each entry against the branches ahead of it, so this
+  # is where a semantic conflict between two green pull requests is caught. A
+  # required check that never reports here times the entry out and drops it.
+  merge_group:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Every job runs on every push, and the ones below skip their own steps.
+      # Gating the job instead would stop it reporting, and a required check
+      # that never reports blocks a pull request rather than passing it.
+      - id: changed
+        uses: ./.github/actions/rust-changed
+      - if: ${{ steps.changed.outputs.rust != 'false' }}
+        uses: Swatinem/rust-cache@v2
+      # Bevy's Linux backend links against ALSA for audio and udev for gamepad
+      # enumeration, and both are resolved through pkg-config from build
+      # scripts, which run even under `cargo check`. The macOS runner uses
+      # CoreAudio and needs nothing installed.
+      - if: ${{ steps.changed.outputs.rust != 'false' }}
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+      # These share a job because each is a second or two of work behind the
+      # cache restore and apt. `!cancelled()` keeps every check reporting after
+      # an earlier one fails, so one run still says what separate jobs did.
+      - if: ${{ steps.changed.outputs.rust != 'false' }}
+        run: cargo fmt --all -- --check
+      # Linted rather than merely checked: clippy subsumes what `cargo check`
+      # would do, and one rustc wrapper keeps the two off each other's build
+      # fingerprints. --all-targets reaches the tests, which are where most of
+      # this crate's code is exercised.
+      - if: ${{ !cancelled() && steps.changed.outputs.rust != 'false' }}
+        run: cargo clippy --all-targets --all-features
+      # Undocumented public items fail via missing_docs; broken intra-doc links
+      # fail via RUSTDOCFLAGS. The examples themselves are compiled and run by
+      # the test job, where plain `cargo test` covers doctests on both hosts.
+      - if: ${{ !cancelled() && steps.changed.outputs.rust != 'false' }}
+        run: cargo doc --no-deps --all-features
+
+  style:
+    name: house style
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # AGENTS.md rules that rustc and clippy cannot express: no inline
+      # comments, doc comment budgets, no TODO markers, no prose outside the
+      # code beyond a folder README and the design under docs/, no
+      # documentation of unbuilt features.
+      - run: scripts/check-style.sh
+      # The body check and the gate have no game to be tested through an App,
+      # so they carry their cases with them, and those run wherever the scripts
+      # can change.
+      - if: ${{ !cancelled() }}
+        run: scripts/check-pr-body.sh --selftest
+      - if: ${{ !cancelled() }}
+        run: scripts/gate.sh --selftest
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: changed
+        uses: ./.github/actions/rust-changed
+      - if: ${{ steps.changed.outputs.rust != 'false' }}
+        uses: Swatinem/rust-cache@v2
+      # Bevy's Linux backend links against ALSA and udev. The macOS runner uses
+      # CoreAudio and needs nothing installed.
+      - if: ${{ runner.os == 'Linux' && steps.changed.outputs.rust != 'false' }}
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+      # The tests build a headless App, so no display is needed on either
+      # runner: a test that requires a window is a test of the windowing
+      # system rather than of this game.
+      - if: ${{ steps.changed.outputs.rust != 'false' }}
+        run: cargo test --all-features

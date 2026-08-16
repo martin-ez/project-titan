@@ -15,3 +15,15 @@ target/
 # Added by cargo
 
 /target
+
+# Merge and patch leftovers. Frequent here because short-lived branches rebase
+# onto a moving main.
+*.orig
+*.rej
+
+# Agent worktrees live inside the repo and are not part of it. settings.json is
+# shared configuration; settings.local.json is one person's machine.
+/.claude/worktrees/
+/.claude/settings.local.json
+
+.DS_Store
