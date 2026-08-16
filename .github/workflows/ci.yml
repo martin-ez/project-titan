@@ -34,9 +34,17 @@ concurrency:
 # repository only gets 10 GiB of Actions cache before entries start evicting
 # each other.
 #
+# macOS is not here, and that is a cost decision rather than a coverage one. A
+# private repository bills macOS at ten times the Linux rate, which made it 85%
+# of this repository's Actions bill from 38% of its wall clock: a cold macOS
+# job is twenty-two minutes, so it bills two hundred and twenty. What is left
+# without it is the platform nobody runs by hand — a developer working on macOS
+# runs scripts/gate.sh there before every push, and Linux is the one no local
+# run covers, which is exactly the platform that broke on the Bevy 0.19
+# upgrade. A macOS regression is therefore caught by the gate rather than here,
+# and the dependency rule in AGENTS.md is checked by whoever adds one.
+#
 # Levers weighed and not taken, so the next person does not re-weigh them:
-# dropping macos-latest from pull requests buys nothing, because a warm macOS
-# job is under a minute and the second platform is coverage rather than cost;
 # lowering opt-level for dependencies under test would stop `cargo run` and
 # `cargo test` sharing artifacts and so compile Bevy twice on a developer's
 # machine to save CI time the cache already saves; one build shared between the
@@ -78,7 +86,7 @@ jobs:
         run: cargo clippy --all-targets
       # Undocumented public items fail via missing_docs; broken intra-doc links
       # fail via RUSTDOCFLAGS. The examples themselves are compiled and run by
-      # the test job, where plain `cargo test` covers doctests on both hosts.
+      # the test job, where plain `cargo test` covers doctests.
       - if: ${{ !cancelled() && steps.changed.outputs.rust != 'false' }}
         run: cargo doc --no-deps
 
@@ -101,12 +109,8 @@ jobs:
         run: scripts/gate.sh --selftest
 
   test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    name: test
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -117,10 +121,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - if: ${{ runner.os == 'Linux' && steps.changed.outputs.rust != 'false' }}
+      - if: ${{ steps.changed.outputs.rust != 'false' }}
         uses: ./.github/actions/linux-build-deps
-      # The tests build a headless App, so no display is needed on either
-      # runner: a test that requires a window is a test of the windowing
-      # system rather than of this game.
+      # The tests build a headless App, so no display is needed: a test that
+      # requires a window is a test of the windowing system rather than of
+      # this game.
       - if: ${{ steps.changed.outputs.rust != 'false' }}
         run: cargo test

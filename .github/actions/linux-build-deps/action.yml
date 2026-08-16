@@ -5,13 +5,13 @@ description: The system libraries Bevy's Linux backend resolves through pkg-conf
 # libwayland for the windowing backend winit selects on Linux. All three are
 # resolved by build scripts through pkg-config, and a build script runs even
 # under `cargo check`, so a missing one fails the build rather than only the
-# run. The macOS runner uses CoreAudio and Cocoa and needs nothing installed.
+# run.
 #
-# Named here once rather than in each job that needs them. The two Linux jobs
-# each carried their own copy of the list and drifted apart, which is how the
-# Bevy 0.19 upgrade left libwayland-dev off both of them. A job that cannot
-# build saves no cache either, so that drift cost every run after it a cold
-# build as well as a red one.
+# Named here once rather than in each job that needs them. The two jobs each
+# carried their own copy of the list and drifted apart, which is how the Bevy
+# 0.19 upgrade left libwayland-dev off both of them. A job that cannot build
+# saves no cache either, so that drift cost every run after it a cold build as
+# well as a red one.
 
 runs:
   using: composite
