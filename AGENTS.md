@@ -76,6 +76,19 @@ tests, and looks tidier.
    never the reverse: a mesh reads the world, a rover never reads its transform
    back to decide where it is.
 
+5. **A system is proved with placeholder shapes before it is given a look.** A
+   tile is a flat hex, a building is a box, a rover is a smaller box on a line,
+   and that is enough to watch a jam form. Every simulation feature ships
+   visible and interactive — one you cannot watch run, and poke at while it is
+   running, is not finished — but it ships in gizmos and primitives. A mesh, a
+   material or a shader is separate work that comes afterwards, under the
+   presentation epic, and never lands beside the system it decorates.
+
+   So a debug view is not an exception here, it is the requirement: drawing a
+   rover's path while pathfinding is being built is part of building
+   pathfinding. The line is what a change is for. Making a system observable is
+   simulation work; making it handsome is not.
+
 Corollary: **it has to hold at fleet scale.** Thousands of rovers on the map is
 the target, so a per-tick system does not allocate per entity, and does not scan
 every entity to find the few it wants. Check before adding a dependency that it
