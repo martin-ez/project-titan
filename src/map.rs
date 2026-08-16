@@ -1,5 +1,4 @@
 use crate::common::{initialize_system, Initialize, NeedsInitialization};
-use bevy::ecs::query::WorldQuery;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use std::f32::consts::FRAC_PI_2;
@@ -7,7 +6,8 @@ use std::f32::consts::FRAC_PI_2;
 const MAP_GRID_SIZE: i16 = 12;
 const MAP_GRID_GAP: f32 = 0.2;
 const MAP_TILE_SIZE: f32 = 10.;
-const MAP_TILE_WIDTH: f32 = MAP_TILE_SIZE / 2. * 1.732_050_8; // sqrt(3)
+const SQRT_3: f32 = 1.732_050_8;
+const MAP_TILE_WIDTH: f32 = MAP_TILE_SIZE / 2. * SQRT_3;
 const MAP_TILE_DEPTH: f32 = 0.25;
 
 pub struct MapPlugin;
@@ -66,12 +66,10 @@ impl MapTile {
 
 impl Initialize<MapTileInitializeParams<'_, '_>> for MapTile {
     fn initialize(&mut self, entity: &Entity, params: &mut MapTileInitializeParams) {
-        // Set the transform to the correct position
         let (mut transform, mut visibility) = params.query.get_mut(*entity).unwrap();
         transform.translation = self.world_position();
         *visibility = Visibility::Visible;
 
-        // Spawn the mesh
         params.commands.entity(*entity).with_children(|parent| {
             parent.spawn((
                 Mesh3d(
