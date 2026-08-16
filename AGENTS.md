@@ -78,16 +78,17 @@ tests, and looks tidier.
 
 5. **A system is proved with placeholder shapes before it is given a look.** A
    tile is a flat hex, a building is a box, a rover is a smaller box on a line,
-   and that is enough to watch a jam form. Every simulation feature ships
-   visible and interactive — one you cannot watch run, and poke at while it is
-   running, is not finished — but it ships in gizmos and primitives. A mesh, a
-   material or a shader is separate work that comes afterwards, under the
-   presentation epic, and never lands beside the system it decorates.
+   and that is enough to watch a jam form. Whatever it takes to see a system
+   run and interact with it while it runs is part of building it, and gizmos
+   and primitives are what that is made of. A mesh, a material or a shader is
+   separate work that comes afterwards, under the presentation epic, and never
+   lands beside the system it decorates.
 
-   So a debug view is not an exception here, it is the requirement: drawing a
-   rover's path while pathfinding is being built is part of building
-   pathfinding. The line is what a change is for. Making a system observable is
-   simulation work; making it handsome is not.
+   How much of that a change needs is a judgement, not a checklist: reach for a
+   debug view when you cannot otherwise see what a system is doing, and leave
+   it out when the tests already say. What is not a judgement is the ceiling on
+   it. Making a system observable is simulation work; making it handsome is
+   not.
 
 Corollary: **it has to hold at fleet scale.** Thousands of rovers on the map is
 the target, so a per-tick system does not allocate per entity, and does not scan
