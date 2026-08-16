@@ -1,0 +1,53 @@
+name: rust-changed
+description: Whether this diff can affect the Rust build.
+
+# Answered per job rather than by one upstream job the others need: a fan-in
+# would sit in front of every run, and would cost a change that does touch Rust
+# more than it saves the occasional change that does not.
+#
+# The safe list is an allow list, so an unrecognised path counts as Rust. Every
+# way this can be wrong therefore runs more than it needed to, which is slow
+# rather than unsound. Prose qualifies only because no source file pulls a .md
+# in: an `include_str!` of one would make README.md a build input.
+
+outputs:
+  rust:
+    description: "'false' only when every changed path is prose or agent configuration."
+    value: ${{ steps.filter.outputs.rust }}
+
+runs:
+  using: composite
+  steps:
+    - id: filter
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+          printf 'rust=true\n' >> "$GITHUB_OUTPUT"
+          echo "not a pull request — nothing is skipped"
+          exit 0
+        fi
+
+        changed="$(git diff --name-only "origin/$GITHUB_BASE_REF"...HEAD)"
+
+        if [ -z "$changed" ]; then
+          printf 'rust=true\n' >> "$GITHUB_OUTPUT"
+          echo "no diff resolved — nothing is skipped"
+          exit 0
+        fi
+
+        rust=false
+        while IFS= read -r path; do
+          [ -n "$path" ] || continue
+          case "$path" in
+            .claude/*|*.md|LICENSE-*) ;;
+            *) rust=true; break ;;
+          esac
+        done <<EOF
+        $changed
+        EOF
+
+        printf 'rust=%s\n' "$rust" >> "$GITHUB_OUTPUT"
+        printf '%s\n' "$changed" | sed 's/^/  /'
+        echo "rust=$rust"
