@@ -10,8 +10,14 @@ dev = ["bevy/dynamic_linking"]
 bevy = { version = "0.19.1" }
 log = { version = "*", features = ["max_level_debug", "release_max_level_warn"] }
 
+# Bevy's debug info is most of what a build writes and most of what the CI
+# cache stores, against a 10 GiB repository limit these caches were hitting.
+# Measured over a cold `cargo test --no-run`: 6.3 GB at the default, 4.2 GB
+# here, 1.6 GB with debug info off. The middle keeps file and line numbers in
+# a backtrace, which is what one is read for, and drops only variable types.
 [profile.dev]
 opt-level = 1
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 3
