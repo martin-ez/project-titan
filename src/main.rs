@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 mod camera;
 mod common;
+mod diagnostics;
 mod input;
 mod map;
 
@@ -9,6 +10,7 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .add_plugins(camera::CameraPlugin)
         .add_plugins(common::CommonPlugin)
+        .add_plugins(diagnostics::DiagnosticsPlugin)
         .add_plugins(input::PlayerInputPlugin)
         .add_plugins(map::MapPlugin)
         .add_systems(Startup, setup_test_scene)
