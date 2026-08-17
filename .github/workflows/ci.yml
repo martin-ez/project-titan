@@ -4,9 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
-  # The merge queue builds each entry against the branches ahead of it, so this
-  # is where a semantic conflict between two green pull requests is caught. A
-  # required check that never reports here times the entry out and drops it.
+  # No merge queue is enabled on this plan, so nothing builds a pull request
+  # against the branches ahead of it, and the push run on `main` below is the
+  # first thing to see a merged result. The trigger stays because a required
+  # check that never reports on a queue entry times it out and drops it.
   merge_group:
 
 env:
@@ -14,6 +15,13 @@ env:
   RUSTFLAGS: -D warnings
   RUSTDOCFLAGS: -D warnings
 
+# `main` is a pointer, and what has to be green is where it points. A merge
+# landing mid-run supersedes the commit that run is verifying, so cancelling it
+# and starting again on the new tip spends the minutes below on the only commit
+# anyone will check out. Cancellation takes the superseded run and never the
+# newest, so the tip always keeps one. What it gives up is which of several
+# quick merges turned `main` red — the tip's run says that it is, not who did
+# it (#42).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -33,8 +41,8 @@ concurrency:
 #
 # Not taken: dependency opt-level, which would build Bevy twice on a
 # developer's machine; one build shared by both jobs, since clippy and rustc
-# write different fingerprints; and save-if on main, which saves nothing while
-# this concurrency group still cancels main's own runs (#42).
+# write different fingerprints; and save-if on main, which would hand the
+# saving to the runs the concurrency group above is most likely to cancel.
 
 jobs:
   checks:
