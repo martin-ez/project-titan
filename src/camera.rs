@@ -227,6 +227,76 @@ fn mouse_zoom(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{headless_app, move_mouse, tick};
+
+    fn camera_app(movement: CameraMovement) -> App {
+        let mut app = headless_app();
+        app.insert_state(movement)
+            .insert_resource(PlayerInput::default())
+            .add_plugins(CameraPlugin);
+        app
+    }
+
+    fn controller<T>(app: &mut App, read: impl Fn(&PanOrbitCamera) -> T) -> T {
+        let mut query = app.world_mut().query::<&PanOrbitCamera>();
+        let controller = query
+            .iter(app.world())
+            .next()
+            .expect("the plugin spawns a controller on startup");
+        read(controller)
+    }
+
+    #[test]
+    fn mouse_motion_orbits_the_camera() {
+        let mut app = camera_app(CameraMovement::Orbit);
+        tick(&mut app);
+        let before = controller(&mut app, |camera| camera.yaw);
+
+        move_mouse(&mut app, Vec2::new(10.0, 0.0));
+        tick(&mut app);
+
+        let expected = before - 10.0 * ORBIT_SENSITIVITY;
+        assert!((controller(&mut app, |camera| camera.yaw) - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn the_pitch_stops_at_the_top_of_its_range() {
+        let mut app = camera_app(CameraMovement::Orbit);
+        tick(&mut app);
+
+        move_mouse(&mut app, Vec2::new(0.0, 10_000.0));
+        tick(&mut app);
+
+        assert_eq!(controller(&mut app, |camera| camera.pitch), PITCH_RANGE.end);
+    }
+
+    #[test]
+    fn the_camera_does_not_orbit_while_translating() {
+        let mut app = camera_app(CameraMovement::Translate);
+        tick(&mut app);
+        let before = controller(&mut app, |camera| camera.yaw);
+
+        move_mouse(&mut app, Vec2::new(10.0, 0.0));
+        tick(&mut app);
+
+        assert_eq!(controller(&mut app, |camera| camera.yaw), before);
+    }
+
+    #[test]
+    fn the_camera_translates_along_the_movement_vector() {
+        let mut app = camera_app(CameraMovement::Translate);
+        tick(&mut app);
+        let before = controller(&mut app, |camera| camera.target);
+
+        app.world_mut()
+            .resource_mut::<PlayerInput>()
+            .movement_vector = Vec3::X;
+        tick(&mut app);
+
+        let after = controller(&mut app, |camera| camera.target);
+        assert!(after.x > before.x);
+        assert_eq!(after.y, before.y);
+    }
 
     #[test]
     fn an_angle_past_half_a_turn_wraps_below_it() {

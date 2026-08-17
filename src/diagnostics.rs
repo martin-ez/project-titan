@@ -44,37 +44,12 @@ fn toggle_overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{headless_app, press, release, tick};
 
-    fn headless_app() -> App {
-        let mut app = App::new();
-        app.add_plugins(MinimalPlugins)
-            .init_resource::<ButtonInput<KeyCode>>()
-            .add_systems(Update, toggle_overlay);
+    fn overlay_app() -> App {
+        let mut app = headless_app();
+        app.add_systems(Update, toggle_overlay);
         app
-    }
-
-    /// A frame the player pressed the key on, which is a press the frame before did not carry.
-    fn press_the_key(app: &mut App) {
-        let mut input = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
-        input.clear();
-        input.press(DIAGNOSTICS_OVERLAY_KEY);
-        app.update();
-    }
-
-    /// A frame the key stayed down for, which is what `InputPlugin` leaves behind each frame.
-    fn keep_the_key_down(app: &mut App) {
-        app.world_mut()
-            .resource_mut::<ButtonInput<KeyCode>>()
-            .clear();
-        app.update();
-    }
-
-    /// A frame the player let the key go on. A press only lands on a key that was up.
-    fn release_the_key(app: &mut App) {
-        let mut input = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
-        input.clear();
-        input.release(DIAGNOSTICS_OVERLAY_KEY);
-        app.update();
     }
 
     fn overlays(app: &mut App) -> usize {
@@ -86,33 +61,47 @@ mod tests {
 
     #[test]
     fn the_overlay_is_hidden_until_the_key_is_pressed() {
-        let mut app = headless_app();
-        app.update();
+        let mut app = overlay_app();
+
+        tick(&mut app);
+
         assert_eq!(overlays(&mut app), 0);
     }
 
     #[test]
     fn pressing_the_key_shows_the_overlay() {
-        let mut app = headless_app();
-        press_the_key(&mut app);
+        let mut app = overlay_app();
+
+        press(&mut app, DIAGNOSTICS_OVERLAY_KEY);
+        tick(&mut app);
+
         assert_eq!(overlays(&mut app), 1);
     }
 
     #[test]
     fn pressing_the_key_again_hides_the_overlay() {
-        let mut app = headless_app();
-        press_the_key(&mut app);
-        release_the_key(&mut app);
-        press_the_key(&mut app);
+        let mut app = overlay_app();
+        press(&mut app, DIAGNOSTICS_OVERLAY_KEY);
+        tick(&mut app);
+        release(&mut app, DIAGNOSTICS_OVERLAY_KEY);
+        tick(&mut app);
+
+        press(&mut app, DIAGNOSTICS_OVERLAY_KEY);
+        tick(&mut app);
+
         assert_eq!(overlays(&mut app), 0);
     }
 
     #[test]
     fn holding_the_key_down_leaves_one_overlay() {
-        let mut app = headless_app();
-        press_the_key(&mut app);
-        keep_the_key_down(&mut app);
-        keep_the_key_down(&mut app);
+        let mut app = overlay_app();
+        press(&mut app, DIAGNOSTICS_OVERLAY_KEY);
+        tick(&mut app);
+
+        tick(&mut app);
+        tick(&mut app);
+        tick(&mut app);
+
         assert_eq!(overlays(&mut app), 1);
     }
 }

@@ -95,18 +95,11 @@ impl Initialize<MapTileInitializeParams<'_, '_>> for MapTile {
 mod tests {
     use super::*;
     use crate::common::initialize::InitializationFailed;
-    use bevy::asset::AssetPlugin;
+    use crate::testing::{headless_app, tick};
 
-    fn headless_app() -> App {
-        let mut app = App::new();
-        app.add_plugins(MinimalPlugins)
-            .add_plugins(AssetPlugin::default())
-            .init_asset::<Mesh>()
-            .init_asset::<StandardMaterial>()
-            .add_systems(
-                PreUpdate,
-                initialize_system::<MapTile, MapTileInitializeParams>,
-            );
+    fn map_app() -> App {
+        let mut app = headless_app();
+        app.add_plugins(MapPlugin);
         app
     }
 
@@ -123,10 +116,10 @@ mod tests {
 
     #[test]
     fn an_initialized_tile_stands_at_the_world_position_of_its_coordinates() {
-        let mut app = headless_app();
+        let mut app = map_app();
         let tile = spawn_tile(&mut app, 1., 0.);
 
-        app.update();
+        tick(&mut app);
 
         let world = app.world();
         assert_eq!(
@@ -143,7 +136,7 @@ mod tests {
 
     #[test]
     fn a_tile_the_initializer_cannot_read_is_marked_rather_than_panicking() {
-        let mut app = headless_app();
+        let mut app = map_app();
         let tile = app
             .world_mut()
             .spawn(MapTile {
@@ -151,7 +144,7 @@ mod tests {
             })
             .id();
 
-        app.update();
+        tick(&mut app);
 
         assert!(app.world().entity(tile).contains::<InitializationFailed>());
     }

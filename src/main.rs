@@ -4,6 +4,8 @@ mod common;
 mod diagnostics;
 mod input;
 mod map;
+#[cfg(test)]
+mod testing;
 
 fn main() {
     App::new()

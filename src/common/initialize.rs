@@ -46,6 +46,7 @@ pub fn initialize_system<T: Component<Mutability = Mutable> + Initialize<P>, P: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{headless_app, tick};
 
     #[derive(Component)]
     struct Probe {
@@ -63,10 +64,9 @@ mod tests {
         }
     }
 
-    fn headless_app() -> App {
-        let mut app = App::new();
-        app.add_plugins(MinimalPlugins)
-            .add_systems(Update, initialize_system::<Probe, ()>);
+    fn probe_app() -> App {
+        let mut app = headless_app();
+        app.add_systems(Update, initialize_system::<Probe, ()>);
         app
     }
 
@@ -83,12 +83,18 @@ mod tests {
             .is_some_and(|probe| probe.ran)
     }
 
+    fn forget_that_it_ran(app: &mut App, entity: Entity) {
+        if let Some(mut probe) = app.world_mut().entity_mut(entity).get_mut::<Probe>() {
+            probe.ran = false;
+        }
+    }
+
     #[test]
     fn an_initialized_entity_loses_its_marker() {
-        let mut app = headless_app();
+        let mut app = probe_app();
         let entity = spawn_probe(&mut app, false);
 
-        app.update();
+        tick(&mut app);
 
         assert!(ran(&app, entity));
         assert!(!app.world().entity(entity).contains::<NeedsInitialization>());
@@ -99,11 +105,23 @@ mod tests {
     }
 
     #[test]
+    fn an_initialized_entity_is_not_initialized_again() {
+        let mut app = probe_app();
+        let entity = spawn_probe(&mut app, false);
+
+        tick(&mut app);
+        forget_that_it_ran(&mut app, entity);
+        tick(&mut app);
+
+        assert!(!ran(&app, entity));
+    }
+
+    #[test]
     fn an_entity_that_reports_a_failure_is_marked_as_failed() {
-        let mut app = headless_app();
+        let mut app = probe_app();
         let entity = spawn_probe(&mut app, true);
 
-        app.update();
+        tick(&mut app);
 
         assert!(app
             .world()
@@ -113,27 +131,23 @@ mod tests {
 
     #[test]
     fn an_entity_that_reports_a_failure_is_not_initialized_again() {
-        let mut app = headless_app();
+        let mut app = probe_app();
         let entity = spawn_probe(&mut app, true);
 
-        app.update();
-        app.world_mut()
-            .entity_mut(entity)
-            .get_mut::<Probe>()
-            .unwrap()
-            .ran = false;
-        app.update();
+        tick(&mut app);
+        forget_that_it_ran(&mut app, entity);
+        tick(&mut app);
 
         assert!(!ran(&app, entity));
     }
 
     #[test]
     fn a_failure_does_not_stop_the_entity_beside_it() {
-        let mut app = headless_app();
+        let mut app = probe_app();
         let failing = spawn_probe(&mut app, true);
         let succeeding = spawn_probe(&mut app, false);
 
-        app.update();
+        tick(&mut app);
 
         assert!(ran(&app, failing));
         assert!(ran(&app, succeeding));
