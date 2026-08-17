@@ -1,8 +1,6 @@
 use bevy::prelude::*;
 mod cleanup;
-mod initialize;
-
-pub use initialize::{initialize_system, Initialize, NeedsInitialization};
+pub mod initialize;
 
 pub struct CommonPlugin;
 
