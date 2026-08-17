@@ -8,7 +8,7 @@
 
 use bevy::asset::AssetPlugin;
 use bevy::input::keyboard::{Key, KeyboardInput, NativeKey};
-use bevy::input::mouse::MouseMotion;
+use bevy::input::mouse::{MouseButtonInput, MouseMotion};
 use bevy::input::{ButtonState, InputPlugin};
 use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
@@ -45,15 +45,35 @@ pub fn move_mouse(app: &mut App, delta: Vec2) {
 }
 
 /// Press `key`, to be seen on the next tick.
-pub fn press(app: &mut App, key: KeyCode) {
+pub fn press_key(app: &mut App, key: KeyCode) {
     let message = key_message(key, ButtonState::Pressed);
     app.world_mut().write_message(message);
 }
 
 /// Release `key`, to be seen on the next tick.
-pub fn release(app: &mut App, key: KeyCode) {
+pub fn release_key(app: &mut App, key: KeyCode) {
     let message = key_message(key, ButtonState::Released);
     app.world_mut().write_message(message);
+}
+
+/// Press `button`, to be seen on the next tick.
+pub fn press_mouse(app: &mut App, button: MouseButton) {
+    let message = mouse_message(button, ButtonState::Pressed);
+    app.world_mut().write_message(message);
+}
+
+/// Release `button`, to be seen on the next tick.
+pub fn release_mouse(app: &mut App, button: MouseButton) {
+    let message = mouse_message(button, ButtonState::Released);
+    app.world_mut().write_message(message);
+}
+
+fn mouse_message(button: MouseButton, state: ButtonState) -> MouseButtonInput {
+    MouseButtonInput {
+        button,
+        state,
+        window: Entity::PLACEHOLDER,
+    }
 }
 
 fn key_message(key_code: KeyCode, state: ButtonState) -> KeyboardInput {
