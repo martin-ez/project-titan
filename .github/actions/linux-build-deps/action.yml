@@ -1,17 +1,13 @@
 name: linux-build-deps
 description: The system libraries Bevy's Linux backend resolves through pkg-config.
 
-# Bevy links against ALSA for audio, udev for gamepad enumeration, and
-# libwayland for the windowing backend winit selects on Linux. All three are
-# resolved by build scripts through pkg-config, and a build script runs even
-# under `cargo check`, so a missing one fails the build rather than only the
-# run.
+# ALSA for audio, udev for gamepads, libwayland for the windowing backend.
+# Build scripts resolve all three through pkg-config and run even under
+# `cargo check`, so a missing one fails the build rather than only the run.
 #
-# Named here once rather than in each job that needs them. The two jobs each
-# carried their own copy of the list and drifted apart, which is how the Bevy
-# 0.19 upgrade left libwayland-dev off both of them. A job that cannot build
-# saves no cache either, so that drift cost every run after it a cold build as
-# well as a red one.
+# Named once rather than per job: the two jobs each held their own copy and
+# drifted, which is how the Bevy 0.19 upgrade left libwayland-dev off both. A
+# job that cannot build saves no cache either, so every later run started cold.
 
 runs:
   using: composite
