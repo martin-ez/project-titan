@@ -44,7 +44,7 @@ fn toggle_overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{headless_app, press, release, tick};
+    use crate::testing::{headless_app, press_key, release_key, tick};
 
     fn overlay_app() -> App {
         let mut app = headless_app();
@@ -72,7 +72,7 @@ mod tests {
     fn pressing_the_key_shows_the_overlay() {
         let mut app = overlay_app();
 
-        press(&mut app, DIAGNOSTICS_OVERLAY_KEY);
+        press_key(&mut app, DIAGNOSTICS_OVERLAY_KEY);
         tick(&mut app);
 
         assert_eq!(overlays(&mut app), 1);
@@ -81,12 +81,12 @@ mod tests {
     #[test]
     fn pressing_the_key_again_hides_the_overlay() {
         let mut app = overlay_app();
-        press(&mut app, DIAGNOSTICS_OVERLAY_KEY);
+        press_key(&mut app, DIAGNOSTICS_OVERLAY_KEY);
         tick(&mut app);
-        release(&mut app, DIAGNOSTICS_OVERLAY_KEY);
+        release_key(&mut app, DIAGNOSTICS_OVERLAY_KEY);
         tick(&mut app);
 
-        press(&mut app, DIAGNOSTICS_OVERLAY_KEY);
+        press_key(&mut app, DIAGNOSTICS_OVERLAY_KEY);
         tick(&mut app);
 
         assert_eq!(overlays(&mut app), 0);
@@ -95,7 +95,7 @@ mod tests {
     #[test]
     fn holding_the_key_down_leaves_one_overlay() {
         let mut app = overlay_app();
-        press(&mut app, DIAGNOSTICS_OVERLAY_KEY);
+        press_key(&mut app, DIAGNOSTICS_OVERLAY_KEY);
         tick(&mut app);
 
         tick(&mut app);

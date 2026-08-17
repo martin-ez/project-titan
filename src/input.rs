@@ -1,3 +1,4 @@
+use bevy::input::InputSystems;
 use bevy::prelude::*;
 use bevy::window::{CursorOptions, PrimaryWindow};
 
@@ -56,30 +57,32 @@ impl Plugin for PlayerInputPlugin {
         app.insert_state(PlayerAction::Select)
             .insert_state(CameraMovement::Translate)
             .insert_resource(PlayerInput::default())
-            .add_systems(Startup, setup)
+            .add_systems(Startup, (spawn_indicator, hide_the_cursor))
             .add_systems(
                 PreUpdate,
-                (update_camera_movement_type, update_player_input),
+                (update_camera_movement_type, update_player_input).after(InputSystems),
             )
             .add_systems(Update, update_indicator);
     }
 }
 
-fn setup(
+fn spawn_indicator(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut cursor_q: Query<&mut CursorOptions, With<PrimaryWindow>>,
-) -> Result {
+) {
     commands.spawn((
         EditingTargetIndicator {},
         Visibility::Hidden,
         Mesh3d(meshes.add(Sphere::new(0.1))),
         MeshMaterial3d(materials.add(Color::srgb(0.1, 0.2, 0.9))),
     ));
-    let mut cursor_options = cursor_q.single_mut()?;
-    cursor_options.visible = false;
-    Ok(())
+}
+
+fn hide_the_cursor(mut cursor_q: Query<&mut CursorOptions, With<PrimaryWindow>>) {
+    for mut cursor_options in &mut cursor_q {
+        cursor_options.visible = false;
+    }
 }
 
 /// Update the camera movement type based on the player's input
@@ -104,26 +107,33 @@ fn update_camera_movement_type(
     }
 }
 
+/// Read the player's input into `PlayerInput`.
+///
+/// The cursor points nowhere without a window to point in, and nowhere without a camera to point
+/// from, but a key and a click are still a key and a click: neither half stops the other.
 fn update_player_input(
-    mut movement_vector: ResMut<PlayerInput>,
+    mut player_input: ResMut<PlayerInput>,
     input: Res<ButtonInput<KeyCode>>,
     mouse_input: Res<ButtonInput<MouseButton>>,
-    window: Single<&Window>,
-    camera: Query<(&Camera, &GlobalTransform)>,
-) -> Result {
-    let (camera, camera_transform) = camera.single()?;
-    movement_vector.world_cursor_position =
-        get_world_cursor_position(window, camera, camera_transform);
-    movement_vector.movement_vector = get_movement_vector(input, camera_transform);
-    movement_vector.tap = mouse_input.just_pressed(MouseButton::Left);
-    Ok(())
+    window: Option<Single<&Window>>,
+    camera: Option<Single<(&Camera, &GlobalTransform)>>,
+) {
+    player_input.tap = mouse_input.just_pressed(MouseButton::Left);
+
+    let Some(camera) = camera else {
+        player_input.movement_vector = Vec3::ZERO;
+        player_input.world_cursor_position = None;
+        return;
+    };
+    let (camera, camera_transform) = *camera;
+
+    player_input.movement_vector = get_movement_vector(&input, camera_transform);
+    player_input.world_cursor_position =
+        window.and_then(|window| get_world_cursor_position(&window, camera, camera_transform));
 }
 
 /// Calculate the movement vector based on the player's input (WASD) and the camera's orientation
-fn get_movement_vector(
-    input: Res<ButtonInput<KeyCode>>,
-    camera_transform: &GlobalTransform,
-) -> Vec3 {
+fn get_movement_vector(input: &ButtonInput<KeyCode>, camera_transform: &GlobalTransform) -> Vec3 {
     let mut direction = Vec3::ZERO;
     if input.pressed(KeyCode::KeyW) {
         direction -= Vec3::Z;
@@ -149,7 +159,7 @@ fn ground_plane_direction(direction: Vec3) -> Vec3 {
 /// Calculate the intersection with the ground plane of the ray originating from the camera and
 /// passing through the cursor
 fn get_world_cursor_position(
-    window: Single<&Window>,
+    window: &Window,
     camera: &Camera,
     camera_transform: &GlobalTransform,
 ) -> Option<Vec3> {
@@ -165,20 +175,142 @@ fn get_world_cursor_position(
 fn update_indicator(
     mut indicator_q: Query<(&mut Transform, &mut Visibility), With<EditingTargetIndicator>>,
     player_input: Res<PlayerInput>,
-) -> Result {
-    let (mut indicator, mut visibility) = indicator_q.single_mut()?;
-    if let Some(point) = player_input.world_cursor_position {
-        indicator.translation = point;
-        *visibility = Visibility::Visible;
-    } else {
-        *visibility = Visibility::Hidden;
+) {
+    for (mut indicator, mut visibility) in &mut indicator_q {
+        if let Some(point) = player_input.world_cursor_position {
+            indicator.translation = point;
+            *visibility = Visibility::Visible;
+        } else {
+            *visibility = Visibility::Hidden;
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{headless_app, press_key, press_mouse, release_key, release_mouse, tick};
+
+    fn input_app() -> App {
+        let mut app = headless_app();
+        app.add_plugins(PlayerInputPlugin);
+        app
+    }
+
+    fn spawn_a_camera(app: &mut App) {
+        app.world_mut().spawn(Camera3d::default());
+    }
+
+    fn spawn_a_primary_window(app: &mut App) {
+        app.world_mut()
+            .spawn((Window::default(), PrimaryWindow, CursorOptions::default()));
+    }
+
+    fn camera_movement(app: &App) -> CameraMovement {
+        app.world()
+            .resource::<State<CameraMovement>>()
+            .get()
+            .clone()
+    }
+
+    fn player_input(app: &App) -> &PlayerInput {
+        app.world().resource::<PlayerInput>()
+    }
+
+    #[test]
+    fn holding_the_orbit_key_switches_the_camera_to_orbiting() {
+        let mut app = input_app();
+        tick(&mut app);
+
+        press_key(&mut app, CAMERA_ORBIT_KEY);
+        tick(&mut app);
+
+        assert_eq!(camera_movement(&app), CameraMovement::Orbit);
+    }
+
+    #[test]
+    fn letting_the_orbit_key_go_returns_the_camera_to_translating() {
+        let mut app = input_app();
+        press_key(&mut app, CAMERA_ORBIT_KEY);
+        tick(&mut app);
+
+        release_key(&mut app, CAMERA_ORBIT_KEY);
+        tick(&mut app);
+
+        assert_eq!(camera_movement(&app), CameraMovement::Translate);
+    }
+
+    #[test]
+    fn holding_the_middle_mouse_button_pans_the_camera() {
+        let mut app = input_app();
+        tick(&mut app);
+
+        press_mouse(&mut app, MouseButton::Middle);
+        tick(&mut app);
+
+        assert_eq!(camera_movement(&app), CameraMovement::Pan);
+    }
+
+    #[test]
+    fn letting_the_middle_mouse_button_go_returns_the_camera_to_translating() {
+        let mut app = input_app();
+        press_mouse(&mut app, MouseButton::Middle);
+        tick(&mut app);
+
+        release_mouse(&mut app, MouseButton::Middle);
+        tick(&mut app);
+
+        assert_eq!(camera_movement(&app), CameraMovement::Translate);
+    }
+
+    #[test]
+    fn a_click_is_reported_as_a_tap() {
+        let mut app = input_app();
+        tick(&mut app);
+
+        press_mouse(&mut app, MouseButton::Left);
+        tick(&mut app);
+
+        assert!(player_input(&app).tap);
+    }
+
+    #[test]
+    fn pressing_forward_moves_away_from_the_camera() {
+        let mut app = input_app();
+        spawn_a_camera(&mut app);
+        tick(&mut app);
+
+        press_key(&mut app, KeyCode::KeyW);
+        tick(&mut app);
+
+        assert_eq!(player_input(&app).movement_vector, -Vec3::Z);
+    }
+
+    #[test]
+    fn without_a_window_the_cursor_points_nowhere() {
+        let mut app = input_app();
+        spawn_a_camera(&mut app);
+
+        tick(&mut app);
+
+        assert_eq!(player_input(&app).world_cursor_position, None);
+    }
+
+    #[test]
+    fn a_primary_window_has_its_cursor_hidden() {
+        let mut app = headless_app();
+        spawn_a_primary_window(&mut app);
+        app.add_plugins(PlayerInputPlugin);
+
+        tick(&mut app);
+
+        let mut query = app.world_mut().query::<&CursorOptions>();
+        let cursor = query
+            .iter(app.world())
+            .next()
+            .expect("the window the test spawned is still there");
+        assert!(!cursor.visible);
+    }
 
     #[test]
     fn a_tilted_direction_flattens_onto_the_ground_plane() {
