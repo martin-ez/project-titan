@@ -19,9 +19,10 @@ concurrency:
   cancel-in-progress: true
 
 # Two costs here, and they pull apart. Wall clock is the dependency cache
-# hitting or not: 55s on an exact hit, 12-22m without one. Billed minutes are
-# runner choice and job count, because Actions rounds every job up to a whole
-# minute and a private repository gets 2,000 minutes a month.
+# hitting or not: both jobs report inside 90s on an exact hit and the test job
+# takes half an hour without one. Billed minutes are runner choice and job
+# count, because Actions rounds every job up to a whole minute and a private
+# repository gets 2,000 minutes a month.
 #
 # Hence no macOS runner: it bills at ten times the Linux rate, which made it
 # 85% of the bill from 38% of the wall clock. That coverage moves to
