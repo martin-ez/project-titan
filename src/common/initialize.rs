@@ -28,3 +28,57 @@ pub fn initialize_system<T: Component<Mutability = Mutable> + Initialize<P>, P: 
         commands.entity(entity).remove::<NeedsInitialization>();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{headless_app, tick};
+
+    #[derive(Component, Default)]
+    struct Counted {
+        initializations: u32,
+    }
+
+    impl Initialize<()> for Counted {
+        fn initialize(&mut self, _entity: &Entity, _params: &mut ()) {
+            self.initializations += 1;
+        }
+    }
+
+    fn app_with_a_counted_entity() -> (App, Entity) {
+        let mut app = headless_app();
+        app.add_systems(Update, initialize_system::<Counted, ()>);
+        let entity = app
+            .world_mut()
+            .spawn((Counted::default(), NeedsInitialization))
+            .id();
+        (app, entity)
+    }
+
+    fn initializations(app: &App, entity: Entity) -> u32 {
+        app.world()
+            .get::<Counted>(entity)
+            .expect("the entity is never despawned")
+            .initializations
+    }
+
+    #[test]
+    fn a_component_that_needs_initialization_is_initialized() {
+        let (mut app, entity) = app_with_a_counted_entity();
+
+        tick(&mut app);
+
+        assert_eq!(initializations(&app, entity), 1);
+    }
+
+    #[test]
+    fn a_component_is_not_initialized_a_second_time() {
+        let (mut app, entity) = app_with_a_counted_entity();
+
+        tick(&mut app);
+        tick(&mut app);
+        tick(&mut app);
+
+        assert_eq!(initializations(&app, entity), 1);
+    }
+}
