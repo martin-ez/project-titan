@@ -58,12 +58,13 @@ jobs:
       # reports blocks a pull request rather than passing it.
       - id: changed
         uses: ./.github/actions/rust-changed
-      # Saving on failure too, because the default leaves a red build
-      # self-sustaining: it caches nothing, so the next run starts cold.
+      # Deliberately not cache-on-failure. A cache key cannot be overwritten
+      # once written, so a build killed part way — which the concurrency group
+      # above does on every new push — would save a partial target directory
+      # and pin it there for that lockfile, leaving every later run to rebuild
+      # the rest and unable to save the result.
       - if: ${{ steps.changed.outputs.rust != 'false' }}
         uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
       - if: ${{ steps.changed.outputs.rust != 'false' }}
         uses: ./.github/actions/linux-build-deps
       # `!cancelled()` keeps every check reporting after an earlier one fails,
@@ -92,8 +93,6 @@ jobs:
         uses: ./.github/actions/rust-changed
       - if: ${{ steps.changed.outputs.rust != 'false' }}
         uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
       - if: ${{ steps.changed.outputs.rust != 'false' }}
         uses: ./.github/actions/linux-build-deps
       # The tests build a headless App, so no display is needed: a test that
