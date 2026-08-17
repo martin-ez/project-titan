@@ -1,4 +1,4 @@
-use crate::common::{initialize_system, Initialize, NeedsInitialization};
+use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use std::f32::consts::FRAC_PI_2;
@@ -65,8 +65,8 @@ impl MapTile {
 }
 
 impl Initialize<MapTileInitializeParams<'_, '_>> for MapTile {
-    fn initialize(&mut self, entity: &Entity, params: &mut MapTileInitializeParams) {
-        let (mut transform, mut visibility) = params.query.get_mut(*entity).unwrap();
+    fn initialize(&mut self, entity: &Entity, params: &mut MapTileInitializeParams) -> Result {
+        let (mut transform, mut visibility) = params.query.get_mut(*entity)?;
         transform.translation = self.world_position();
         *visibility = Visibility::Visible;
 
@@ -87,5 +87,65 @@ impl Initialize<MapTileInitializeParams<'_, '_>> for MapTile {
                     )),
             ));
         });
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::initialize::InitializationFailed;
+    use crate::testing::{headless_app, tick};
+
+    fn map_app() -> App {
+        let mut app = headless_app();
+        app.add_plugins(MapPlugin);
+        app
+    }
+
+    fn spawn_tile(app: &mut App, x: f32, y: f32) -> Entity {
+        app.world_mut()
+            .spawn((
+                MapTile {
+                    coordinates: Vec2::new(x, y),
+                },
+                Visibility::Hidden,
+            ))
+            .id()
+    }
+
+    #[test]
+    fn an_initialized_tile_stands_at_the_world_position_of_its_coordinates() {
+        let mut app = map_app();
+        let tile = spawn_tile(&mut app, 1., 0.);
+
+        tick(&mut app);
+
+        let world = app.world();
+        assert_eq!(
+            world.entity(tile).get::<Transform>().map(|t| t.translation),
+            Some(Vec3::new(MAP_TILE_WIDTH, 0., 0.))
+        );
+        assert_eq!(
+            world.entity(tile).get::<Visibility>(),
+            Some(&Visibility::Visible)
+        );
+        assert!(!world.entity(tile).contains::<NeedsInitialization>());
+        assert!(!world.entity(tile).contains::<InitializationFailed>());
+    }
+
+    #[test]
+    fn a_tile_the_initializer_cannot_read_is_marked_rather_than_panicking() {
+        let mut app = map_app();
+        let tile = app
+            .world_mut()
+            .spawn(MapTile {
+                coordinates: Vec2::ZERO,
+            })
+            .id();
+
+        tick(&mut app);
+
+        assert!(app.world().entity(tile).contains::<InitializationFailed>());
     }
 }

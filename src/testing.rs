@@ -6,6 +6,7 @@
 //! whose clock moves exactly one fixed tick per frame, which is the only footing invariant 2
 //! leaves a simulation test to assert from.
 
+use bevy::asset::AssetPlugin;
 use bevy::input::keyboard::{Key, KeyboardInput, NativeKey};
 use bevy::input::mouse::MouseMotion;
 use bevy::input::{ButtonState, InputPlugin};
@@ -16,7 +17,14 @@ use bevy::time::TimeUpdateStrategy;
 /// An `App` carrying what a plugin needs to run, and nothing that opens a window.
 pub fn headless_app() -> App {
     let mut app = App::new();
-    app.add_plugins((MinimalPlugins, StatesPlugin, InputPlugin));
+    app.add_plugins((
+        MinimalPlugins,
+        StatesPlugin,
+        InputPlugin,
+        AssetPlugin::default(),
+    ))
+    .init_asset::<Mesh>()
+    .init_asset::<StandardMaterial>();
     app
 }
 
