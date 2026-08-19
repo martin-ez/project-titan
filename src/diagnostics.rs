@@ -6,6 +6,8 @@ use bevy::prelude::*;
 const DIAGNOSTICS_OVERLAY_KEY: KeyCode = KeyCode::F3;
 /// Key binding that shows and hides the debug gizmos
 const DEBUG_GIZMOS_KEY: KeyCode = KeyCode::F4;
+/// Whether the debug gizmos are on when the game opens
+const DEBUG_GIZMOS_AT_STARTUP: bool = cfg!(debug_assertions);
 
 /// Frame rate and frame time, on a key, over whatever else is on screen.
 ///
@@ -53,8 +55,9 @@ pub struct DebugGizmos;
 /// One switch for every debug gizmo this game draws.
 ///
 /// A debug view is how a jam stops looking like a slow rover, and a key each is how a debug layer
-/// stops being usable. One key flips the whole `DebugGizmos` group instead. Off at startup: a game
-/// that opens covered in arrows is not the one being played.
+/// stops being usable. One key flips the whole `DebugGizmos` group instead. A development build
+/// opens with the group on, because watching a system run is what that build is for; a release
+/// build opens with it off, because a player is not there to read it.
 pub struct DebugGizmosPlugin;
 
 impl Plugin for DebugGizmosPlugin {
@@ -62,7 +65,7 @@ impl Plugin for DebugGizmosPlugin {
         app.insert_gizmo_config(
             DebugGizmos,
             GizmoConfig {
-                enabled: false,
+                enabled: DEBUG_GIZMOS_AT_STARTUP,
                 ..default()
             },
         )
@@ -160,8 +163,27 @@ mod tests {
             .enabled
     }
 
+    fn set_gizmos(app: &mut App, on: bool) {
+        app.world_mut()
+            .resource_mut::<GizmoConfigStore>()
+            .config_mut::<DebugGizmos>()
+            .0
+            .enabled = on;
+    }
+
+    #[cfg(debug_assertions)]
     #[test]
-    fn the_debug_gizmos_are_off_until_the_key_is_pressed() {
+    fn a_development_build_opens_with_the_debug_gizmos_on() {
+        let mut app = gizmo_app();
+
+        tick(&mut app);
+
+        assert!(gizmos_are_on(&app));
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn a_release_build_opens_with_the_debug_gizmos_off() {
         let mut app = gizmo_app();
 
         tick(&mut app);
@@ -172,6 +194,8 @@ mod tests {
     #[test]
     fn pressing_the_key_turns_the_debug_gizmos_on() {
         let mut app = gizmo_app();
+        tick(&mut app);
+        set_gizmos(&mut app, false);
 
         press_key(&mut app, DEBUG_GIZMOS_KEY);
         tick(&mut app);
@@ -180,12 +204,10 @@ mod tests {
     }
 
     #[test]
-    fn pressing_the_key_again_turns_the_debug_gizmos_off() {
+    fn pressing_the_key_turns_the_debug_gizmos_off() {
         let mut app = gizmo_app();
-        press_key(&mut app, DEBUG_GIZMOS_KEY);
         tick(&mut app);
-        release_key(&mut app, DEBUG_GIZMOS_KEY);
-        tick(&mut app);
+        set_gizmos(&mut app, true);
 
         press_key(&mut app, DEBUG_GIZMOS_KEY);
         tick(&mut app);
@@ -196,6 +218,8 @@ mod tests {
     #[test]
     fn holding_the_key_down_leaves_the_debug_gizmos_on() {
         let mut app = gizmo_app();
+        tick(&mut app);
+        set_gizmos(&mut app, false);
         press_key(&mut app, DEBUG_GIZMOS_KEY);
         tick(&mut app);
 
