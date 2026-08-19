@@ -57,12 +57,33 @@ tests, and looks tidier.
    Every one of those makes the game easier to build and removes the problem it
    is about.
 
-2. **The simulation runs on fixed ticks; presentation runs on frames.**
-   Gameplay state changes in `FixedUpdate` and reads the tick, never
-   `delta_secs()`. Smoothing, interpolation and camera easing run in `Update`
-   and change nothing a rover can observe. This is what makes a jam reproducible
-   — the same inputs give the same traffic, on any machine and at any frame rate
-   — and it is the only reason a simulation test can assert anything at all.
+2. **The simulation runs on fixed ticks; presentation runs on frames.** A tick
+   is the unit of game time: gameplay state changes in `FixedUpdate` and
+   measures in ticks, never off `delta_secs()`. Smoothing, interpolation and
+   camera easing run in `Update` and change nothing a rover can observe.
+   Running the world faster is then running more ticks, not taking bigger
+   steps, which is what makes time warp a view of the same game rather than a
+   different one — a chain that jams has to jam the same way fast-forwarded as
+   at real time, on any machine and at any frame rate. It is also what leaves a
+   balance claim measurable rather than arguable (2.3): a tick is countable, so
+   a test runs hundreds of them and asserts what came out.
+
+   Input arrives on the frame, because there is nowhere else for it to arrive,
+   and a player edit may land there when the state it writes is its own record:
+   a dropped click places no building, which is a click that did nothing rather
+   than a game that diverged. What may not happen is a system on the tick
+   reading a frame fact. A click is true for one frame, and a frame carries no
+   tick as often as it carries two, so a tick polling one drops it, or acts on
+   it more than once. A command that leaves no record behind it is the one that
+   has to survive the crossing, and the work that first needs one builds it.
+
+   Which side a change belongs on is a judgement, and the question to ask of
+   the state it changes is whether a rover could observe it. If it could it is
+   simulation, whatever folder it lives in. If it only changes what the player
+   sees — a camera settling, a mesh catching up to the tile it stands on — it
+   is presentation, `delta_secs()` and all, and it may lag the simulation by a
+   frame. Nothing here bans measuring real time. What it bans is gameplay
+   depending on it.
 
 3. **Hex coordinates are the truth; a world position is derived.** A tile, a
    building and a road segment are located by integer grid coordinates, and
