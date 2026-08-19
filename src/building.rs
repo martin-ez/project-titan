@@ -108,6 +108,7 @@ impl Initialize<BuildingInitializeParams<'_, '_>> for Building {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::initialize::InitializationFailed;
     use crate::testing::{headless_app, tick};
 
     fn building_app(action: PlayerAction) -> App {
@@ -176,6 +177,27 @@ mod tests {
                 .map(|t| t.translation),
             Some(HexCoordinates::from_offset_row(2, 3).world_position())
         );
+    }
+
+    #[test]
+    fn a_placed_building_is_there_to_see_once_it_is_initialized() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        let tile = spawn_tile(&mut app, 0, 0);
+
+        tap_on(&mut app, Some(tile));
+        tick(&mut app);
+
+        let building = building_entity(&mut app).expect("the tap placed a building");
+        let world = app.world();
+        assert_eq!(
+            world.entity(building).get::<Visibility>(),
+            Some(&Visibility::Visible)
+        );
+        assert!(!world.entity(building).contains::<InitializationFailed>());
+        assert!(world
+            .entity(building)
+            .get::<Children>()
+            .is_some_and(|children| !children.is_empty()));
     }
 
     #[test]
