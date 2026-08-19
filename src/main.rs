@@ -14,6 +14,7 @@ fn main() {
         .add_plugins(building::BuildingPlugin)
         .add_plugins(camera::CameraPlugin)
         .add_plugins(common::CommonPlugin)
+        .add_plugins(diagnostics::DebugGizmosPlugin)
         .add_plugins(diagnostics::DiagnosticsPlugin)
         .add_plugins(input::PlayerInputPlugin)
         .add_plugins(map::MapPlugin)
