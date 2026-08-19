@@ -1,10 +1,11 @@
 //! A headless `App` to drive this game's systems in a test.
 //!
-//! `MinimalPlugins` on its own cannot hold one of these plugins: states and the input resources
-//! and messages come from plugins outside it, and virtual time advances by however long the last
-//! frame happened to take. What this builds instead is an `App` with no window and no renderer
-//! whose clock moves exactly one fixed tick per frame, which is the only footing invariant 2
-//! leaves a simulation test to assert from.
+//! `MinimalPlugins` on its own cannot hold one of these plugins: states, the input resources and
+//! messages and the propagation that gives an entity a `GlobalTransform` all come from plugins
+//! outside it, and virtual time advances by however long the last frame happened to take. What
+//! this builds instead is an `App` with no window and no renderer whose clock moves exactly one
+//! fixed tick per frame, which is the only footing invariant 2 leaves a simulation test to assert
+//! from.
 
 use bevy::asset::AssetPlugin;
 use bevy::input::keyboard::{Key, KeyboardInput, NativeKey};
@@ -21,6 +22,7 @@ pub fn headless_app() -> App {
         MinimalPlugins,
         StatesPlugin,
         InputPlugin,
+        TransformPlugin,
         AssetPlugin::default(),
     ))
     .init_asset::<Mesh>()
