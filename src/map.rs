@@ -1,3 +1,4 @@
+use crate::common::cursor::{CursorSurface, TileSurface};
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -13,9 +14,23 @@ const MAP_TILE_DEPTH: f32 = 0.25;
 pub struct MapPlugin;
 
 #[derive(Component)]
-#[require(Transform, InheritedVisibility, NeedsInitialization)]
+#[require(
+    Transform,
+    InheritedVisibility,
+    NeedsInitialization,
+    TileSurface,
+    CursorSurface = tile_surface()
+)]
 struct MapTile {
     coordinates: Vec2,
+}
+
+/// The ground a tile offers the cursor: the whole hex, gap included, lying flat on the tile.
+fn tile_surface() -> CursorSurface {
+    CursorSurface {
+        radius: MAP_TILE_SIZE / 2.,
+        height: 0.,
+    }
 }
 
 #[derive(SystemParam)]
@@ -132,6 +147,21 @@ mod tests {
         );
         assert!(!world.entity(tile).contains::<NeedsInitialization>());
         assert!(!world.entity(tile).contains::<InitializationFailed>());
+    }
+
+    #[test]
+    fn a_tile_offers_the_cursor_a_hexagon_the_size_of_the_grid() {
+        let mut app = map_app();
+        let tile = spawn_tile(&mut app, 0., 0.);
+
+        tick(&mut app);
+
+        let world = app.world();
+        assert!(world.entity(tile).contains::<TileSurface>());
+        assert_eq!(
+            world.entity(tile).get::<CursorSurface>().map(|s| s.radius),
+            Some(MAP_TILE_SIZE / 2.)
+        );
     }
 
     #[test]

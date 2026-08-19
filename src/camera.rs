@@ -132,7 +132,7 @@ fn pan(
     for (mut controller, mut transform) in &mut controller_q {
         match action.get() {
             CameraMovement::Pan => {
-                if let Some(point) = player_input.world_cursor_position {
+                if let Some(point) = player_input.ground_cursor_position {
                     if let Some(last_point) = *selected_point {
                         let delta = last_point - point;
                         controller.target += delta;
