@@ -47,6 +47,8 @@ pub struct PlayerInput {
     pub movement_vector: Vec3,
     /// Whether the player just tap or clicked
     pub tap: bool,
+    /// Whether the player just clicked with the secondary mouse button
+    pub secondary_tap: bool,
 }
 
 #[derive(Component)]
@@ -151,6 +153,7 @@ fn update_player_input(
     action: Res<State<PlayerAction>>,
 ) {
     player_input.tap = mouse_input.just_pressed(MouseButton::Left);
+    player_input.secondary_tap = mouse_input.just_pressed(MouseButton::Right);
 
     let Some(camera) = camera else {
         player_input.movement_vector = Vec3::ZERO;
@@ -407,6 +410,28 @@ mod tests {
         tick(&mut app);
 
         assert!(player_input(&app).tap);
+    }
+
+    #[test]
+    fn a_right_click_is_reported_as_a_secondary_tap() {
+        let mut app = input_app();
+        tick(&mut app);
+
+        press_mouse(&mut app, MouseButton::Right);
+        tick(&mut app);
+
+        assert!(player_input(&app).secondary_tap);
+    }
+
+    #[test]
+    fn a_right_click_is_not_reported_as_a_tap() {
+        let mut app = input_app();
+        tick(&mut app);
+
+        press_mouse(&mut app, MouseButton::Right);
+        tick(&mut app);
+
+        assert!(!player_input(&app).tap);
     }
 
     #[test]
