@@ -1,3 +1,4 @@
+use crate::simulation::TICKS_PER_SECOND;
 use bevy::dev_tools::diagnostics_overlay::{DiagnosticsOverlay, DiagnosticsOverlayPlugin};
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
 use bevy::prelude::*;
@@ -40,9 +41,17 @@ fn toggle_overlay(
             commands.entity(overlay).despawn();
         }
         None => {
-            commands.spawn(DiagnosticsOverlay::fps());
+            commands.spawn(frames_and_ticks());
         }
     }
+}
+
+/// The frame rate the player is watching at, and the rate the world is ticking under it.
+fn frames_and_ticks() -> DiagnosticsOverlay {
+    let mut overlay = DiagnosticsOverlay::fps();
+    overlay.title = "Frames and ticks".into();
+    overlay.items.push(TICKS_PER_SECOND.into());
+    overlay
 }
 
 /// The gizmo config group this game's debug views draw into.
@@ -107,6 +116,24 @@ mod tests {
         tick(&mut app);
 
         assert_eq!(overlays(&mut app), 0);
+    }
+
+    #[test]
+    fn the_overlay_shows_the_rate_the_world_is_ticking_at() {
+        let mut app = overlay_app();
+
+        press_key(&mut app, DIAGNOSTICS_OVERLAY_KEY);
+        tick(&mut app);
+
+        let mut query = app.world_mut().query::<&DiagnosticsOverlay>();
+        let overlay = query
+            .iter(app.world())
+            .next()
+            .expect("the key spawned an overlay");
+        assert!(overlay
+            .items
+            .iter()
+            .any(|item| item.path == TICKS_PER_SECOND));
     }
 
     #[test]
