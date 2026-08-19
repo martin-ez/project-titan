@@ -8,6 +8,7 @@
 //! from.
 
 use bevy::asset::AssetPlugin;
+use bevy::gizmos::GizmoAsset;
 use bevy::input::keyboard::{Key, KeyboardInput, NativeKey};
 use bevy::input::mouse::{MouseButtonInput, MouseMotion};
 use bevy::input::{ButtonState, InputPlugin};
@@ -26,6 +27,7 @@ pub fn headless_app() -> App {
         TransformPlugin,
         AssetPlugin::default(),
     ))
+    .init_asset::<GizmoAsset>()
     .init_asset::<Mesh>()
     .init_asset::<StandardMaterial>();
     app
