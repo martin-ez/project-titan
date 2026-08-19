@@ -4,8 +4,10 @@ use bevy::prelude::*;
 use std::f32::consts::{PI, TAU};
 use std::ops::Range;
 
-/// Speed of the camera when translating with WASD
-const TRANSLATION_SENSITIVITY: f32 = 0.12;
+/// Speed of the camera when translating with WASD, in world units per second.
+///
+/// Settled by play testing as 0.12 per tick of the 64 Hz clock it used to run on.
+const TRANSLATION_SENSITIVITY: f32 = 7.68;
 /// How much the speed of the camera increases when zooming out
 const TRANSLATION_ZOOM_MULTIPLIER: f32 = 0.04;
 /// Smoothing factor for the camera translation
@@ -44,10 +46,11 @@ struct PanOrbitCamera {
 impl Plugin for CameraPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, spawn_camera)
-            .add_systems(Update, (scroll_zoom, pan))
             .add_systems(
-                FixedUpdate,
+                Update,
                 (
+                    scroll_zoom,
+                    pan,
                     translate.run_if(not(in_state(CameraMovement::Pan))),
                     orbit.run_if(in_state(CameraMovement::Orbit)),
                     mouse_zoom.run_if(in_state(CameraMovement::Zoom)),
@@ -77,7 +80,7 @@ fn spawn_camera(mut commands: Commands) {
 fn smooth_tracking(
     mut controller_query: Query<(&mut Transform, &PanOrbitCamera), With<PanOrbitCamera>>,
     mut camera_query: Query<&mut Transform, (With<Camera>, Without<PanOrbitCamera>)>,
-    time: Res<Time>,
+    time: Res<Time<Real>>,
 ) -> Result {
     for (mut root_transform, controller) in &mut controller_query {
         let mut camera_transform = camera_query.single_mut()?;
@@ -105,10 +108,12 @@ fn smooth_tracking(
 fn translate(
     mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
     player_input: Res<PlayerInput>,
+    time: Res<Time<Real>>,
 ) -> Result {
     let mut controller = controller_q.single_mut()?;
     let zoom_multiplier = (controller.radius * TRANSLATION_ZOOM_MULTIPLIER).exp();
-    controller.target += player_input.movement_vector * TRANSLATION_SENSITIVITY * zoom_multiplier;
+    let step = TRANSLATION_SENSITIVITY * zoom_multiplier * time.delta_secs();
+    controller.target += player_input.movement_vector * step;
     Ok(())
 }
 
@@ -122,7 +127,7 @@ fn pan(
     mut inertia: Local<Option<Vec3>>,
     player_input: Res<PlayerInput>,
     action: Res<State<CameraMovement>>,
-    time: Res<Time>,
+    time: Res<Time<Real>>,
 ) {
     for (mut controller, mut transform) in &mut controller_q {
         match action.get() {
@@ -227,7 +232,11 @@ fn mouse_zoom(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{headless_app, move_mouse, tick};
+    use crate::testing::{advance, headless_app, move_mouse, tick};
+    use std::time::Duration;
+
+    /// A frame short enough that virtual time never reaches its maximum delta.
+    const FRAME: Duration = Duration::from_millis(10);
 
     fn camera_app(movement: CameraMovement) -> App {
         let mut app = headless_app();
@@ -235,6 +244,49 @@ mod tests {
             .insert_resource(PlayerInput::default())
             .add_plugins(CameraPlugin);
         app
+    }
+
+    fn translating_app() -> App {
+        let mut app = camera_app(CameraMovement::Translate);
+        app.world_mut()
+            .resource_mut::<PlayerInput>()
+            .movement_vector = Vec3::X;
+        app
+    }
+
+    fn advance_by(app: &mut App, frames: u32) {
+        for _ in 0..frames {
+            advance(app, FRAME);
+        }
+    }
+
+    fn translated_over(app: &mut App, frames: u32, frame: Duration) -> Vec3 {
+        advance(app, frame);
+        let before = controller(app, |camera| camera.target);
+        for _ in 0..frames {
+            advance(app, frame);
+        }
+        controller(app, |camera| camera.target) - before
+    }
+
+    fn set_target(app: &mut App, target: Vec3) {
+        let mut query = app.world_mut().query::<&mut PanOrbitCamera>();
+        let mut controller = query
+            .iter_mut(app.world_mut())
+            .next()
+            .expect("the plugin spawns a controller on startup");
+        controller.target = target;
+    }
+
+    fn camera_translation(app: &mut App) -> Vec3 {
+        let mut query = app
+            .world_mut()
+            .query_filtered::<&Transform, With<PanOrbitCamera>>();
+        query
+            .iter(app.world())
+            .next()
+            .expect("the plugin spawns a controller on startup")
+            .translation
     }
 
     fn controller<T>(app: &mut App, read: impl Fn(&PanOrbitCamera) -> T) -> T {
@@ -296,6 +348,100 @@ mod tests {
         let after = controller(&mut app, |camera| camera.target);
         assert!(after.x > before.x);
         assert_eq!(after.y, before.y);
+    }
+
+    #[test]
+    fn the_camera_translates_the_same_distance_at_any_frame_rate() {
+        let in_one_frame = translated_over(&mut translating_app(), 1, 10 * FRAME);
+        let in_ten = translated_over(&mut translating_app(), 10, FRAME);
+
+        assert!((in_one_frame - in_ten).length() < 1e-4);
+        assert!(in_one_frame.x > 0.0);
+    }
+
+    #[test]
+    fn the_camera_translates_at_the_same_speed_whatever_the_tick_rate() {
+        let mut slow = translating_app();
+        slow.insert_resource(Time::<Fixed>::from_hz(8.0));
+        let mut fast = translating_app();
+        fast.insert_resource(Time::<Fixed>::from_hz(256.0));
+
+        let travelled = translated_over(&mut slow, 10, FRAME);
+
+        assert!((travelled - translated_over(&mut fast, 10, FRAME)).length() < 1e-4);
+        assert!(travelled.x > 0.0);
+    }
+
+    #[test]
+    fn the_camera_translates_at_the_same_speed_when_the_simulation_runs_fast() {
+        let mut normal = translating_app();
+        let mut fast = translating_app();
+        fast.world_mut()
+            .resource_mut::<Time<Virtual>>()
+            .set_relative_speed(4.0);
+
+        let travelled = translated_over(&mut normal, 10, FRAME);
+
+        assert!((travelled - translated_over(&mut fast, 10, FRAME)).length() < 1e-4);
+        assert!(travelled.x > 0.0);
+    }
+
+    #[test]
+    fn the_camera_eases_at_the_same_rate_when_the_simulation_runs_fast() {
+        let mut normal = camera_app(CameraMovement::Translate);
+        let mut fast = camera_app(CameraMovement::Translate);
+        fast.world_mut()
+            .resource_mut::<Time<Virtual>>()
+            .set_relative_speed(4.0);
+        advance_by(&mut normal, 1);
+        advance_by(&mut fast, 1);
+        set_target(&mut normal, Vec3::X * 10.0);
+        set_target(&mut fast, Vec3::X * 10.0);
+
+        advance_by(&mut normal, 10);
+        advance_by(&mut fast, 10);
+
+        let eased = camera_translation(&mut normal);
+        assert!((eased - camera_translation(&mut fast)).length() < 1e-4);
+        assert!(eased.x > 0.0);
+    }
+
+    #[test]
+    fn the_camera_translates_on_a_frame_with_no_fixed_tick() {
+        let mut app = translating_app();
+        app.insert_resource(Time::<Fixed>::from_seconds(1_000.0));
+        advance_by(&mut app, 1);
+        let before = controller(&mut app, |camera| camera.target);
+
+        advance_by(&mut app, 1);
+
+        assert!(controller(&mut app, |camera| camera.target).x > before.x);
+    }
+
+    #[test]
+    fn the_camera_orbits_on_a_frame_with_no_fixed_tick() {
+        let mut app = camera_app(CameraMovement::Orbit);
+        app.insert_resource(Time::<Fixed>::from_seconds(1_000.0));
+        advance_by(&mut app, 1);
+        let before = controller(&mut app, |camera| camera.yaw);
+
+        move_mouse(&mut app, Vec2::new(10.0, 0.0));
+        advance_by(&mut app, 1);
+
+        assert_ne!(controller(&mut app, |camera| camera.yaw), before);
+    }
+
+    #[test]
+    fn the_camera_zooms_on_a_frame_with_no_fixed_tick() {
+        let mut app = camera_app(CameraMovement::Zoom);
+        app.insert_resource(Time::<Fixed>::from_seconds(1_000.0));
+        advance_by(&mut app, 1);
+        let before = controller(&mut app, |camera| camera.radius);
+
+        move_mouse(&mut app, Vec2::new(0.0, 10.0));
+        advance_by(&mut app, 1);
+
+        assert_ne!(controller(&mut app, |camera| camera.radius), before);
     }
 
     #[test]
