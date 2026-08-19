@@ -1,4 +1,4 @@
-use crate::common::cursor::CursorRayCast;
+use crate::common::cursor::{CursorHit, CursorRayCast};
 use bevy::input::InputSystems;
 use bevy::prelude::*;
 use bevy::window::{CursorOptions, PrimaryWindow};
@@ -37,7 +37,7 @@ pub enum CameraMovement {
 
 #[derive(Resource, Default)]
 pub struct PlayerInput {
-    /// The point on the surface the cursor is over, which is nothing where there is no surface
+    /// The point on the surface the cursor is over, settled onto a tile while a build tool is held
     pub world_cursor_position: Option<Vec3>,
     /// Where the cursor meets the ground plane, whatever stands between the two
     pub ground_cursor_position: Option<Vec3>,
@@ -148,6 +148,7 @@ fn update_player_input(
     window: Option<Single<&Window>>,
     camera: Option<Single<(&Camera, &GlobalTransform)>>,
     surfaces: CursorRayCast,
+    action: Res<State<PlayerAction>>,
 ) {
     player_input.tap = mouse_input.just_pressed(MouseButton::Left);
 
@@ -166,8 +167,24 @@ fn update_player_input(
     player_input.ground_cursor_position = ray.and_then(ground_plane_position);
 
     let hit = ray.and_then(|ray| surfaces.cast(ray));
-    player_input.world_cursor_position = hit.as_ref().map(|hit| hit.point);
-    player_input.cursor_tile = hit.and_then(|hit| hit.tile);
+    player_input.world_cursor_position = hit.as_ref().map(|hit| settled_position(hit, &action));
+    player_input.cursor_tile = hit.and_then(|hit| hit.tile).map(|tile| tile.entity);
+}
+
+/// Where the cursor reports itself to be, given the tool the player is holding.
+///
+/// A build tool settles it over the middle of the tile it is on, so an edit lands on a tile rather
+/// than between two. The height it landed at is its own, so a cursor over a building stays on top
+/// of the building rather than dropping through it.
+fn settled_position(hit: &CursorHit, action: &PlayerAction) -> Vec3 {
+    let editing = matches!(
+        action,
+        PlayerAction::EditRoads | PlayerAction::EditBuildings
+    );
+    match hit.tile {
+        Some(tile) if editing => Vec3::new(tile.centre.x, hit.point.y, tile.centre.z),
+        _ => hit.point,
+    }
 }
 
 /// Calculate the movement vector based on the player's input (WASD) and the camera's orientation
@@ -236,6 +253,8 @@ mod tests {
 
     const SURFACE_RADIUS: f32 = 10.;
     const WINDOW_SIZE: UVec2 = UVec2::new(1280, 720);
+    /// A tile centre the ray down the world's Y axis lands on, but not at the middle of.
+    const OFF_CENTRE_TILE: Vec3 = Vec3::new(3., 0., 1.);
 
     fn input_app() -> App {
         let mut app = headless_app();
@@ -275,22 +294,37 @@ mod tests {
         app
     }
 
-    fn spawn_surface(app: &mut App, height: f32) -> Entity {
+    fn spawn_surface_at(app: &mut App, centre: Vec3, height: f32) -> Entity {
         app.world_mut()
             .spawn((
                 CursorSurface {
                     radius: SURFACE_RADIUS,
                     height,
                 },
-                Transform::default(),
+                Transform::from_translation(centre),
             ))
             .id()
     }
 
-    fn spawn_tile(app: &mut App) -> Entity {
-        let tile = spawn_surface(app, 0.);
+    fn spawn_surface(app: &mut App, height: f32) -> Entity {
+        spawn_surface_at(app, Vec3::ZERO, height)
+    }
+
+    fn spawn_tile_at(app: &mut App, centre: Vec3) -> Entity {
+        let tile = spawn_surface_at(app, centre, 0.);
         app.world_mut().entity_mut(tile).insert(TileSurface);
         tile
+    }
+
+    fn spawn_tile(app: &mut App) -> Entity {
+        spawn_tile_at(app, Vec3::ZERO)
+    }
+
+    /// Pick up `tool` and let the state it asks for reach the next read of the cursor.
+    fn hold_tool(app: &mut App, tool: KeyCode) {
+        press_key(app, tool);
+        tick(app);
+        tick(app);
     }
 
     /// A ray through a viewport carries the rounding of that viewport, so compare places loosely.
@@ -475,6 +509,75 @@ mod tests {
             .next()
             .expect("the plugin spawns an indicator on startup");
         assert_eq!(visibility, &Visibility::Hidden);
+    }
+
+    #[test]
+    fn the_cursor_settles_on_the_tile_centre_while_the_road_tool_is_held() {
+        let mut app = app_looking_down_at_the_origin();
+        spawn_tile_at(&mut app, OFF_CENTRE_TILE);
+
+        hold_tool(&mut app, ROAD_TOOL_KEY);
+
+        assert_lands_on(player_input(&app).world_cursor_position, OFF_CENTRE_TILE);
+    }
+
+    #[test]
+    fn the_cursor_settles_on_the_tile_centre_while_the_building_tool_is_held() {
+        let mut app = app_looking_down_at_the_origin();
+        spawn_tile_at(&mut app, OFF_CENTRE_TILE);
+
+        hold_tool(&mut app, BUILDING_TOOL_KEY);
+
+        assert_lands_on(player_input(&app).world_cursor_position, OFF_CENTRE_TILE);
+    }
+
+    #[test]
+    fn the_cursor_stays_where_it_landed_while_selecting() {
+        let mut app = app_looking_down_at_the_origin();
+        spawn_tile_at(&mut app, OFF_CENTRE_TILE);
+
+        tick(&mut app);
+        tick(&mut app);
+
+        assert_lands_on(player_input(&app).world_cursor_position, Vec3::ZERO);
+    }
+
+    #[test]
+    fn the_tile_the_cursor_settles_on_is_the_one_the_ray_hit() {
+        let mut app = app_looking_down_at_the_origin();
+        let tile = spawn_tile_at(&mut app, OFF_CENTRE_TILE);
+
+        hold_tool(&mut app, ROAD_TOOL_KEY);
+
+        assert_eq!(player_input(&app).cursor_tile, Some(tile));
+    }
+
+    #[test]
+    fn a_cursor_on_an_object_settles_over_the_centre_of_the_tile_it_stands_on() {
+        let mut app = app_looking_down_at_the_origin();
+        spawn_tile_at(&mut app, OFF_CENTRE_TILE);
+        spawn_surface_at(&mut app, OFF_CENTRE_TILE, 3.);
+
+        hold_tool(&mut app, BUILDING_TOOL_KEY);
+
+        assert_lands_on(
+            player_input(&app).world_cursor_position,
+            OFF_CENTRE_TILE + Vec3::new(0., 3., 0.),
+        );
+    }
+
+    #[test]
+    fn a_held_tool_leaves_a_cursor_off_the_grid_where_it_landed() {
+        let mut app = app_looking_down_at_the_origin();
+        spawn_surface_at(&mut app, OFF_CENTRE_TILE, 2.);
+
+        hold_tool(&mut app, ROAD_TOOL_KEY);
+
+        assert_lands_on(
+            player_input(&app).world_cursor_position,
+            Vec3::new(0., 2., 0.),
+        );
+        assert_eq!(player_input(&app).cursor_tile, None);
     }
 
     #[test]
