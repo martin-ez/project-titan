@@ -26,7 +26,16 @@ pub struct CursorHit {
     /// The point on the nearest surface the ray meets.
     pub point: Vec3,
     /// The nearest tile the ray meets, which is the one under `point` when it is on an object.
-    pub tile: Option<Entity>,
+    pub tile: Option<CursorTile>,
+}
+
+/// A tile a cursor ray met, and the middle of it.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub struct CursorTile {
+    /// The tile itself.
+    pub entity: Entity,
+    /// The middle of the tile's surface, which is the only place on it an edit may go.
+    pub centre: Vec3,
 }
 
 /// Casts a ray against every [`CursorSurface`] in the world.
@@ -51,7 +60,7 @@ impl CursorRayCast<'_, '_> {
     /// building stands on.
     pub fn cast(&self, ray: Ray3d) -> Option<CursorHit> {
         let mut nearest: Option<(f32, Vec3)> = None;
-        let mut nearest_tile: Option<(f32, Entity)> = None;
+        let mut nearest_tile: Option<(f32, CursorTile)> = None;
 
         for (entity, surface, transform, is_tile) in &self.surfaces {
             let Some(distance) = surface_distance(ray, surface, transform.translation()) else {
@@ -61,7 +70,8 @@ impl CursorRayCast<'_, '_> {
                 nearest = Some((distance, ray.get_point(distance)));
             }
             if is_tile && nearest_tile.is_none_or(|(nearest, _)| distance < nearest) {
-                nearest_tile = Some((distance, entity));
+                let centre = transform.translation() + Vec3::Y * surface.height;
+                nearest_tile = Some((distance, CursorTile { entity, centre }));
             }
         }
 
@@ -196,7 +206,19 @@ mod tests {
         let hit = cast(&mut app, straight_down(0., 0.)).expect("the ray meets the object");
 
         assert_eq!(hit.point.y, 3.);
-        assert_eq!(hit.tile, Some(tile));
+        assert_eq!(hit.tile.map(|hit| hit.entity), Some(tile));
+    }
+
+    #[test]
+    fn a_hit_names_the_middle_of_the_tile_it_belongs_to() {
+        let mut app = cast_app();
+        let centre = Vec3::new(3., 0., 1.);
+        spawn_tile(&mut app, centre);
+        tick(&mut app);
+
+        let hit = cast(&mut app, straight_down(0., 0.)).expect("the ray meets the tile");
+
+        assert_eq!(hit.tile.map(|hit| hit.centre), Some(centre));
     }
 
     #[test]
