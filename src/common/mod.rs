@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-mod cleanup;
+pub mod cleanup;
 pub mod cursor;
 pub mod initialize;
 
