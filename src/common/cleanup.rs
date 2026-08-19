@@ -44,7 +44,8 @@ fn destroy_on_state_change_system(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{headless_app, tick};
+    use crate::input::PlayerInputPlugin;
+    use crate::testing::{headless_app, press_key, tick};
 
     fn cleanup_app() -> App {
         let mut app = headless_app();
@@ -94,6 +95,19 @@ mod tests {
         tick(&mut app);
 
         assert!(!still_there(&app, entity));
+    }
+
+    #[test]
+    fn picking_a_tool_destroys_what_the_last_one_left_behind() {
+        let mut app = headless_app();
+        app.add_plugins((PlayerInputPlugin, CleanupPlugin));
+        let preview = app.world_mut().spawn(DestroyOnStateChange).id();
+        tick(&mut app);
+
+        press_key(&mut app, KeyCode::Digit2);
+        tick(&mut app);
+
+        assert!(!still_there(&app, preview));
     }
 
     #[test]
