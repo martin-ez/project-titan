@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+mod building;
 mod camera;
 mod common;
 mod diagnostics;
@@ -10,6 +11,7 @@ mod testing;
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
+        .add_plugins(building::BuildingPlugin)
         .add_plugins(camera::CameraPlugin)
         .add_plugins(common::CommonPlugin)
         .add_plugins(diagnostics::DiagnosticsPlugin)

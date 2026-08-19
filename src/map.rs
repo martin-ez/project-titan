@@ -6,7 +6,8 @@ use std::f32::consts::FRAC_PI_2;
 
 const MAP_GRID_SIZE: i32 = 12;
 const MAP_GRID_GAP: f32 = 0.2;
-const MAP_TILE_SIZE: f32 = 10.;
+/// The across-corners size of a tile: the diameter of the circle its hexagon fits in.
+pub const MAP_TILE_SIZE: f32 = 10.;
 const SQRT_3: f32 = 1.732_050_8;
 const MAP_TILE_WIDTH: f32 = MAP_TILE_SIZE / 2. * SQRT_3;
 const MAP_TILE_ROW_SPACING: f32 = MAP_TILE_SIZE * 0.75;
@@ -14,12 +15,14 @@ const MAP_TILE_DEPTH: f32 = 0.25;
 
 pub struct MapPlugin;
 
+/// Where a tile is: axial hex coordinates, from which a world position is derived.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct HexCoordinates {
+pub struct HexCoordinates {
     q: i32,
     r: i32,
 }
 
+/// One tile of the grid, standing where its coordinates put it.
 #[derive(Component)]
 #[require(
     Transform,
@@ -28,8 +31,9 @@ struct HexCoordinates {
     TileSurface,
     CursorSurface = tile_surface()
 )]
-struct MapTile {
-    coordinates: HexCoordinates,
+pub struct MapTile {
+    /// The tile's place on the grid.
+    pub coordinates: HexCoordinates,
 }
 
 /// The ground a tile offers the cursor: the whole hex, gap included, lying flat on the tile.
@@ -71,14 +75,16 @@ fn setup(mut commands: Commands) {
 }
 
 impl HexCoordinates {
-    fn from_offset_row(col: i32, row: i32) -> Self {
+    /// The coordinates of the cell at `col` and `row` of an offset-row layout.
+    pub fn from_offset_row(col: i32, row: i32) -> Self {
         Self {
             q: col - (row - row.rem_euclid(2)) / 2,
             r: row,
         }
     }
 
-    fn world_position(&self) -> Vec3 {
+    /// Where on the ground plane these coordinates put the middle of a tile.
+    pub fn world_position(&self) -> Vec3 {
         Vec3::new(
             MAP_TILE_WIDTH * (self.q as f32 + self.r as f32 / 2.),
             0.,
