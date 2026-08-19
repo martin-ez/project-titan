@@ -8,6 +8,12 @@ const CAMERA_PAN_KEY: KeyCode = KeyCode::Space;
 const CAMERA_ORBIT_KEY: KeyCode = KeyCode::ShiftLeft;
 /// Key binding for orbiting the camera
 const CAMERA_ZOOM_KEY: KeyCode = KeyCode::ControlLeft;
+/// Key binding for holding the select tool
+const SELECT_TOOL_KEY: KeyCode = KeyCode::Digit1;
+/// Key binding for holding the road editing tool
+const ROAD_TOOL_KEY: KeyCode = KeyCode::Digit2;
+/// Key binding for holding the building editing tool
+const BUILDING_TOOL_KEY: KeyCode = KeyCode::Digit3;
 
 pub struct PlayerInputPlugin;
 
@@ -60,7 +66,12 @@ impl Plugin for PlayerInputPlugin {
             .add_systems(Startup, (spawn_indicator, hide_the_cursor))
             .add_systems(
                 PreUpdate,
-                (update_camera_movement_type, update_player_input).after(InputSystems),
+                (
+                    update_camera_movement_type,
+                    update_player_action,
+                    update_player_input,
+                )
+                    .after(InputSystems),
             )
             .add_systems(Update, update_indicator);
     }
@@ -100,6 +111,30 @@ fn update_camera_movement_type(
         CameraMovement::Pan
     } else {
         CameraMovement::Translate
+    };
+
+    if *current_state.get() != wanted {
+        next_state.set(wanted);
+    }
+}
+
+/// Update the tool the player is holding based on the player's input.
+///
+/// A tool is picked up rather than held down: it stays until another key puts it down, which is
+/// what a camera movement is not.
+fn update_player_action(
+    input: Res<ButtonInput<KeyCode>>,
+    current_state: Res<State<PlayerAction>>,
+    mut next_state: ResMut<NextState<PlayerAction>>,
+) {
+    let wanted = if input.just_pressed(SELECT_TOOL_KEY) {
+        PlayerAction::Select
+    } else if input.just_pressed(ROAD_TOOL_KEY) {
+        PlayerAction::EditRoads
+    } else if input.just_pressed(BUILDING_TOOL_KEY) {
+        PlayerAction::EditBuildings
+    } else {
+        return;
     };
 
     if *current_state.get() != wanted {
@@ -322,5 +357,64 @@ mod tests {
     #[test]
     fn a_direction_straight_up_flattens_to_nothing() {
         assert_eq!(ground_plane_direction(Vec3::Y), Vec3::ZERO);
+    }
+
+    fn player_action(app: &App) -> PlayerAction {
+        app.world().resource::<State<PlayerAction>>().get().clone()
+    }
+
+    #[test]
+    fn the_player_starts_out_selecting() {
+        let mut app = input_app();
+
+        tick(&mut app);
+
+        assert_eq!(player_action(&app), PlayerAction::Select);
+    }
+
+    #[test]
+    fn pressing_the_road_key_holds_the_road_tool() {
+        let mut app = input_app();
+        tick(&mut app);
+
+        press_key(&mut app, ROAD_TOOL_KEY);
+        tick(&mut app);
+
+        assert_eq!(player_action(&app), PlayerAction::EditRoads);
+    }
+
+    #[test]
+    fn pressing_the_building_key_holds_the_building_tool() {
+        let mut app = input_app();
+        tick(&mut app);
+
+        press_key(&mut app, BUILDING_TOOL_KEY);
+        tick(&mut app);
+
+        assert_eq!(player_action(&app), PlayerAction::EditBuildings);
+    }
+
+    #[test]
+    fn pressing_the_select_key_puts_the_road_tool_down() {
+        let mut app = input_app();
+        press_key(&mut app, ROAD_TOOL_KEY);
+        tick(&mut app);
+
+        press_key(&mut app, SELECT_TOOL_KEY);
+        tick(&mut app);
+
+        assert_eq!(player_action(&app), PlayerAction::Select);
+    }
+
+    #[test]
+    fn letting_the_road_key_go_keeps_the_road_tool() {
+        let mut app = input_app();
+        press_key(&mut app, ROAD_TOOL_KEY);
+        tick(&mut app);
+
+        release_key(&mut app, ROAD_TOOL_KEY);
+        tick(&mut app);
+
+        assert_eq!(player_action(&app), PlayerAction::EditRoads);
     }
 }
