@@ -11,6 +11,9 @@ const SEGMENT_SUBDIVISIONS: u32 = 8;
 /// How far into a segment the arrow onto the next one reaches, at either end of the handover.
 const HANDOVER_REACH: f32 = 0.1;
 
+/// How far the debug view lifts a lane off the ground, so it does not fight the tiles it lies on.
+const GIZMO_LIFT: Vec3 = Vec3::new(0., 0.1, 0.);
+
 /// The colour a lane's spline is drawn in
 const LANE_COLOUR: Color = Color::srgb(0.35, 0.75, 0.95);
 
@@ -152,8 +155,9 @@ fn draw_the_lanes(
 ) {
     for (segment, next) in &segments {
         gizmos.linestrip(
-            (0..=SEGMENT_SUBDIVISIONS)
-                .map(|step| segment.world_position(step as f32 / SEGMENT_SUBDIVISIONS as f32)),
+            (0..=SEGMENT_SUBDIVISIONS).map(|step| {
+                segment.world_position(step as f32 / SEGMENT_SUBDIVISIONS as f32) + GIZMO_LIFT
+            }),
             LANE_COLOUR,
         );
 
@@ -161,8 +165,8 @@ fn draw_the_lanes(
             continue;
         };
         gizmos.arrow(
-            segment.world_position(1. - HANDOVER_REACH),
-            next.world_position(HANDOVER_REACH),
+            segment.world_position(1. - HANDOVER_REACH) + GIZMO_LIFT,
+            next.world_position(HANDOVER_REACH) + GIZMO_LIFT,
             HANDOVER_COLOUR,
         );
     }
