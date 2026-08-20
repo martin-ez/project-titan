@@ -83,6 +83,48 @@ impl HexCoordinates {
         }
     }
 
+    /// The straight run of tiles from here to `other`, `other` included and this one not.
+    ///
+    /// Every step of it lands on a neighbour of the one before, so a cursor that jumped several
+    /// tiles between two frames leaves the same run as one that crossed them slowly.
+    pub fn line_to(&self, other: Self) -> impl Iterator<Item = Self> {
+        let (from, steps) = (*self, self.distance_to(other));
+        (1..=steps).map(move |step| from.lerp(other, step as f32 / steps as f32))
+    }
+
+    fn distance_to(&self, other: Self) -> i32 {
+        let (dq, dr) = (other.q - self.q, other.r - self.r);
+        (dq.abs() + dr.abs() + (dq + dr).abs()) / 2
+    }
+
+    fn lerp(&self, other: Self, along: f32) -> Self {
+        Self::nearest(
+            self.q as f32 + (other.q - self.q) as f32 * along,
+            self.r as f32 + (other.r - self.r) as f32 * along,
+        )
+    }
+
+    fn nearest(q: f32, r: f32) -> Self {
+        let s = -q - r;
+        let (mut rounded_q, mut rounded_r, rounded_s) = (q.round(), r.round(), s.round());
+        let (strayed_q, strayed_r, strayed_s) = (
+            (rounded_q - q).abs(),
+            (rounded_r - r).abs(),
+            (rounded_s - s).abs(),
+        );
+
+        if strayed_q > strayed_r && strayed_q > strayed_s {
+            rounded_q = -rounded_r - rounded_s;
+        } else if strayed_r > strayed_s {
+            rounded_r = -rounded_q - rounded_s;
+        }
+
+        Self {
+            q: rounded_q as i32,
+            r: rounded_r as i32,
+        }
+    }
+
     /// Where on the ground plane these coordinates put the middle of a tile.
     pub fn world_position(&self) -> Vec3 {
         Vec3::new(
@@ -270,5 +312,63 @@ mod tests {
         tick(&mut app);
 
         assert!(app.world().entity(tile).contains::<InitializationFailed>());
+    }
+
+    fn neighbours(centre: HexCoordinates) -> HashSet<HexCoordinates> {
+        NEIGHBOUR_STEPS
+            .iter()
+            .map(|&(dq, dr)| HexCoordinates {
+                q: centre.q + dq,
+                r: centre.r + dr,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_run_between_two_tiles_steps_through_the_ones_between_them() {
+        let from = HexCoordinates::from_offset_row(0, 0);
+        let to = HexCoordinates::from_offset_row(3, 0);
+
+        let run: Vec<HexCoordinates> = from.line_to(to).collect();
+
+        assert_eq!(
+            run,
+            [
+                HexCoordinates::from_offset_row(1, 0),
+                HexCoordinates::from_offset_row(2, 0),
+                HexCoordinates::from_offset_row(3, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_run_from_a_tile_to_itself_is_empty() {
+        let tile = HexCoordinates::from_offset_row(2, 3);
+
+        assert_eq!(tile.line_to(tile).count(), 0);
+    }
+
+    #[test]
+    fn every_step_of_a_run_is_a_neighbour_of_the_one_before_it() {
+        const REACH: i32 = 6;
+
+        let from = HexCoordinates::from_offset_row(0, 0);
+
+        for col in -REACH..=REACH {
+            for row in -REACH..=REACH {
+                let to = HexCoordinates::from_offset_row(col, row);
+                let run: Vec<HexCoordinates> = from.line_to(to).collect();
+
+                let mut standing = from;
+                for &tile in &run {
+                    assert!(
+                        neighbours(standing).contains(&tile),
+                        "{standing:?} then {tile:?} on the way to {to:?}"
+                    );
+                    standing = tile;
+                }
+                assert_eq!(run.last().copied(), (to != from).then_some(to));
+            }
+        }
     }
 }

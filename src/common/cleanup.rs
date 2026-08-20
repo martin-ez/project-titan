@@ -8,7 +8,7 @@ pub struct CleanupPlugin;
 pub struct Destroy;
 
 /// Marker component for entities that should be destroyed when the game state changes.
-#[derive(Component)]
+#[derive(Component, Default)]
 pub struct DestroyOnStateChange;
 
 impl Plugin for CleanupPlugin {
