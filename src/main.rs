@@ -5,6 +5,7 @@ mod common;
 mod diagnostics;
 mod input;
 mod map;
+mod road;
 mod simulation;
 #[cfg(test)]
 mod testing;
@@ -19,6 +20,7 @@ fn main() {
         .add_plugins(diagnostics::DiagnosticsPlugin)
         .add_plugins(input::PlayerInputPlugin)
         .add_plugins(map::MapPlugin)
+        .add_plugins(road::RoadPlugin)
         .add_plugins(simulation::SimulationPlugin)
         .add_systems(Startup, setup_test_scene)
         .run();
