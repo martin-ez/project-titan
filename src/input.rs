@@ -49,6 +49,8 @@ pub struct PlayerInput {
     pub tap: bool,
     /// Whether the player just clicked with the secondary mouse button
     pub secondary_tap: bool,
+    /// Whether the player is holding the primary mouse button down
+    pub dragging: bool,
 }
 
 #[derive(Component)]
@@ -154,6 +156,7 @@ fn update_player_input(
 ) {
     player_input.tap = mouse_input.just_pressed(MouseButton::Left);
     player_input.secondary_tap = mouse_input.just_pressed(MouseButton::Right);
+    player_input.dragging = mouse_input.pressed(MouseButton::Left);
 
     let Some(camera) = camera else {
         player_input.movement_vector = Vec3::ZERO;
@@ -421,6 +424,31 @@ mod tests {
         tick(&mut app);
 
         assert!(player_input(&app).secondary_tap);
+    }
+
+    #[test]
+    fn holding_the_primary_button_down_is_reported_as_a_drag() {
+        let mut app = input_app();
+        tick(&mut app);
+
+        press_mouse(&mut app, MouseButton::Left);
+        tick(&mut app);
+        tick(&mut app);
+
+        assert!(player_input(&app).dragging);
+        assert!(!player_input(&app).tap);
+    }
+
+    #[test]
+    fn letting_the_primary_button_go_ends_the_drag() {
+        let mut app = input_app();
+        press_mouse(&mut app, MouseButton::Left);
+        tick(&mut app);
+
+        release_mouse(&mut app, MouseButton::Left);
+        tick(&mut app);
+
+        assert!(!player_input(&app).dragging);
     }
 
     #[test]
