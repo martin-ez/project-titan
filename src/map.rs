@@ -15,6 +15,9 @@ const MAP_TILE_DEPTH: f32 = 0.25;
 const NODE_SPACING: f32 = MAP_TILE_SIZE / 2.;
 const NODE_BASIS_X: f32 = MAP_TILE_SIZE * SQRT_3 / 4.;
 
+/// How far it is from the middle of a tile to the middle of any of its six edges.
+pub const MAP_TILE_INRADIUS: f32 = MAP_TILE_WIDTH / 2.;
+
 pub struct MapPlugin;
 
 /// Where a tile is: axial hex coordinates, from which a world position is derived.
@@ -156,6 +159,16 @@ impl HexCoordinates {
             q: rounded_q as i32,
             r: rounded_r as i32,
         }
+    }
+
+    /// The tile the point `position` stands on, whatever height it stands at.
+    ///
+    /// The inverse of `world_position`, rounded to the nearest tile the same way a run between two
+    /// of them is, so every point of the plane reports one and a point on an edge reports one of
+    /// the two sharing it.
+    pub fn from_world_position(position: Vec3) -> Self {
+        let r = position.z / MAP_TILE_ROW_SPACING;
+        Self::nearest(position.x / MAP_TILE_WIDTH - r / 2., r)
     }
 
     /// Where on the ground plane these coordinates put the middle of a tile.
@@ -447,5 +460,40 @@ mod tests {
         }
 
         assert_eq!(corners.len(), NODE_STEPS.len());
+    }
+
+    #[test]
+    fn a_world_position_reports_the_tile_it_stands_in() {
+        for (col, row) in [(0, 0), (2, 3), (-4, 1), (3, -2)] {
+            let tile = HexCoordinates::from_offset_row(col, row);
+
+            assert_eq!(
+                HexCoordinates::from_world_position(tile.world_position()),
+                tile
+            );
+        }
+    }
+
+    #[test]
+    fn a_world_position_past_a_tiles_edge_stands_in_the_next_tile() {
+        /// How far either side of the edge the two positions are taken, as a share of the reach
+        /// to it.
+        const STRIDE: f32 = 0.01;
+
+        let tile = HexCoordinates::from_offset_row(2, 3);
+        let beyond = HexCoordinates {
+            q: tile.q + 1,
+            r: tile.r,
+        };
+        let towards = Vec3::new(MAP_TILE_INRADIUS, 0., 0.);
+
+        assert_eq!(
+            HexCoordinates::from_world_position(tile.world_position() + towards * (1. - STRIDE)),
+            tile
+        );
+        assert_eq!(
+            HexCoordinates::from_world_position(tile.world_position() + towards * (1. + STRIDE)),
+            beyond
+        );
     }
 }
