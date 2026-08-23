@@ -229,7 +229,13 @@ mod tests {
             .iter()
             .map(|&(col, row)| LatticeNode::from_tile(HexCoordinates::from_offset_row(col, row)))
             .collect();
-        let road = app.world_mut().spawn(Road { nodes }).id();
+        let road = app
+            .world_mut()
+            .spawn(Road {
+                nodes,
+                leaving: None,
+            })
+            .id();
         tick(app);
         road
     }
