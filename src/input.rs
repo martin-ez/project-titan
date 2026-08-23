@@ -1,4 +1,6 @@
 use crate::common::cursor::{CursorHit, CursorRayCast};
+use crate::map::{LatticeNode, MapTile};
+use bevy::ecs::system::SystemParam;
 use bevy::input::InputSystems;
 use bevy::prelude::*;
 use bevy::window::{CursorOptions, PrimaryWindow};
@@ -43,6 +45,8 @@ pub struct PlayerInput {
     pub ground_cursor_position: Option<Vec3>,
     /// The tile the cursor is over, which is the one under it when the cursor is over a building
     pub cursor_tile: Option<Entity>,
+    /// The node of the road lattice the cursor is over, while the road tool is the one held
+    pub cursor_node: Option<LatticeNode>,
     /// The normalized vector representing the player's movement (WASD)
     pub movement_vector: Vec3,
     /// Whether the player just tap or clicked
@@ -56,6 +60,14 @@ pub struct PlayerInput {
 #[derive(Component)]
 #[require(Transform, Visibility)]
 struct EditingTargetIndicator;
+
+#[derive(SystemParam)]
+struct CursorReading<'w, 's> {
+    window: Option<Single<'w, 's, &'static Window>>,
+    camera: Option<Single<'w, 's, (&'static Camera, &'static GlobalTransform)>>,
+    surfaces: CursorRayCast<'w, 's>,
+    tiles: Query<'w, 's, &'static MapTile>,
+}
 
 impl Plugin for PlayerInputPlugin {
     fn build(&self, app: &mut App) {
@@ -149,46 +161,61 @@ fn update_player_input(
     mut player_input: ResMut<PlayerInput>,
     input: Res<ButtonInput<KeyCode>>,
     mouse_input: Res<ButtonInput<MouseButton>>,
-    window: Option<Single<&Window>>,
-    camera: Option<Single<(&Camera, &GlobalTransform)>>,
-    surfaces: CursorRayCast,
+    cursor: CursorReading,
     action: Res<State<PlayerAction>>,
 ) {
     player_input.tap = mouse_input.just_pressed(MouseButton::Left);
     player_input.secondary_tap = mouse_input.just_pressed(MouseButton::Right);
     player_input.dragging = mouse_input.pressed(MouseButton::Left);
 
-    let Some(camera) = camera else {
+    let Some(camera) = &cursor.camera else {
         player_input.movement_vector = Vec3::ZERO;
         player_input.world_cursor_position = None;
         player_input.ground_cursor_position = None;
         player_input.cursor_tile = None;
+        player_input.cursor_node = None;
         return;
     };
-    let (camera, camera_transform) = *camera;
+    let (camera, camera_transform) = **camera;
 
     player_input.movement_vector = get_movement_vector(&input, camera_transform);
 
-    let ray = window.and_then(|window| get_cursor_ray(&window, camera, camera_transform));
+    let ray = cursor
+        .window
+        .as_ref()
+        .and_then(|window| get_cursor_ray(window, camera, camera_transform));
     player_input.ground_cursor_position = ray.and_then(ground_plane_position);
 
-    let hit = ray.and_then(|ray| surfaces.cast(ray));
-    player_input.world_cursor_position = hit.as_ref().map(|hit| settled_position(hit, &action));
+    let hit = ray.and_then(|ray| cursor.surfaces.cast(ray));
+    let node = hit
+        .as_ref()
+        .filter(|_| *action.get() == PlayerAction::EditRoads)
+        .and_then(|hit| {
+            let tile = cursor.tiles.get(hit.tile?.entity).ok()?;
+            Some(LatticeNode::nearest_on(tile.coordinates, hit.point))
+        });
+
+    player_input.cursor_node = node;
+    player_input.world_cursor_position =
+        hit.as_ref().map(|hit| settled_position(hit, &action, node));
     player_input.cursor_tile = hit.and_then(|hit| hit.tile).map(|tile| tile.entity);
 }
 
 /// Where the cursor reports itself to be, given the tool the player is holding.
 ///
-/// A build tool settles it over the middle of the tile it is on, so an edit lands on a tile rather
-/// than between two. The height it landed at is its own, so a cursor over a building stays on top
-/// of the building rather than dropping through it.
-fn settled_position(hit: &CursorHit, action: &PlayerAction) -> Vec3 {
-    let editing = matches!(
-        action,
-        PlayerAction::EditRoads | PlayerAction::EditBuildings
-    );
+/// The road tool settles it on `node`, which a road may be built through, and the building tool
+/// over the middle of the tile, which is where a building stands. The height it landed at is its
+/// own either way, so a cursor over a building stays on top of the building rather than dropping
+/// through it.
+fn settled_position(hit: &CursorHit, action: &PlayerAction, node: Option<LatticeNode>) -> Vec3 {
+    if let Some(node) = node {
+        let settled = node.world_position();
+        return Vec3::new(settled.x, hit.point.y, settled.z);
+    }
     match hit.tile {
-        Some(tile) if editing => Vec3::new(tile.centre.x, hit.point.y, tile.centre.z),
+        Some(tile) if *action == PlayerAction::EditBuildings => {
+            Vec3::new(tile.centre.x, hit.point.y, tile.centre.z)
+        }
         _ => hit.point,
     }
 }
@@ -252,6 +279,7 @@ fn update_indicator(
 mod tests {
     use super::*;
     use crate::common::cursor::{CursorSurface, TileSurface};
+    use crate::map::HexCoordinates;
     use crate::testing::{headless_app, press_key, press_mouse, release_key, release_mouse, tick};
     use bevy::camera::RenderTargetInfo;
     use bevy::math::DVec2;
@@ -320,6 +348,24 @@ mod tests {
         let tile = spawn_surface_at(app, centre, 0.);
         app.world_mut().entity_mut(tile).insert(TileSurface);
         tile
+    }
+
+    /// A tile of the grid standing at `centre`, which the cursor can name a node of.
+    fn spawn_grid_tile_at(app: &mut App, centre: Vec3, coordinates: HexCoordinates) -> Entity {
+        let tile = spawn_tile_at(app, centre);
+        app.world_mut()
+            .entity_mut(tile)
+            .insert(MapTile { coordinates });
+        tile
+    }
+
+    fn cursor_node(app: &App) -> Option<LatticeNode> {
+        player_input(app).cursor_node
+    }
+
+    /// The tile the fixtures put under the cursor, whose middle node stands at the world's origin.
+    fn origin_tile() -> HexCoordinates {
+        HexCoordinates::from_offset_row(0, 0)
     }
 
     fn spawn_tile(app: &mut App) -> Entity {
@@ -565,16 +611,6 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_settles_on_the_tile_centre_while_the_road_tool_is_held() {
-        let mut app = app_looking_down_at_the_origin();
-        spawn_tile_at(&mut app, OFF_CENTRE_TILE);
-
-        hold_tool(&mut app, ROAD_TOOL_KEY);
-
-        assert_lands_on(player_input(&app).world_cursor_position, OFF_CENTRE_TILE);
-    }
-
-    #[test]
     fn the_cursor_settles_on_the_tile_centre_while_the_building_tool_is_held() {
         let mut app = app_looking_down_at_the_origin();
         spawn_tile_at(&mut app, OFF_CENTRE_TILE);
@@ -582,6 +618,61 @@ mod tests {
         hold_tool(&mut app, BUILDING_TOOL_KEY);
 
         assert_lands_on(player_input(&app).world_cursor_position, OFF_CENTRE_TILE);
+    }
+
+    #[test]
+    fn the_cursor_reports_a_lattice_node_while_the_road_tool_is_held() {
+        let mut app = app_looking_down_at_the_origin();
+        spawn_grid_tile_at(&mut app, OFF_CENTRE_TILE, origin_tile());
+
+        hold_tool(&mut app, ROAD_TOOL_KEY);
+
+        assert_eq!(
+            cursor_node(&app),
+            Some(LatticeNode::from_tile(origin_tile()))
+        );
+    }
+
+    #[test]
+    fn the_cursor_settles_on_the_node_it_reports_while_the_road_tool_is_held() {
+        let mut app = app_looking_down_at_the_origin();
+        spawn_grid_tile_at(&mut app, OFF_CENTRE_TILE, origin_tile());
+
+        hold_tool(&mut app, ROAD_TOOL_KEY);
+
+        assert_lands_on(player_input(&app).world_cursor_position, Vec3::ZERO);
+    }
+
+    #[test]
+    fn the_cursor_reports_no_node_while_the_building_tool_is_held() {
+        let mut app = app_looking_down_at_the_origin();
+        spawn_grid_tile_at(&mut app, OFF_CENTRE_TILE, origin_tile());
+
+        hold_tool(&mut app, BUILDING_TOOL_KEY);
+
+        assert_eq!(cursor_node(&app), None);
+        assert_lands_on(player_input(&app).world_cursor_position, OFF_CENTRE_TILE);
+    }
+
+    #[test]
+    fn the_cursor_reports_no_node_while_selecting() {
+        let mut app = app_looking_down_at_the_origin();
+        spawn_grid_tile_at(&mut app, OFF_CENTRE_TILE, origin_tile());
+
+        tick(&mut app);
+        tick(&mut app);
+
+        assert_eq!(cursor_node(&app), None);
+    }
+
+    #[test]
+    fn the_cursor_reports_no_node_off_the_grid() {
+        let mut app = app_looking_down_at_the_origin();
+        spawn_surface_at(&mut app, OFF_CENTRE_TILE, 2.);
+
+        hold_tool(&mut app, ROAD_TOOL_KEY);
+
+        assert_eq!(cursor_node(&app), None);
     }
 
     #[test]
