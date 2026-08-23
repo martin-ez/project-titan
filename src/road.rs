@@ -47,6 +47,9 @@ const DRAWING_COLOUR: Color = Color::srgb(0.6, 0.95, 0.6);
 /// The colour the tiles a road runs over are marked in
 const OCCUPIED_COLOUR: Color = Color::srgb(0.95, 0.45, 0.35);
 
+/// The colour a tile under the cursor is marked in when a road already runs over it
+const TAKEN_COLOUR: Color = Color::srgb(0.95, 0.25, 0.2);
+
 /// How wide the mark on an occupied tile is drawn, as a share of the tile's inradius.
 const OCCUPIED_MARK: f32 = 0.35;
 
@@ -74,13 +77,13 @@ pub struct Road {
 
 /// The road the player is part way through dragging out, as far as the cursor has taken it.
 ///
-/// It is a record of tiles and nothing else until the button comes up: no arc, no lane and
+/// It is a record of nodes and nothing else until the button comes up: no arc, no lane and
 /// nothing a rover could drive. Putting the tool down destroys it with the rest of the tool's
 /// state, so a drag abandoned half way leaves the network as it was.
 #[derive(Component)]
 #[require(DestroyOnStateChange)]
 struct DrawnRoad {
-    path: Vec<HexCoordinates>,
+    path: Vec<LatticeNode>,
 }
 
 /// A circular arc on the ground, and the whole of a road's geometry.
@@ -152,6 +155,7 @@ impl Plugin for RoadPlugin {
                     draw_the_lanes,
                     draw_the_drawn_road,
                     draw_the_occupied_tiles,
+                    draw_the_road_under_the_cursor,
                 ),
             );
     }
@@ -310,8 +314,8 @@ fn release_the_tiles_of_a_removed_road(removed: On<Remove, Road>, mut occupied: 
 
 /// The tiles `arcs` run over, each of them reported once.
 ///
-/// Both ends of every arc are stood on exactly rather than merely walked near, which is what makes
-/// a road's own nodes tiles it is found under: a node is where one arc ends and the next begins.
+/// Both ends of every arc are stood on exactly rather than merely walked near, so a road is always
+/// found under the tiles its own nodes stand on: a node is where one arc ends and the next begins.
 fn tiles_walked_by(arcs: &[Arc]) -> Vec<HexCoordinates> {
     let mut walked: Vec<HexCoordinates> = Vec::new();
     for arc in arcs {
@@ -455,33 +459,28 @@ fn stretches_of(arc: &Arc) -> Vec<(f32, f32)> {
         .collect()
 }
 
-/// Take the road the player is dragging out as far as the tile under the cursor.
+/// Take the road the player is dragging out as far as the node under the cursor.
 ///
-/// The path grows by the straight run from the tile it had reached, so the road a drag leaves is
-/// the one the cursor crossed rather than the one it was sampled on: a flick that skipped three
-/// tiles lays the same road as a slow drag over them, and a cursor resting on one adds nothing.
+/// The path records the nodes the cursor reached and nothing between them, because an arc spans
+/// from one node to the next rather than passing through every node on the way: filling the gap
+/// would pin the road to nodes the player never aimed at. A cursor resting on one adds nothing.
 fn extend_the_drawn_road(
     mut commands: Commands,
     player_input: Res<PlayerInput>,
     action: Res<State<PlayerAction>>,
-    tiles: Query<&MapTile>,
     mut drawn: Query<&mut DrawnRoad>,
 ) {
     if !player_input.dragging || *action.get() != PlayerAction::EditRoads {
         return;
     }
-    let Some(reached) = player_input
-        .cursor_tile
-        .and_then(|tile| tiles.get(tile).ok())
-        .map(|tile| tile.coordinates)
-    else {
+    let Some(reached) = player_input.cursor_node else {
         return;
     };
 
     match drawn.iter_mut().next() {
         Some(mut drawn) => {
-            if let Some(last) = drawn.path.last().copied() {
-                drawn.path.extend(last.line_to(reached));
+            if drawn.path.last() != Some(&reached) {
+                drawn.path.push(reached);
             }
         }
         None => {
@@ -494,13 +493,12 @@ fn extend_the_drawn_road(
 
 /// Put the drawn road into the world when the player lets the button go.
 ///
-/// A drag that never left its tile lays nothing, which is what a click with the road tool is.
+/// A drag that never left its node lays nothing, which is what a click with the road tool is.
 fn lay_the_drawn_road(
     mut commands: Commands,
     player_input: Res<PlayerInput>,
-    occupied: Res<RoadTiles>,
     drawn: Query<(Entity, &DrawnRoad)>,
-    roads: Query<&Road>,
+    roads: Query<(Entity, &Road)>,
 ) {
     if player_input.dragging {
         return;
@@ -509,21 +507,12 @@ fn lay_the_drawn_road(
     for (entity, drawing) in &drawn {
         commands.entity(entity).despawn();
 
-        let met = roads_along(&drawing.path, &occupied);
-        let drawn: Vec<LatticeNode> = drawing
-            .path
-            .iter()
-            .copied()
-            .map(LatticeNode::from_tile)
-            .collect();
-        let meetings = nodes_shared_with(&drawn, &met, &roads);
+        let drawn = drawing.path.clone();
+        let meetings = nodes_shared_with(&drawn, &roads);
         for nodes in split_at(&drawn, &meetings) {
             commands.spawn(Road { nodes });
         }
-        for &crossed in &met {
-            let Ok(road) = roads.get(crossed) else {
-                continue;
-            };
+        for (crossed, road) in &roads {
             let pieces = split_at(&road.nodes, &meetings);
             if pieces.len() < 2 {
                 continue;
@@ -536,33 +525,15 @@ fn lay_the_drawn_road(
     }
 }
 
-/// The roads running over any tile of `path`, each of them once.
-///
-/// A road the drawn one cannot have met is never read, which is what keeps laying a road off the
-/// whole network: every node the two share stands at the middle of a tile of `path`, and a node is
-/// where one of the road's arcs ends, so a road that shares one is over that tile.
-fn roads_along(path: &[HexCoordinates], occupied: &RoadTiles) -> Vec<Entity> {
-    let mut met: Vec<Entity> = Vec::new();
-    for &tile in path {
-        for &road in occupied.roads_over(tile) {
-            if !met.contains(&road) {
-                met.push(road);
-            }
-        }
-    }
-    met
-}
-
-/// The nodes of `drawn` that one of the roads in `met` already runs through.
+/// The nodes of `drawn` that a road already runs through.
 fn nodes_shared_with(
     drawn: &[LatticeNode],
-    met: &[Entity],
-    roads: &Query<&Road>,
+    roads: &Query<(Entity, &Road)>,
 ) -> HashSet<LatticeNode> {
     let drawn: HashSet<LatticeNode> = drawn.iter().copied().collect();
-    met.iter()
-        .filter_map(|&road| roads.get(road).ok())
-        .flat_map(|road| road.nodes.iter().copied())
+    roads
+        .iter()
+        .flat_map(|(_, road)| road.nodes.iter().copied())
         .filter(|node| drawn.contains(node))
         .collect()
 }
@@ -606,8 +577,8 @@ fn draw_the_drawn_road(mut gizmos: Gizmos<DebugGizmos>, drawn: Query<&DrawnRoad>
 /// Mark every tile a road runs over, which the lanes drawn across them do not say.
 ///
 /// A road curves over the grid rather than following it, so which tiles it takes is a question the
-/// map cannot be looked at to answer — and it is the question a building being refused a tile will
-/// be answered with.
+/// map cannot be looked at to answer, and a lane drawn over a corner of one looks the same as a
+/// lane that misses it.
 fn draw_the_occupied_tiles(
     mut gizmos: Gizmos<DebugGizmos>,
     occupied: Res<RoadTiles>,
@@ -625,6 +596,37 @@ fn draw_the_occupied_tiles(
             );
         }
     }
+}
+
+/// Mark the tile under the cursor when a road already runs over it.
+///
+/// This is the tile question asked from the other end, and the one #98 refuses a building with.
+/// Reading it off a road would mean reading every road, which is what the tile is keyed for.
+fn draw_the_road_under_the_cursor(
+    mut gizmos: Gizmos<DebugGizmos>,
+    occupied: Res<RoadTiles>,
+    player_input: Res<PlayerInput>,
+    tiles: Query<&MapTile>,
+) {
+    let Some(tile) = player_input
+        .cursor_tile
+        .and_then(|tile| tiles.get(tile).ok())
+        .map(|tile| tile.coordinates)
+    else {
+        return;
+    };
+    if occupied.roads_over(tile).is_empty() {
+        return;
+    }
+
+    gizmos.circle(
+        Isometry3d::new(
+            tile.world_position() + GIZMO_LIFT,
+            Quat::from_rotation_x(FRAC_PI_2),
+        ),
+        MAP_TILE_INRADIUS,
+        TAKEN_COLOUR,
+    );
 }
 
 /// Draw every lane, and the order a rover drives its segments in.
@@ -682,9 +684,8 @@ mod tests {
     const CROSSING: [(i32, i32); 3] = [(2, -1), (2, 0), (2, 1)];
 
     /// Nodes far enough apart that the arcs between them cross tiles of their own, in offset-row
-    /// coordinates. A road the tool laid never looks like this: a drag fills in every tile it
-    /// crossed, so its arcs only ever run from one tile to the one beside it and stay inside the
-    /// two. An arc that spans a run is what a road drawn between two points has to be measured as.
+    /// coordinates. A drag records the nodes the cursor reached and nothing between them, so this
+    /// is what a flick lays and what the road tool hands the walk to measure.
     const SWEEPING: [(i32, i32); 3] = [(0, 0), (3, 0), (3, 3)];
 
     /// Pairs of nodes whose runs cross the grid at lengths and angles of their own, in offset-row
@@ -956,27 +957,20 @@ mod tests {
         assert_eq!(segments_in_the_world(&mut app), 0);
     }
 
-    fn spawn_tiles(app: &mut App, offsets: &[(i32, i32)]) -> Vec<Entity> {
-        tiles(offsets)
-            .into_iter()
-            .map(|coordinates| app.world_mut().spawn(MapTile { coordinates }).id())
-            .collect()
-    }
-
-    /// Put the cursor over `tile` with the primary button as `dragging` says, and take a frame.
-    fn move_cursor(app: &mut App, tile: Option<Entity>, dragging: bool) {
+    /// Put the cursor over `node` with the primary button as `dragging` says, and take a frame.
+    fn move_cursor(app: &mut App, node: Option<LatticeNode>, dragging: bool) {
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.cursor_tile = tile;
+            input.cursor_node = node;
             input.dragging = dragging;
         }
         tick(app);
     }
 
-    /// Drag over `path` a tile at a frame, then let the button go over the last of them.
-    fn drag_over(app: &mut App, path: &[Entity]) {
-        for &tile in path {
-            move_cursor(app, Some(tile), true);
+    /// Drag over `path` a node at a frame, then let the button go over the last of them.
+    fn drag_over(app: &mut App, path: &[LatticeNode]) {
+        for &node in path {
+            move_cursor(app, Some(node), true);
         }
         move_cursor(app, path.last().copied(), false);
     }
@@ -999,9 +993,9 @@ mod tests {
     }
 
     #[test]
-    fn a_drag_across_tiles_lays_a_road_through_them() {
+    fn a_drag_across_nodes_lays_a_road_through_them() {
         let mut app = app_holding(PlayerAction::EditRoads);
-        let path = spawn_tiles(&mut app, &STRAIGHT);
+        let path = nodes(&STRAIGHT);
 
         drag_over(&mut app, &path);
 
@@ -1012,19 +1006,19 @@ mod tests {
     #[test]
     fn nothing_is_laid_until_the_drag_ends() {
         let mut app = app_holding(PlayerAction::EditRoads);
-        let path = spawn_tiles(&mut app, &STRAIGHT);
+        let path = nodes(&STRAIGHT);
 
-        for &tile in &path {
-            move_cursor(&mut app, Some(tile), true);
+        for &node in &path {
+            move_cursor(&mut app, Some(node), true);
         }
 
         assert_eq!(roads_in_the_world(&mut app), 0);
     }
 
     #[test]
-    fn a_drag_that_never_left_its_tile_lays_no_road() {
+    fn a_drag_that_never_left_its_node_lays_no_road() {
         let mut app = app_holding(PlayerAction::EditRoads);
-        let path = spawn_tiles(&mut app, &[(0, 0)]);
+        let path = nodes(&[(0, 0)]);
 
         drag_over(&mut app, &path);
 
@@ -1034,7 +1028,7 @@ mod tests {
     #[test]
     fn a_drag_while_selecting_lays_nothing() {
         let mut app = app_holding(PlayerAction::Select);
-        let path = spawn_tiles(&mut app, &STRAIGHT);
+        let path = nodes(&STRAIGHT);
 
         drag_over(&mut app, &path);
 
@@ -1044,7 +1038,7 @@ mod tests {
     #[test]
     fn a_drag_while_editing_buildings_lays_nothing() {
         let mut app = app_holding(PlayerAction::EditBuildings);
-        let path = spawn_tiles(&mut app, &STRAIGHT);
+        let path = nodes(&STRAIGHT);
 
         drag_over(&mut app, &path);
 
@@ -1052,39 +1046,39 @@ mod tests {
     }
 
     #[test]
-    fn a_drag_that_skipped_a_tile_still_runs_through_it() {
+    fn a_drag_that_skipped_a_node_runs_straight_to_the_one_it_reached() {
         let mut app = app_holding(PlayerAction::EditRoads);
-        spawn_tiles(&mut app, &STRAIGHT);
-        let flicked = spawn_tiles(&mut app, &[STRAIGHT[0], STRAIGHT[STRAIGHT.len() - 1]]);
+        let ends = [STRAIGHT[0], STRAIGHT[STRAIGHT.len() - 1]];
 
-        drag_over(&mut app, &flicked);
+        drag_over(&mut app, &nodes(&ends));
 
-        assert!(a_road_runs_through(&mut app, &STRAIGHT));
+        assert!(a_road_runs_through(&mut app, &ends));
+        assert_eq!(roads_in_the_world(&mut app), 1);
     }
 
     #[test]
-    fn resting_on_a_tile_does_not_repeat_it() {
+    fn resting_on_a_node_does_not_repeat_it() {
         let mut app = app_holding(PlayerAction::EditRoads);
-        let path = spawn_tiles(&mut app, &[(0, 0), (1, 0)]);
+        let path = nodes(&[(0, 0), (1, 0)]);
 
-        move_cursor(&mut app, Some(path[0]), true);
-        move_cursor(&mut app, Some(path[0]), true);
-        move_cursor(&mut app, Some(path[1]), true);
-        move_cursor(&mut app, Some(path[1]), true);
-        move_cursor(&mut app, Some(path[1]), false);
+        move_cursor(&mut app, path.first().copied(), true);
+        move_cursor(&mut app, path.first().copied(), true);
+        move_cursor(&mut app, path.last().copied(), true);
+        move_cursor(&mut app, path.last().copied(), true);
+        move_cursor(&mut app, path.last().copied(), false);
 
         assert!(a_road_runs_through(&mut app, &[(0, 0), (1, 0)]));
     }
 
     #[test]
-    fn a_drag_passing_over_no_tile_carries_on_from_where_it_left_off() {
+    fn a_drag_passing_over_no_node_carries_on_from_where_it_left_off() {
         let mut app = app_holding(PlayerAction::EditRoads);
-        let path = spawn_tiles(&mut app, &[(0, 0), (1, 0)]);
+        let path = nodes(&[(0, 0), (1, 0)]);
 
-        move_cursor(&mut app, Some(path[0]), true);
+        move_cursor(&mut app, path.first().copied(), true);
         move_cursor(&mut app, None, true);
-        move_cursor(&mut app, Some(path[1]), true);
-        move_cursor(&mut app, Some(path[1]), false);
+        move_cursor(&mut app, path.last().copied(), true);
+        move_cursor(&mut app, path.last().copied(), false);
 
         assert!(a_road_runs_through(&mut app, &[(0, 0), (1, 0)]));
     }
@@ -1092,9 +1086,9 @@ mod tests {
     #[test]
     fn putting_the_tool_down_mid_drag_lays_nothing() {
         let mut app = app_holding(PlayerAction::EditRoads);
-        let path = spawn_tiles(&mut app, &STRAIGHT);
-        for &tile in &path {
-            move_cursor(&mut app, Some(tile), true);
+        let path = nodes(&STRAIGHT);
+        for &node in &path {
+            move_cursor(&mut app, Some(node), true);
         }
 
         app.world_mut()
@@ -1109,10 +1103,8 @@ mod tests {
     /// Lay `STRAIGHT`, then drag `CROSSING` over the middle of it.
     fn a_road_drawn_across_another() -> App {
         let mut app = app_holding(PlayerAction::EditRoads);
-        let along = spawn_tiles(&mut app, &STRAIGHT);
-        drag_over(&mut app, &along);
-        let across = spawn_tiles(&mut app, &CROSSING);
-        drag_over(&mut app, &across);
+        drag_over(&mut app, &nodes(&STRAIGHT));
+        drag_over(&mut app, &nodes(&CROSSING));
         tick(&mut app);
         app
     }
@@ -1126,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn the_road_it_crossed_is_split_at_the_tile_they_share() {
+    fn the_road_it_crossed_is_split_at_the_node_they_share() {
         let mut app = a_road_drawn_across_another();
 
         assert!(a_road_runs_through(&mut app, &STRAIGHT[..3]));
@@ -1272,11 +1264,9 @@ mod tests {
     #[test]
     fn a_road_drawn_onto_the_end_of_another_leaves_it_whole() {
         let mut app = app_holding(PlayerAction::EditRoads);
-        let along = spawn_tiles(&mut app, &STRAIGHT);
-        drag_over(&mut app, &along);
+        drag_over(&mut app, &nodes(&STRAIGHT));
 
-        let onward = spawn_tiles(&mut app, &ONWARD);
-        drag_over(&mut app, &onward);
+        drag_over(&mut app, &nodes(&ONWARD));
 
         assert!(a_road_runs_through(&mut app, &STRAIGHT));
         assert!(a_road_runs_through(&mut app, &ONWARD));
@@ -1373,9 +1363,11 @@ mod tests {
         );
     }
 
-    /// Whether `tile` and `other` are one step apart on the grid.
+    /// Whether `tile` and `other` are neighbours, which is to say one tile width apart. Anything
+    /// further off stands at least half as far again.
     fn are_neighbours(tile: HexCoordinates, other: HexCoordinates) -> bool {
-        tile.line_to(other).count() == 1
+        let apart = tile.world_position().distance(other.world_position());
+        (apart - MAP_TILE_INRADIUS * 2.).abs() < TOLERANCE
     }
 
     /// The tiles of `occupied` that can be walked to from the first of them, neighbour by

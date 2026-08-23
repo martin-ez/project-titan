@@ -108,6 +108,30 @@ impl LatticeNode {
             NODE_SPACING * (self.i as f32 / 2. + self.j as f32),
         )
     }
+
+    /// The node of `tile` nearest to `position`: its middle, or whichever corner is closer.
+    ///
+    /// Only the seven nodes of one tile are offered, so a cursor over a tile settles on a node of
+    /// that tile and never on one belonging to the tile beyond it.
+    pub fn nearest_on(tile: HexCoordinates, position: Vec3) -> Self {
+        let centre = Self::from_tile(tile);
+        centre
+            .corners()
+            .into_iter()
+            .chain(std::iter::once(centre))
+            .min_by(|node, other| {
+                let strayed = node.world_position().distance_squared(position);
+                strayed.total_cmp(&other.world_position().distance_squared(position))
+            })
+            .unwrap_or(centre)
+    }
+
+    fn corners(&self) -> [Self; 6] {
+        [(1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1)].map(|(di, dj)| Self {
+            i: self.i + di,
+            j: self.j + dj,
+        })
+    }
 }
 
 impl HexCoordinates {
@@ -119,25 +143,14 @@ impl HexCoordinates {
         }
     }
 
-    /// The straight run of tiles from here to `other`, `other` included and this one not.
+    /// The tile the point `position` stands on, whatever height it stands at.
     ///
-    /// Every step of it lands on a neighbour of the one before, so a cursor that jumped several
-    /// tiles between two frames leaves the same run as one that crossed them slowly.
-    pub fn line_to(&self, other: Self) -> impl Iterator<Item = Self> {
-        let (from, steps) = (*self, self.distance_to(other));
-        (1..=steps).map(move |step| from.lerp(other, step as f32 / steps as f32))
-    }
-
-    fn distance_to(&self, other: Self) -> i32 {
-        let (dq, dr) = (other.q - self.q, other.r - self.r);
-        (dq.abs() + dr.abs() + (dq + dr).abs()) / 2
-    }
-
-    fn lerp(&self, other: Self, along: f32) -> Self {
-        Self::nearest(
-            self.q as f32 + (other.q - self.q) as f32 * along,
-            self.r as f32 + (other.r - self.r) as f32 * along,
-        )
+    /// The inverse of `world_position`. A point of the plane always stands on one, and one on an
+    /// edge or a corner stands on whichever of the tiles sharing it the rounding settles for, so
+    /// what this answers is which tile to hold a road against rather than which it is inside.
+    pub fn from_world_position(position: Vec3) -> Self {
+        let r = position.z / MAP_TILE_ROW_SPACING;
+        Self::nearest(position.x / MAP_TILE_WIDTH - r / 2., r)
     }
 
     fn nearest(q: f32, r: f32) -> Self {
@@ -159,16 +172,6 @@ impl HexCoordinates {
             q: rounded_q as i32,
             r: rounded_r as i32,
         }
-    }
-
-    /// The tile the point `position` stands on, whatever height it stands at.
-    ///
-    /// The inverse of `world_position`, rounded to the nearest tile the same way a run between two
-    /// of them is, so every point of the plane reports one and a point on an edge reports one of
-    /// the two sharing it.
-    pub fn from_world_position(position: Vec3) -> Self {
-        let r = position.z / MAP_TILE_ROW_SPACING;
-        Self::nearest(position.x / MAP_TILE_WIDTH - r / 2., r)
     }
 
     /// Where on the ground plane these coordinates put the middle of a tile.
@@ -360,64 +363,6 @@ mod tests {
         assert!(app.world().entity(tile).contains::<InitializationFailed>());
     }
 
-    fn neighbours(centre: HexCoordinates) -> HashSet<HexCoordinates> {
-        NEIGHBOUR_STEPS
-            .iter()
-            .map(|&(dq, dr)| HexCoordinates {
-                q: centre.q + dq,
-                r: centre.r + dr,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn the_run_between_two_tiles_steps_through_the_ones_between_them() {
-        let from = HexCoordinates::from_offset_row(0, 0);
-        let to = HexCoordinates::from_offset_row(3, 0);
-
-        let run: Vec<HexCoordinates> = from.line_to(to).collect();
-
-        assert_eq!(
-            run,
-            [
-                HexCoordinates::from_offset_row(1, 0),
-                HexCoordinates::from_offset_row(2, 0),
-                HexCoordinates::from_offset_row(3, 0),
-            ]
-        );
-    }
-
-    #[test]
-    fn the_run_from_a_tile_to_itself_is_empty() {
-        let tile = HexCoordinates::from_offset_row(2, 3);
-
-        assert_eq!(tile.line_to(tile).count(), 0);
-    }
-
-    #[test]
-    fn every_step_of_a_run_is_a_neighbour_of_the_one_before_it() {
-        const REACH: i32 = 6;
-
-        let from = HexCoordinates::from_offset_row(0, 0);
-
-        for col in -REACH..=REACH {
-            for row in -REACH..=REACH {
-                let to = HexCoordinates::from_offset_row(col, row);
-                let run: Vec<HexCoordinates> = from.line_to(to).collect();
-
-                let mut standing = from;
-                for &tile in &run {
-                    assert!(
-                        neighbours(standing).contains(&tile),
-                        "{standing:?} then {tile:?} on the way to {to:?}"
-                    );
-                    standing = tile;
-                }
-                assert_eq!(run.last().copied(), (to != from).then_some(to));
-            }
-        }
-    }
-
     /// The steps to the six nodes around a node of the lattice.
     const NODE_STEPS: [(i32, i32); 6] = [(1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1)];
 
@@ -434,6 +379,98 @@ mod tests {
                 strayed < TOLERANCE,
                 "{node:?} stands {strayed} from {tile:?}"
             );
+        }
+    }
+
+    /// The seven nodes a cursor over `tile` may settle on: its middle and its six corners.
+    fn nodes_of(tile: HexCoordinates) -> HashSet<LatticeNode> {
+        let centre = LatticeNode::from_tile(tile);
+        let mut nodes: HashSet<LatticeNode> = NODE_STEPS
+            .iter()
+            .map(|&(di, dj)| LatticeNode {
+                i: centre.i + di,
+                j: centre.j + dj,
+            })
+            .collect();
+        nodes.insert(centre);
+        nodes
+    }
+
+    #[test]
+    fn a_cursor_at_the_middle_of_a_tile_settles_on_the_tile_s_own_node() {
+        let tile = HexCoordinates::from_offset_row(2, 3);
+
+        let node = LatticeNode::nearest_on(tile, tile.world_position());
+
+        assert_eq!(node, LatticeNode::from_tile(tile));
+    }
+
+    #[test]
+    fn a_cursor_by_a_corner_of_a_tile_settles_on_that_corner() {
+        let tile = HexCoordinates::from_offset_row(2, 3);
+        let centre = LatticeNode::from_tile(tile);
+        let corner = LatticeNode {
+            i: centre.i + 1,
+            j: centre.j,
+        };
+        let just_inside = corner.world_position()
+            + (centre.world_position() - corner.world_position()).normalize() * 0.5;
+
+        assert_eq!(LatticeNode::nearest_on(tile, just_inside), corner);
+    }
+
+    #[test]
+    fn a_cursor_anywhere_inside_a_tile_settles_on_a_node_of_that_tile() {
+        const SAMPLES: i32 = 40;
+
+        let tile = HexCoordinates::from_offset_row(-1, 2);
+        let nodes = nodes_of(tile);
+
+        for across in -SAMPLES..=SAMPLES {
+            for along in -SAMPLES..=SAMPLES {
+                let offset = Vec3::new(
+                    across as f32 / SAMPLES as f32 * MAP_TILE_SIZE / 2.,
+                    0.,
+                    along as f32 / SAMPLES as f32 * MAP_TILE_SIZE / 2.,
+                );
+                let position = tile.world_position() + offset;
+
+                let settled = LatticeNode::nearest_on(tile, position);
+
+                assert!(
+                    nodes.contains(&settled),
+                    "{settled:?} is not a node of {tile:?}, from {position:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_cursor_settles_on_the_nearest_of_a_tile_s_nodes() {
+        const SAMPLES: i32 = 20;
+
+        let tile = HexCoordinates::from_offset_row(0, 0);
+        let nodes = nodes_of(tile);
+
+        for across in -SAMPLES..=SAMPLES {
+            for along in -SAMPLES..=SAMPLES {
+                let position = tile.world_position()
+                    + Vec3::new(
+                        across as f32 / SAMPLES as f32 * MAP_TILE_SIZE / 2.,
+                        0.,
+                        along as f32 / SAMPLES as f32 * MAP_TILE_SIZE / 2.,
+                    );
+
+                let settled = LatticeNode::nearest_on(tile, position);
+                let strayed = settled.world_position().distance(position);
+
+                for node in &nodes {
+                    assert!(
+                        node.world_position().distance(position) >= strayed - 1e-3,
+                        "{node:?} is nearer {position:?} than {settled:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -461,7 +498,6 @@ mod tests {
 
         assert_eq!(corners.len(), NODE_STEPS.len());
     }
-
     #[test]
     fn a_world_position_reports_the_tile_it_stands_in() {
         for (col, row) in [(0, 0), (2, 3), (-4, 1), (3, -2)] {
