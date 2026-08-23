@@ -5,7 +5,7 @@ use crate::input::{PlayerAction, PlayerInput};
 use crate::map::{HexCoordinates, LatticeNode, MapTile, MAP_TILE_INRADIUS};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::f32::consts::FRAC_PI_2;
 
 /// How many straight pieces a segment's arc is drawn as.
@@ -76,6 +76,19 @@ const TAKEN_COLOUR: Color = Color::srgb(0.95, 0.25, 0.2);
 /// How wide the mark on an occupied tile is drawn, as a share of the tile's inradius.
 const OCCUPIED_MARK: f32 = 0.35;
 
+/// The colour a junction is marked in
+const JUNCTION_COLOUR: Color = Color::srgb(0.9, 0.5, 0.95);
+
+/// How wide a junction is marked, as a share of the tile's inradius.
+const JUNCTION_MARK: f32 = 0.25;
+
+/// How far apart two points may stand and still be the same crossing.
+///
+/// Two roads meeting at a node are reached by every pair of arcs that ends there, so the same
+/// point comes back several times over and has to be gathered into one junction rather than one
+/// each. It is also what says a point is on an arc at all rather than beside it.
+const CROSSING_TOLERANCE: f32 = 1e-3;
+
 /// The roads on the map, and the lanes a rover drives on them.
 ///
 /// A road carries one lane in each direction, built together and removed together, and the two
@@ -118,7 +131,7 @@ struct DrawnRoad {
 /// ask which it holds. It is built when the road is laid and never rewritten: cutting a road moves
 /// which stretch of an arc a segment covers and never the arc itself, which is what makes a
 /// junction cut into a road move none of it, however many times it is cut (invariant 6).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Arc {
     start: Vec3,
     tangent: Vec3,
@@ -151,6 +164,35 @@ pub struct NextSegment(pub Entity);
 #[relationship_target(relationship = NextSegment)]
 pub struct PreviousSegments(Vec<Entity>);
 
+/// A place two roads cross, and how far along each of them the crossing stands.
+///
+/// It is a distance along an arc rather than a node of its own, so putting one in cuts the
+/// segments that cover that distance and rewrites neither arc: a road crossed in its middle stays
+/// exactly where it was drawn, however often it is crossed (invariant 6). Which of its arms a
+/// rover may leave by, and who goes first, belongs to #68.
+#[derive(Component)]
+pub struct Junction {
+    /// Where on the ground the roads cross.
+    pub at: Vec3,
+    /// The arcs that reach the crossing, and how far along each of them it stands.
+    pub across: Vec<Crossing>,
+}
+
+/// How far into one of a road's arcs a junction cuts it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Crossing {
+    /// The road the arc belongs to.
+    pub road: Entity,
+    /// Which of the road's arcs the junction stands on, counted from the end it was begun at.
+    pub arc: usize,
+    /// How far along that arc it stands.
+    pub along: f32,
+}
+
+/// A road that has been measured against the roads already laid for the places it crosses them.
+#[derive(Component)]
+struct Crossed;
+
 /// Which roads run over each tile of the map, and which tiles each road runs over.
 ///
 /// Under #4 a road was a run of tiles and this was a lookup; under #93 an arc runs over the grid
@@ -173,12 +215,21 @@ impl Plugin for RoadPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<RoadTiles>()
             .add_observer(release_the_tiles_of_a_removed_road)
-            .add_systems(PreUpdate, initialize_system::<Road, RoadInitializeParams>)
+            .add_observer(forget_a_removed_road_at_the_junctions_on_it)
+            .add_systems(
+                PreUpdate,
+                (
+                    initialize_system::<Road, RoadInitializeParams>,
+                    cut_the_roads_where_they_cross,
+                )
+                    .chain(),
+            )
             .add_systems(
                 Update,
                 (
                     (place_a_node, lay_the_road).chain(),
                     draw_the_lanes,
+                    draw_the_junctions,
                     draw_the_road_being_placed,
                     draw_the_occupied_tiles,
                     draw_the_road_under_the_cursor,
@@ -272,6 +323,41 @@ impl Arc {
         turned(self.tangent, self.curvature * at.clamp(0., self.length))
     }
 
+    /// Where the circle this arc lies on has its middle, which a straight has nowhere.
+    fn centre(&self) -> Vec3 {
+        self.start + left_of(self.tangent) / self.curvature
+    }
+
+    /// How far that middle is from the arc.
+    fn radius(&self) -> f32 {
+        (1. / self.curvature).abs()
+    }
+
+    /// How far along this arc `point` stands, or nothing where it is off the curve or past an end.
+    ///
+    /// A point beside the curve is not on this arc, and one on the circle the arc lies on but past
+    /// either end is not on it either, so both answer nothing rather than the nearest place.
+    fn distance_along(&self, point: Vec3) -> Option<f32> {
+        let at = if self.curvature == 0. {
+            let reach = point - self.start;
+            let at = reach.dot(self.tangent);
+            if (reach - self.tangent * at).length() > CROSSING_TOLERANCE {
+                return None;
+            }
+            at
+        } else {
+            let centre = self.centre();
+            let (from, to) = (self.start - centre, point - centre);
+            if (to.length() - self.radius()).abs() > CROSSING_TOLERANCE {
+                return None;
+            }
+            driven(turn_of(from, to).atan2(from.dot(to)), self.curvature) / self.curvature
+        };
+
+        (at >= -CROSSING_TOLERANCE && at <= self.length + CROSSING_TOLERANCE)
+            .then(|| at.clamp(0., self.length))
+    }
+
     /// The same arc driven the other way, for the lane that runs back down the road.
     fn reversed(&self) -> Self {
         Self {
@@ -289,6 +375,19 @@ fn turn_of(tangent: Vec3, reach: Vec3) -> f32 {
 
 fn left_of(tangent: Vec3) -> Vec3 {
     Vec3::new(-tangent.z, 0., tangent.x)
+}
+
+/// The turn `angle` is, measured the way a road of `curvature` drives rather than the shorter way.
+///
+/// A turn just short of nothing reads as a turn just short of the whole circle when it is measured
+/// backwards, so the tolerance the crossing is found to is what separates the two.
+fn driven(angle: f32, curvature: f32) -> f32 {
+    let behind = CROSSING_TOLERANCE * curvature.abs();
+    match curvature > 0. {
+        true if angle < -behind => angle + std::f32::consts::TAU,
+        false if angle > behind => angle - std::f32::consts::TAU,
+        _ => angle,
+    }
 }
 
 fn turned(vector: Vec3, by: f32) -> Vec3 {
@@ -519,13 +618,13 @@ fn direction_leaving(node: LatticeNode, roads: &Query<&Road>) -> Option<Vec3> {
 /// Put the road the player placed into the world, once they say it is finished.
 ///
 /// Clicking onto a road that is already there finishes it too: reaching one is how a road is
-/// joined to the network, and a road that ends on another's node meets it there rather than
-/// running through it. A road of a single node is no road and lays nothing.
+/// joined to the network. Neither road is taken apart by the meeting, which is cut into both of
+/// them as a junction instead. A road of a single node is no road and lays nothing.
 fn lay_the_road(
     mut commands: Commands,
     player_input: Res<PlayerInput>,
     placing: Query<(Entity, &DrawnRoad)>,
-    roads: Query<(Entity, &Road)>,
+    roads: Query<&Road>,
 ) {
     for (entity, placed) in &placing {
         if !player_input.finish && !reaches_a_road(placed, &roads) {
@@ -533,83 +632,290 @@ fn lay_the_road(
         }
         commands.entity(entity).despawn();
 
-        let meetings = nodes_shared_with(&placed.nodes, &roads);
-        for (nodes, leaving) in split_at(&placed.nodes, placed.leaving, &meetings) {
-            commands.spawn(Road { nodes, leaving });
+        if placed.nodes.len() < 2 {
+            continue;
         }
-        for (crossed, road) in &roads {
-            let pieces = split_at(&road.nodes, road.leaving, &meetings);
-            if pieces.len() < 2 {
-                continue;
-            }
-            commands.entity(crossed).despawn();
-            for (nodes, leaving) in pieces {
-                commands.spawn(Road { nodes, leaving });
-            }
-        }
+        commands.spawn(Road {
+            nodes: placed.nodes.clone(),
+            leaving: placed.leaving,
+        });
     }
 }
 
 /// Whether the road being placed has arrived on a road that is already there.
-fn reaches_a_road(placed: &DrawnRoad, roads: &Query<(Entity, &Road)>) -> bool {
+fn reaches_a_road(placed: &DrawnRoad, roads: &Query<&Road>) -> bool {
     let Some(reached) = placed.nodes.last().filter(|_| placed.nodes.len() > 1) else {
         return false;
     };
-    roads.iter().any(|(_, road)| road.nodes.contains(reached))
+    roads.iter().any(|road| road.nodes.contains(reached))
 }
 
-/// The nodes of `drawn` that a road already runs through.
-fn nodes_shared_with(
-    drawn: &[LatticeNode],
-    roads: &Query<(Entity, &Road)>,
-) -> HashSet<LatticeNode> {
-    let drawn: HashSet<LatticeNode> = drawn.iter().copied().collect();
-    roads
+/// Put a junction wherever a road just laid crosses one that was already there.
+///
+/// It runs beside the initialization that lays a road, so the crossing is worked out from the arcs
+/// once and is a fact of record after that (invariant 3), and a frame that laid no road does no
+/// work at all. A road is measured against the roads laid alongside it on the same frame as well
+/// as against the ones already standing, and against each of them once.
+fn cut_the_roads_where_they_cross(
+    mut commands: Commands,
+    roads: Query<(Entity, &Road, Has<Crossed>), Without<NeedsInitialization>>,
+    children: Query<&Children>,
+    mut segments: Query<(&mut RoadSegment, Option<&NextSegment>)>,
+    mut junctions: Query<&mut Junction>,
+) {
+    let laid: Vec<(Entity, Vec<Arc>, bool)> = roads
         .iter()
-        .flat_map(|(_, road)| road.nodes.iter().copied())
-        .filter(|node| drawn.contains(node))
+        .map(|(entity, road, crossed)| (entity, arcs_through(&road.nodes, road.leaving), !crossed))
+        .collect();
+    if !laid.iter().any(|(.., fresh)| *fresh) {
+        return;
+    }
+
+    let mut found: Vec<(Vec3, Vec<Crossing>)> = Vec::new();
+    for (taken, (road, arcs, fresh)) in laid.iter().enumerate() {
+        if *fresh {
+            commands.entity(*road).insert(Crossed);
+        }
+        for (other, other_arcs, other_fresh) in &laid[taken + 1..] {
+            if !fresh && !other_fresh {
+                continue;
+            }
+            gather_the_crossings(*road, arcs, *other, other_arcs, &mut found);
+        }
+    }
+
+    for (at, across) in found {
+        for road in roads_crossing(&across) {
+            cut_the_segments_of(road, at, &children, &mut segments, &mut commands);
+        }
+        match junctions
+            .iter_mut()
+            .find(|junction| junction.at.distance(at) <= CROSSING_TOLERANCE)
+        {
+            Some(mut junction) => {
+                for crossing in across {
+                    note(&mut junction.across, crossing);
+                }
+            }
+            None => {
+                commands.spawn(Junction { at, across });
+            }
+        }
+    }
+}
+
+/// The roads a crossing stands on, each once however many of its arcs reach the point.
+fn roads_crossing(across: &[Crossing]) -> Vec<Entity> {
+    let mut roads: Vec<Entity> = Vec::new();
+    for crossing in across {
+        if !roads.contains(&crossing.road) {
+            roads.push(crossing.road);
+        }
+    }
+    roads
+}
+
+/// Note where two roads' arcs cross, gathering a point met by several pairs into one crossing.
+fn gather_the_crossings(
+    road: Entity,
+    arcs: &[Arc],
+    other: Entity,
+    other_arcs: &[Arc],
+    found: &mut Vec<(Vec3, Vec<Crossing>)>,
+) {
+    for (index, arc) in arcs.iter().enumerate() {
+        for (other_index, other_arc) in other_arcs.iter().enumerate() {
+            for (at, along, other_along) in crossings_of(arc, other_arc) {
+                let met = met_at(found, at);
+                note(
+                    &mut found[met].1,
+                    Crossing {
+                        road,
+                        arc: index,
+                        along,
+                    },
+                );
+                note(
+                    &mut found[met].1,
+                    Crossing {
+                        road: other,
+                        arc: other_index,
+                        along: other_along,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Which crossing of `found` stands at `at`, opened where nothing has been found there yet.
+fn met_at(found: &mut Vec<(Vec3, Vec<Crossing>)>, at: Vec3) -> usize {
+    match found
+        .iter()
+        .position(|(met, _)| met.distance(at) <= CROSSING_TOLERANCE)
+    {
+        Some(met) => met,
+        None => {
+            found.push((at, Vec::new()));
+            found.len() - 1
+        }
+    }
+}
+
+fn note(across: &mut Vec<Crossing>, crossing: Crossing) {
+    if !across
+        .iter()
+        .any(|noted| noted.road == crossing.road && noted.arc == crossing.arc)
+    {
+        across.push(crossing);
+    }
+}
+
+/// Cut every segment of `road` that covers `at` in two, both halves on the arc it already had.
+///
+/// The arc is copied rather than worked out again, so the halves hold the same curve to the bit
+/// and neither of them has moved. A crossing that lands on an end of a segment cuts nothing: the
+/// junction already stands where two segments meet.
+fn cut_the_segments_of(
+    road: Entity,
+    at: Vec3,
+    children: &Query<&Children>,
+    segments: &mut Query<(&mut RoadSegment, Option<&NextSegment>)>,
+    commands: &mut Commands,
+) {
+    let Ok(lanes) = children.get(road) else {
+        return;
+    };
+    for lane in lanes.iter() {
+        let Ok(pieces) = children.get(lane) else {
+            continue;
+        };
+        for piece in pieces.iter() {
+            let Ok((segment, onward)) = segments.get(piece) else {
+                continue;
+            };
+            let (arc, from, to) = (segment.arc, segment.from, segment.to);
+            let onward = onward.map(|onward| onward.0);
+            let Some(along) = arc.distance_along(at) else {
+                continue;
+            };
+            if along <= from + CROSSING_TOLERANCE || along >= to - CROSSING_TOLERANCE {
+                continue;
+            }
+
+            let cut = commands
+                .spawn((
+                    RoadSegment {
+                        arc,
+                        from: along,
+                        to,
+                    },
+                    ChildOf(lane),
+                ))
+                .id();
+            if let Some(onward) = onward {
+                commands.entity(cut).insert(NextSegment(onward));
+            }
+            commands.entity(piece).insert(NextSegment(cut));
+            if let Ok((mut segment, _)) = segments.get_mut(piece) {
+                segment.to = along;
+            }
+        }
+    }
+}
+
+/// Where two arcs cross, and how far along each of them the crossing stands.
+///
+/// A straight is an arc of zero curvature, so a pair is a line meeting a line, a line meeting a
+/// circle, or two circles meeting. What those answer is a point of the whole line or the whole
+/// circle, which is a crossing only where both arcs reach as far as it.
+fn crossings_of(one: &Arc, other: &Arc) -> Vec<(Vec3, f32, f32)> {
+    let meetings = match (one.curvature == 0., other.curvature == 0.) {
+        (true, true) => where_the_lines_meet(one, other),
+        (true, false) => where_a_line_meets_a_circle(one, other),
+        (false, true) => where_a_line_meets_a_circle(other, one),
+        (false, false) => where_the_circles_meet(one, other),
+    };
+
+    meetings
+        .into_iter()
+        .filter_map(|at| Some((at, one.distance_along(at)?, other.distance_along(at)?)))
         .collect()
 }
 
-/// Break a road into the roads it becomes once cut at every node in `at`.
-///
-/// A cut node ends the piece before it and starts the piece after, so the roads either side meet
-/// there rather than running through: that shared end is what makes the node a place a rover has
-/// to be handed over at. A cut at one of its own ends leaves it whole, being where it already
-/// ended, and a piece of a single node is no road at all and is dropped.
-///
-/// Each piece keeps the direction the whole road had where that piece begins, so the arcs it is
-/// rebuilt from are the arcs it already had: cutting a road moves none of it (invariant 6).
-fn split_at(
-    nodes: &[LatticeNode],
-    leaving: Option<Vec3>,
-    at: &HashSet<LatticeNode>,
-) -> Vec<(Vec<LatticeNode>, Option<Vec3>)> {
-    let arcs = arcs_through(nodes, leaving);
-    let directions: Vec<Option<Vec3>> = (0..nodes.len())
-        .map(
-            |node| match node.checked_sub(1).and_then(|before| arcs.get(before)) {
-                Some(arc) => Some(arc.tangent_at(arc.length)),
-                None => leaving,
-            },
-        )
-        .collect();
+/// The one point two straights meet at, which two running the same way have nowhere.
+fn where_the_lines_meet(one: &Arc, other: &Arc) -> Vec<Vec3> {
+    let crossing = turn_of(one.tangent, other.tangent);
+    if crossing.abs() < STRAIGHT_REACH {
+        return Vec::new();
+    }
+    vec![one.start + one.tangent * (turn_of(other.start - one.start, other.tangent) / crossing)]
+}
 
-    let mut pieces = Vec::new();
-    let mut opened = 0;
-
-    for (node, &standing) in nodes.iter().enumerate() {
-        let ends = at.contains(&standing) && node > opened;
-        if !ends && node + 1 < nodes.len() {
-            continue;
-        }
-        if node > opened {
-            pieces.push((nodes[opened..=node].to_vec(), directions[opened]));
-        }
-        opened = node;
+/// The points a straight meets a circle at, of which there are two unless it misses or grazes.
+fn where_a_line_meets_a_circle(line: &Arc, arc: &Arc) -> Vec<Vec3> {
+    let reach = line.start - arc.centre();
+    let towards = reach.dot(line.tangent);
+    let beyond = towards * towards - reach.length_squared() + arc.radius() * arc.radius();
+    if beyond < 0. {
+        return Vec::new();
     }
 
-    pieces
+    let step = beyond.sqrt();
+    vec![
+        line.start + line.tangent * (step - towards),
+        line.start + line.tangent * (-step - towards),
+    ]
+}
+
+/// The points two circles meet at, of which there are two unless one misses, holds or graze.
+fn where_the_circles_meet(one: &Arc, other: &Arc) -> Vec<Vec3> {
+    let (centre, middle) = (one.centre(), other.centre());
+    let between = middle - centre;
+    let apart = between.length();
+    if apart == 0. {
+        return Vec::new();
+    }
+
+    let (radius, span) = (one.radius(), other.radius());
+    let along = (radius * radius - span * span + apart * apart) / (2. * apart);
+    let across = radius * radius - along * along;
+    if across < 0. {
+        return Vec::new();
+    }
+
+    let met = centre + between * (along / apart);
+    let sideways = left_of(between) * (across.sqrt() / apart);
+    vec![met + sideways, met - sideways]
+}
+
+/// Drop a removed road from the junctions on it, and with it any junction left on one road alone.
+fn forget_a_removed_road_at_the_junctions_on_it(
+    removed: On<Remove, Road>,
+    mut commands: Commands,
+    mut junctions: Query<(Entity, &mut Junction)>,
+) {
+    for (entity, mut junction) in &mut junctions {
+        if !junction
+            .across
+            .iter()
+            .any(|crossing| crossing.road == removed.entity)
+        {
+            continue;
+        }
+        junction
+            .across
+            .retain(|crossing| crossing.road != removed.entity);
+
+        let left = junction.across.first().map(|crossing| crossing.road);
+        if junction
+            .across
+            .iter()
+            .all(|crossing| Some(crossing.road) == left)
+        {
+            commands.entity(entity).despawn();
+        }
+    }
 }
 
 /// Draw the road being placed, the arc the next click would lay, and the ground it cannot reach.
@@ -677,6 +983,20 @@ fn ring_around(centre: Vec3, radius: f32) -> impl Iterator<Item = Vec3> {
         let turn = std::f32::consts::TAU * step as f32 / RING_SUBDIVISIONS as f32;
         centre + turned(Vec3::X * radius, turn) + GIZMO_LIFT
     })
+}
+
+/// Mark every junction, which two lanes drawn across each other do not say is there.
+///
+/// A crossing is a point on both roads rather than anything either of them stores, so a road
+/// drawn over another looks exactly like a road drawn beside it until the junction is drawn.
+fn draw_the_junctions(mut gizmos: Gizmos<DebugGizmos>, junctions: Query<&Junction>) {
+    for junction in &junctions {
+        gizmos.circle(
+            Isometry3d::new(junction.at + GIZMO_LIFT, Quat::from_rotation_x(FRAC_PI_2)),
+            MAP_TILE_INRADIUS * JUNCTION_MARK,
+            JUNCTION_COLOUR,
+        );
+    }
 }
 
 /// Mark every tile a road runs over, which the lanes drawn across them do not say.
@@ -769,6 +1089,7 @@ mod tests {
     use crate::common::initialize::InitializationFailed;
     use crate::diagnostics::DebugGizmosPlugin;
     use crate::testing::{headless_app, tick};
+    use std::collections::HashSet;
 
     /// How closely two world positions have to agree to be the same place.
     const TOLERANCE: f32 = 1e-3;
@@ -808,6 +1129,20 @@ mod tests {
     /// A run of tiles setting off from the last tile of `STRAIGHT`, in offset-row coordinates.
     const ONWARD: [(i32, i32); 2] = [(3, 0), (3, 1)];
 
+    /// A direction from a tile's middle far enough towards a corner of it to settle on that corner.
+    const TOWARDS_A_CORNER: Vec3 = Vec3::new(0., 0., MAP_TILE_INRADIUS);
+
+    /// A direction from a tile's middle far enough towards the corner two round from that one.
+    const TOWARDS_THE_CORNER_TWO_ROUND: Vec3 =
+        Vec3::new(MAP_TILE_INRADIUS, 0., -MAP_TILE_INRADIUS / 2.);
+
+    /// A straight run crossing the curve of `TURNING` between its nodes, in offset-row coordinates.
+    const ACROSS_THE_CURVE: [(i32, i32); 2] = [(0, 2), (2, 0)];
+
+    /// A run that turns a corner of its own and crosses the curve of `TURNING` while it is turning,
+    /// in offset-row coordinates. Both roads meet on an arc, which is the pair of circles.
+    const CURVING_ACROSS: [(i32, i32); 3] = [(2, -1), (2, 0), (0, 1)];
+
     fn app_holding(tool: PlayerAction) -> App {
         let mut app = headless_app();
         app.insert_state(tool)
@@ -843,9 +1178,13 @@ mod tests {
     }
 
     fn spawn_road(app: &mut App, offsets: &[(i32, i32)]) -> Entity {
+        spawn_road_through(app, &nodes(offsets))
+    }
+
+    fn spawn_road_through(app: &mut App, path: &[LatticeNode]) -> Entity {
         app.world_mut()
             .spawn(Road {
-                nodes: nodes(offsets),
+                nodes: path.to_vec(),
                 leaving: None,
             })
             .id()
@@ -1315,16 +1654,15 @@ mod tests {
     }
 
     #[test]
-    fn the_road_it_arrived_on_is_split_at_the_node_they_share() {
+    fn the_road_it_arrived_on_is_left_whole() {
         let mut app = a_road_placed_onto_another();
 
-        assert!(a_road_runs_through(&mut app, &STRAIGHT[..3]));
-        assert!(a_road_runs_through(&mut app, &STRAIGHT[2..]));
-        assert_eq!(roads_in_the_world(&mut app), 3);
+        assert!(a_road_runs_through(&mut app, &STRAIGHT));
+        assert_eq!(roads_in_the_world(&mut app), 2);
     }
 
     #[test]
-    fn every_road_a_meeting_leaves_behind_gets_its_lanes() {
+    fn both_roads_of_a_meeting_keep_their_lanes() {
         let mut app = a_road_placed_onto_another();
 
         let laid: Vec<Entity> = app
@@ -1333,7 +1671,7 @@ mod tests {
             .iter(app.world())
             .collect();
 
-        assert_eq!(laid.len(), 3);
+        assert_eq!(laid.len(), 2);
         for road in laid {
             assert!(!app.world().entity(road).contains::<InitializationFailed>());
             assert_eq!(lanes(&app, road).len(), 2);
@@ -1505,6 +1843,300 @@ mod tests {
         assert!(a_road_runs_through(&mut app, &ONWARD));
         assert_eq!(roads_in_the_world(&mut app), 2);
     }
+    /// The two corners of the tile at `offset` a road drawn between crosses `STRAIGHT` at.
+    ///
+    /// Neither corner stands on `STRAIGHT`, and the straight between them meets it two thirds of
+    /// the way along itself, which is a node of neither road and an end of no segment of either.
+    fn crossing_arm(offset: (i32, i32)) -> Vec<LatticeNode> {
+        vec![
+            corner_of(offset, TOWARDS_A_CORNER),
+            corner_of(offset, TOWARDS_THE_CORNER_TWO_ROUND),
+        ]
+    }
+
+    /// `STRAIGHT`, and a road laid across the middle of it a frame later.
+    fn a_crossed_road() -> (App, Entity, Entity) {
+        let mut app = road_app();
+        let crossed = spawn_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+        let crossing = spawn_road_through(&mut app, &crossing_arm(STRAIGHT[1]));
+        tick(&mut app);
+        (app, crossed, crossing)
+    }
+
+    /// Every junction in the world, as where it stands and the arcs that reach it.
+    fn junctions(app: &mut App) -> Vec<(Vec3, Vec<Crossing>)> {
+        app.world_mut()
+            .query::<&Junction>()
+            .iter(app.world())
+            .map(|junction| (junction.at, junction.across.clone()))
+            .collect()
+    }
+
+    /// The one junction in the world.
+    fn the_junction(app: &mut App) -> (Vec3, Vec<Crossing>) {
+        let mut found = junctions(app);
+        let one = found.pop();
+        assert!(found.is_empty(), "more than one junction");
+        one.expect("a junction")
+    }
+
+    fn segments_under(app: &App, road: Entity) -> Vec<Entity> {
+        lanes(app, road)
+            .into_iter()
+            .flat_map(|lane| children_of(app, lane))
+            .collect()
+    }
+
+    /// The arc under every segment of `road`, on either of its lanes.
+    fn arcs_under(app: &App, road: Entity) -> Vec<Arc> {
+        segments_under(app, road)
+            .into_iter()
+            .filter_map(|segment| component_of::<RoadSegment>(app, segment).map(|piece| piece.arc))
+            .collect()
+    }
+
+    /// Where the straight from `from` to `to` crosses the straight from `across` to `beyond`.
+    fn where_the_straights_cross(from: Vec3, to: Vec3, across: Vec3, beyond: Vec3) -> Vec3 {
+        let along = to - from;
+        let other = beyond - across;
+        from + along * (turn_of(across - from, other) / turn_of(along, other))
+    }
+
+    #[test]
+    fn a_road_drawn_across_another_crosses_it_between_its_nodes() {
+        let (mut app, ..) = a_crossed_road();
+        let crossed = nodes(&STRAIGHT[1..3]);
+        let arm = crossing_arm(STRAIGHT[1]);
+        let met = where_the_straights_cross(
+            crossed[0].world_position(),
+            crossed[1].world_position(),
+            arm[0].world_position(),
+            arm[1].world_position(),
+        );
+
+        let (at, _) = the_junction(&mut app);
+
+        assert!(
+            at.distance(met) < TOLERANCE,
+            "a junction at {at}, not {met}"
+        );
+    }
+
+    #[test]
+    fn a_junction_names_both_the_roads_that_cross_at_it() {
+        let (mut app, crossed, crossing) = a_crossed_road();
+
+        let (_, across) = the_junction(&mut app);
+
+        let roads: HashSet<Entity> = across.iter().map(|crossing| crossing.road).collect();
+        assert_eq!(roads, HashSet::from([crossed, crossing]));
+    }
+
+    /// The arc a crossing is recorded against, worked out from the road's own nodes.
+    fn arc_of(app: &App, crossing: &Crossing) -> Option<Arc> {
+        let road = component_of::<Road>(app, crossing.road)?;
+        arcs_through(&road.nodes, road.leaving)
+            .get(crossing.arc)
+            .copied()
+    }
+
+    /// Whether every arc a junction names puts the crossing where the junction stands.
+    fn stands_where_it_says(app: &App, at: Vec3, across: &[Crossing]) -> bool {
+        !across.is_empty()
+            && across.iter().all(|crossing| {
+                arc_of(app, crossing)
+                    .is_some_and(|arc| arc.position(crossing.along).distance(at) < TOLERANCE)
+            })
+    }
+
+    /// Whether a junction was found on a curve of `road` rather than on a straight run of it.
+    fn found_on_a_curve_of(app: &App, road: Entity, across: &[Crossing]) -> bool {
+        across
+            .iter()
+            .filter(|crossing| crossing.road == road)
+            .any(|crossing| arc_of(app, crossing).is_some_and(|arc| arc.curvature != 0.))
+    }
+
+    #[test]
+    fn a_junction_stands_at_a_distance_along_the_arc_of_each_road_it_crosses() {
+        let (mut app, ..) = a_crossed_road();
+
+        let (at, across) = the_junction(&mut app);
+
+        assert!(
+            stands_where_it_says(&app, at, &across),
+            "{across:?} at {at}"
+        );
+    }
+
+    #[test]
+    fn a_straight_road_drawn_across_a_curve_crosses_it_on_the_arc() {
+        let mut app = road_app();
+        let curved = spawn_road(&mut app, &TURNING);
+        tick(&mut app);
+        spawn_road(&mut app, &ACROSS_THE_CURVE);
+        tick(&mut app);
+
+        let (at, across) = the_junction(&mut app);
+
+        assert!(
+            stands_where_it_says(&app, at, &across),
+            "{across:?} at {at}"
+        );
+        assert!(found_on_a_curve_of(&app, curved, &across), "{across:?}");
+    }
+
+    #[test]
+    fn two_curves_drawn_across_each_other_cross_on_both_arcs() {
+        let mut app = road_app();
+        let curved = spawn_road(&mut app, &TURNING);
+        tick(&mut app);
+        let curving = spawn_road(&mut app, &CURVING_ACROSS);
+        tick(&mut app);
+
+        let (at, across) = the_junction(&mut app);
+
+        assert!(
+            stands_where_it_says(&app, at, &across),
+            "{across:?} at {at}"
+        );
+        assert!(found_on_a_curve_of(&app, curved, &across), "{across:?}");
+        assert!(found_on_a_curve_of(&app, curving, &across), "{across:?}");
+    }
+
+    #[test]
+    fn crossing_a_curve_moves_none_of_its_arcs() {
+        let mut app = road_app();
+        let curved = spawn_road(&mut app, &TURNING);
+        tick(&mut app);
+        let before = arcs_under(&app, curved);
+
+        spawn_road(&mut app, &ACROSS_THE_CURVE);
+        tick(&mut app);
+
+        let after = arcs_under(&app, curved);
+        assert!(after.len() > before.len(), "a curve that was never cut");
+        for arc in after {
+            assert!(before.contains(&arc), "an arc that moved: {arc:?}");
+        }
+    }
+
+    #[test]
+    fn crossing_a_road_moves_none_of_its_arcs() {
+        let mut app = road_app();
+        let crossed = spawn_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+        let before = arcs_under(&app, crossed);
+
+        spawn_road_through(&mut app, &crossing_arm(STRAIGHT[1]));
+        tick(&mut app);
+
+        let after = arcs_under(&app, crossed);
+        assert!(after.len() > before.len(), "a road that was never cut");
+        for arc in after {
+            assert!(before.contains(&arc), "an arc that moved: {arc:?}");
+        }
+    }
+
+    #[test]
+    fn the_segments_either_side_of_a_junction_are_intervals_of_one_arc() {
+        let (mut app, crossed, _) = a_crossed_road();
+        let (at, _) = the_junction(&mut app);
+
+        let mut met = 0;
+        for segment in segments_under(&app, crossed) {
+            if position(&app, segment, 1.).distance(at) > TOLERANCE {
+                continue;
+            }
+            let onward = next_of(&app, segment).expect("the segment past the junction");
+            let before = component_of::<RoadSegment>(&app, segment).expect("the segment before");
+            let after = component_of::<RoadSegment>(&app, onward).expect("the segment after");
+
+            assert_eq!(before.arc, after.arc);
+            assert_eq!(before.to, after.from);
+            met += 1;
+        }
+
+        assert_eq!(met, lanes(&app, crossed).len(), "a lane that was not cut");
+    }
+
+    #[test]
+    fn a_road_crossed_twice_is_cut_at_both_crossings() {
+        let mut app = road_app();
+        let crossed = spawn_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+        let before = segments_under(&app, crossed).len();
+
+        spawn_road_through(&mut app, &crossing_arm(STRAIGHT[1]));
+        tick(&mut app);
+        spawn_road_through(&mut app, &crossing_arm(STRAIGHT[2]));
+        tick(&mut app);
+
+        assert_eq!(junctions(&mut app).len(), 2);
+        assert_eq!(
+            segments_under(&app, crossed).len(),
+            before + 2 * lanes(&app, crossed).len()
+        );
+    }
+
+    #[test]
+    fn two_roads_laid_on_the_same_frame_cross_each_other() {
+        let mut app = road_app();
+        spawn_road(&mut app, &STRAIGHT);
+        spawn_road_through(&mut app, &crossing_arm(STRAIGHT[1]));
+        tick(&mut app);
+
+        assert_eq!(junctions(&mut app).len(), 1);
+    }
+
+    #[test]
+    fn two_roads_that_meet_at_a_node_they_share_make_one_junction() {
+        let mut app = a_road_placed_onto_another();
+
+        let (at, _) = the_junction(&mut app);
+
+        let met = nodes(&STRAIGHT)[2].world_position();
+        assert!(
+            at.distance(met) < TOLERANCE,
+            "a junction at {at}, not {met}"
+        );
+    }
+
+    #[test]
+    fn a_road_that_reaches_no_other_makes_no_junction() {
+        let (mut app, _) = built_road(&WINDING);
+
+        assert!(junctions(&mut app).is_empty());
+    }
+
+    #[test]
+    fn the_segments_of_a_crossed_road_still_drive_the_whole_of_it() {
+        let (app, crossed, _) = a_crossed_road();
+        let start = children_of(&app, lanes(&app, crossed)[0])[0];
+
+        let mut driven = vec![start];
+        while let Some(next) = next_of(&app, *driven.last().expect("the drive has a segment")) {
+            if next == start {
+                break;
+            }
+            driven.push(next);
+        }
+
+        assert_eq!(driven.len(), segments_under(&app, crossed).len());
+    }
+
+    #[test]
+    fn a_removed_road_leaves_no_junction_naming_it() {
+        let (mut app, crossed, _) = a_crossed_road();
+        assert_eq!(junctions(&mut app).len(), 1);
+
+        app.world_mut().entity_mut(crossed).despawn();
+        tick(&mut app);
+
+        assert!(junctions(&mut app).is_empty());
+    }
+
     fn occupied_tiles(app: &App, road: Entity) -> Vec<HexCoordinates> {
         app.world()
             .resource::<RoadTiles>()
@@ -1687,7 +2319,7 @@ mod tests {
     }
 
     #[test]
-    fn splitting_a_road_leaves_the_tile_they_met_on_occupied_by_the_pieces() {
+    fn the_tile_two_roads_met_on_is_occupied_by_both_of_them() {
         let mut app = a_road_placed_onto_another();
 
         let laid: Vec<Entity> = app
