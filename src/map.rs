@@ -9,7 +9,8 @@ const MAP_GRID_GAP: f32 = 0.2;
 /// The across-corners size of a tile: the diameter of the circle its hexagon fits in.
 pub const MAP_TILE_SIZE: f32 = 10.;
 const SQRT_3: f32 = 1.732_050_8;
-const MAP_TILE_WIDTH: f32 = MAP_TILE_SIZE / 2. * SQRT_3;
+/// The across-flats size of a tile: how far it is from one tile's middle to a neighbour's.
+pub const MAP_TILE_WIDTH: f32 = MAP_TILE_SIZE / 2. * SQRT_3;
 const MAP_TILE_ROW_SPACING: f32 = MAP_TILE_SIZE * 0.75;
 const MAP_TILE_DEPTH: f32 = 0.25;
 const NODE_SPACING: f32 = MAP_TILE_SIZE / 2.;
