@@ -819,11 +819,12 @@ mod tests {
     /// A run of tiles that turns a corner, in offset-row coordinates.
     const TURNING: [(i32, i32); 3] = [(0, 0), (1, 0), (1, 1)];
 
-    /// A run of tiles that turns back on itself, in offset-row coordinates.
+    /// A run of tiles turning `TURNING`'s corner over twice the ground, in offset-row coordinates.
     ///
-    /// The corner at its middle tile is a hundred and twenty degrees against `TURNING`'s sixty,
-    /// so it is the same road drawn round a tighter bend.
-    const HAIRPIN: [(i32, i32); 3] = [(0, 0), (1, 0), (0, 1)];
+    /// An arc turns by twice the angle its target sits off the heading, so aiming further off does
+    /// not tighten it past a point: sixty degrees off and a hundred and twenty give the same
+    /// radius. Reaching the same corner over twice the distance is what draws it twice as wide.
+    const WIDE_CORNER: [(i32, i32); 3] = [(0, 0), (2, 0), (3, 2)];
 
     /// A run of tiles that runs straight and then turns twice, in offset-row coordinates.
     const WINDING: [(i32, i32); 5] = [(0, 0), (1, 0), (2, 0), (2, 1), (2, 2)];
@@ -1789,10 +1790,15 @@ mod tests {
 
     #[test]
     fn a_tighter_corner_is_slower_than_a_sweeping_one() {
-        let (sweeping, wide) = built_road(&TURNING);
-        let (tight, hairpin) = built_road(&HAIRPIN);
+        let (sweeping, wide) = built_road(&WIDE_CORNER);
+        let (tight, corner) = built_road(&TURNING);
 
-        assert!(slowest_on(&tight, hairpin) < slowest_on(&sweeping, wide));
+        let bend = slowest_on(&tight, corner);
+        let curve = slowest_on(&sweeping, wide);
+        assert!(
+            bend < curve,
+            "{bend} round the tighter corner against {curve}"
+        );
     }
 
     #[test]

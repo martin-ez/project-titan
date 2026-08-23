@@ -369,13 +369,32 @@ mod tests {
             .into_iter()
             .map(LatticeNode::from_tile)
             .collect();
-        app.world_mut().spawn(Road { nodes });
+        app.world_mut().spawn(Road {
+            nodes,
+            leaving: None,
+        });
     }
 
     /// Set a rover off from the start of the first segment of the road through `offsets`.
     fn set_off_along(app: &mut App, offsets: &[(i32, i32)]) -> (Entity, Entity) {
         let segment = segment_from(app, tiles(offsets)[0]);
         (spawn_rover(app, segment, 0.), segment)
+    }
+
+    /// The segment of the one road in `app` that holds a rover to the lowest speed.
+    fn slowest_segment_in(app: &mut App) -> Entity {
+        app.world_mut()
+            .query::<(Entity, &RoadSegment)>()
+            .iter(app.world())
+            .min_by(|(_, one), (_, other)| one.speed_limit().total_cmp(&other.speed_limit()))
+            .map(|(segment, _)| segment)
+            .expect("the road has segments")
+    }
+
+    /// How fast a segment with no curve in it allows, which is the fastest a segment gets.
+    fn the_open_road() -> f32 {
+        let (app, _, straight) = road_with_a_driver(&STRAIGHT);
+        speed_limit_of(&app, straight)
     }
 
     /// An app of its own holding one road and one rover at the start of it.
@@ -576,19 +595,22 @@ mod tests {
 
     #[test]
     fn a_rover_crosses_a_slower_segment_in_more_ticks() {
-        let (mut open_road, on_the_straight, straight) = road_with_a_driver(&STRAIGHT);
-        let (mut bends, round_the_bend, winding) = road_with_a_driver(&WINDING);
-        let quickly = speed_limit_of(&open_road, straight);
-        let slowly = speed_limit_of(&bends, winding);
-        let ground = length_of(&open_road, straight) / length_of(&bends, winding);
+        let mut app = rover_app();
+        lay_road(&mut app, &WINDING);
+        tick(&mut app);
+        let bend = slowest_segment_in(&mut app);
+        let round_the_bend = spawn_rover(&mut app, bend, 0.);
+        let ground = length_of(&app, bend);
+        let open_road = the_open_road();
 
-        let quick = ticks_to_cross(&mut open_road, on_the_straight);
-        let slow = ticks_to_cross(&mut bends, round_the_bend);
+        let slowly = speed_limit_of(&app, bend);
+        let taken = ticks_to_cross(&mut app, round_the_bend) as f32;
 
-        assert!(slowly < quickly, "{slowly} round the bend is no slower");
+        assert!(slowly < open_road, "{slowly} round the bend is no slower");
         assert!(
-            slow as f32 > quick as f32 * ground,
-            "{slow} ticks round the bend against {quick} over {ground} of the ground"
+            taken > ground / open_road,
+            "{taken} ticks round the bend against the {} the same {ground} of straight takes",
+            ground / open_road
         );
     }
 
