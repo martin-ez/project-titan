@@ -2,7 +2,7 @@ use crate::common::cleanup::DestroyOnStateChange;
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use crate::diagnostics::DebugGizmos;
 use crate::input::{PlayerAction, PlayerInput};
-use crate::map::{HexCoordinates, LatticeNode, MapTile, MAP_TILE_INRADIUS};
+use crate::map::{HexCoordinates, LatticeNode, MapTile, MAP_TILE_INRADIUS, MAP_TILE_SIZE};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -24,6 +24,21 @@ const SEGMENT_LENGTH: f32 = 5.;
 /// How near two tangents have to be to count as the same direction when a biarc is fitted.
 const JOIN_TOLERANCE: f32 = 1e-4;
 
+/// How far a rover may travel in one tick on a segment that does not turn at all.
+///
+/// In world units, so a rover on the straight crosses a tile every sixty-four ticks. Nothing in
+/// gameplay measures in seconds (invariant 2): running the world faster runs more ticks rather
+/// than longer ones, and this is untouched by that.
+const STRAIGHT_SPEED_LIMIT: f32 = MAP_TILE_SIZE / 64.;
+
+/// The tightest curve still driven at the straight-road limit, as a radius in world units.
+///
+/// Four tiles across. The sixty-degree corner between neighbouring tiles fits arcs of about one
+/// and two thirds of a tile in radius, which comes out near two thirds of the straight limit:
+/// enough that a sweeping road is worth the land it costs, and not so much that a corner is a
+/// wall.
+const COMFORTABLE_RADIUS: f32 = 4. * MAP_TILE_SIZE;
+
 /// How far apart an arc is walked when the tiles it runs over are worked out.
 ///
 /// Two samples this close land on one tile or on neighbours, so the walk crosses one boundary
@@ -37,6 +52,9 @@ const GIZMO_LIFT: Vec3 = Vec3::new(0., 0.1, 0.);
 
 /// The colour a lane's arcs are drawn in
 const LANE_COLOUR: Color = Color::srgb(0.35, 0.75, 0.95);
+
+/// The colour a lane is drawn in where its curve holds a rover to the slowest a segment gets
+const SLOW_LANE_COLOUR: Color = Color::srgb(0.95, 0.35, 0.45);
 
 /// The colour the step from one segment onto the next is drawn in
 const HANDOVER_COLOUR: Color = Color::srgb(0.95, 0.8, 0.3);
@@ -280,6 +298,23 @@ impl RoadSegment {
             along if along >= 1. => self.to,
             along => self.from + (self.to - self.from) * along,
         })
+    }
+
+    /// How long the stretch of arc this segment covers is, in world units.
+    pub fn length(&self) -> f32 {
+        self.to - self.from
+    }
+
+    /// How far a rover may travel along this segment in one tick.
+    ///
+    /// Read off the arc's curvature rather than stored beside it, which is what makes a tight turn
+    /// a cost the player trades land against rather than a rule the build tool enforces. An arc
+    /// holds one curvature along its whole length, so there is no spike anywhere to read the wrong
+    /// number off, and two segments cut from one arc are equally fast however often the road
+    /// between them was cut (invariant 6).
+    pub fn speed_limit(&self) -> f32 {
+        let radius = self.arc.curvature.abs().recip();
+        STRAIGHT_SPEED_LIMIT * (radius / COMFORTABLE_RADIUS).sqrt().min(1.)
     }
 }
 
@@ -629,10 +664,12 @@ fn draw_the_road_under_the_cursor(
     );
 }
 
-/// Draw every lane, and the order a rover drives its segments in.
+/// Draw every lane, the order a rover drives its segments in, and how fast each of them allows.
 ///
 /// A chain of segments is otherwise only visible in a test: two lanes lying on the same road look
 /// like one road, and the join at a dead end looks like a rover turning round of its own accord.
+/// A lane's colour is its speed limit, so the cost of a corner can be seen while the road is being
+/// built rather than inferred afterwards from rovers arriving late.
 fn draw_the_lanes(
     mut gizmos: Gizmos<DebugGizmos>,
     segments: Query<(&RoadSegment, Option<&NextSegment>)>,
@@ -643,7 +680,7 @@ fn draw_the_lanes(
             (0..=SEGMENT_SUBDIVISIONS).map(|step| {
                 segment.world_position(step as f32 / SEGMENT_SUBDIVISIONS as f32) + GIZMO_LIFT
             }),
-            LANE_COLOUR,
+            SLOW_LANE_COLOUR.mix(&LANE_COLOUR, segment.speed_limit() / STRAIGHT_SPEED_LIMIT),
         );
 
         let Some(next) = next.and_then(|next| onward.get(next.0).ok()) else {
@@ -676,6 +713,12 @@ mod tests {
 
     /// A run of tiles that turns a corner, in offset-row coordinates.
     const TURNING: [(i32, i32); 3] = [(0, 0), (1, 0), (1, 1)];
+
+    /// A run of tiles that turns back on itself, in offset-row coordinates.
+    ///
+    /// The corner at its middle tile is a hundred and twenty degrees against `TURNING`'s sixty,
+    /// so it is the same road drawn round a tighter bend.
+    const HAIRPIN: [(i32, i32); 3] = [(0, 0), (1, 0), (0, 1)];
 
     /// A run of tiles that runs straight and then turns twice, in offset-row coordinates.
     const WINDING: [(i32, i32); 5] = [(0, 0), (1, 0), (2, 0), (2, 1), (2, 2)];
@@ -797,6 +840,25 @@ mod tests {
                 position(app, segment, step as f32 / LENGTH_SAMPLES as f32).distance(before)
             })
             .sum()
+    }
+
+    /// How fast every segment of the lane of `road` setting off from `tile` allows.
+    fn speed_limits_along(app: &App, road: Entity, tile: HexCoordinates) -> Vec<f32> {
+        lane_from(app, road, tile)
+            .into_iter()
+            .filter_map(|segment| component_of::<RoadSegment>(app, segment))
+            .map(RoadSegment::speed_limit)
+            .collect()
+    }
+
+    /// The lowest speed limit anywhere on `road`, which is its tightest curve.
+    fn slowest_on(app: &App, road: Entity) -> f32 {
+        lanes(app, road)
+            .into_iter()
+            .flat_map(|lane| children_of(app, lane))
+            .filter_map(|segment| component_of::<RoadSegment>(app, segment))
+            .map(RoadSegment::speed_limit)
+            .fold(f32::INFINITY, f32::min)
     }
 
     fn next_of(app: &App, segment: Entity) -> Option<Entity> {
@@ -1467,6 +1529,51 @@ mod tests {
         assert_eq!(met.len(), laid.len());
         for road in met {
             assert!(laid.contains(&road), "a road that is no longer laid");
+        }
+    }
+    #[test]
+    fn a_straight_segment_is_the_fastest_a_segment_gets() {
+        let (app, road) = built_road(&STRAIGHT);
+
+        let limits = speed_limits_along(&app, road, tiles(&STRAIGHT)[0]);
+
+        assert!(!limits.is_empty(), "the lane has no segments to be fast on");
+        for limit in limits {
+            assert!(
+                (limit - STRAIGHT_SPEED_LIMIT).abs() < TOLERANCE,
+                "{limit} against the straight limit of {STRAIGHT_SPEED_LIMIT}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_road_that_turns_is_slower_than_one_that_does_not() {
+        let (straight, laid) = built_road(&STRAIGHT);
+        let (turning, bent) = built_road(&TURNING);
+
+        assert!(slowest_on(&turning, bent) < slowest_on(&straight, laid));
+    }
+
+    #[test]
+    fn a_tighter_corner_is_slower_than_a_sweeping_one() {
+        let (sweeping, wide) = built_road(&TURNING);
+        let (tight, hairpin) = built_road(&HAIRPIN);
+
+        assert!(slowest_on(&tight, hairpin) < slowest_on(&sweeping, wide));
+    }
+
+    #[test]
+    fn a_road_is_as_fast_driven_one_way_as_the_other() {
+        let path = tiles(&WINDING);
+        let (app, road) = built_road(&WINDING);
+
+        let there = speed_limits_along(&app, road, path[0]);
+        let mut back = speed_limits_along(&app, road, path[WINDING.len() - 1]);
+        back.reverse();
+
+        assert_eq!(there.len(), back.len());
+        for (there, back) in there.iter().zip(&back) {
+            assert!((there - back).abs() < TOLERANCE, "{there} against {back}");
         }
     }
 }
