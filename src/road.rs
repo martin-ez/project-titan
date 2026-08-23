@@ -2,10 +2,11 @@ use crate::common::cleanup::DestroyOnStateChange;
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use crate::diagnostics::DebugGizmos;
 use crate::input::{PlayerAction, PlayerInput};
-use crate::map::{LatticeNode, MAP_TILE_WIDTH};
+use crate::map::{HexCoordinates, LatticeNode, MapTile, MAP_TILE_INRADIUS};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::f32::consts::FRAC_PI_2;
 
 /// How many straight pieces a segment's arc is drawn as.
 const SEGMENT_SUBDIVISIONS: u32 = 8;
@@ -25,12 +26,12 @@ const SEGMENT_LENGTH: f32 = 5.;
 
 /// The tightest turn a road may be built to make, as the radius of the arc a rover drives.
 ///
-/// Half a tile across the flats, so the bound comes off the grid rather than out of the air. It
-/// leaves the sixty degree turn onto a neighbouring tile buildable, whose arc has a radius of one
-/// lattice step, and refuses the same turn onto a neighbouring node, which would need two thirds
-/// of that. Under it the nodes a road cannot reach from where it stands are the two discs of this
-/// radius that touch its heading, one either side.
-const MIN_TURN_RADIUS: f32 = MAP_TILE_WIDTH / 2.;
+/// A tile's inradius, so the bound comes off the grid rather than out of the air. It leaves the
+/// sixty degree turn onto a neighbouring tile buildable, whose arc has a radius of one lattice
+/// step, and refuses the same turn onto a neighbouring node, which would need two thirds of that.
+/// Under it the nodes a road cannot reach from where it stands are the two discs of this radius
+/// that touch its heading, one either side.
+const MIN_TURN_RADIUS: f32 = MAP_TILE_INRADIUS;
 
 /// How far off the heading a target may sit and still be aimed at straight.
 ///
@@ -39,6 +40,14 @@ const MIN_TURN_RADIUS: f32 = MAP_TILE_WIDTH / 2.;
 /// gives an arc of radius in the millions, whose centre is too far from the road for a position
 /// on it to survive being computed in single precision.
 const STRAIGHT_REACH: f32 = 1e-3;
+
+/// How far apart an arc is walked when the tiles it runs over are worked out.
+///
+/// Two samples this close land on one tile or on neighbours, so the walk crosses one boundary
+/// at a time rather than stepping a tile over. What it does not report is a tile the arc only
+/// clips the corner of for less than a step, which at a quarter of the inradius is an eighth of
+/// the way across a tile: too little for anything to stand on.
+const TILE_SAMPLE_STEP: f32 = MAP_TILE_INRADIUS / 4.;
 
 /// How far the debug view lifts a lane off the ground, so it does not fight the tiles it lies on.
 const GIZMO_LIFT: Vec3 = Vec3::new(0., 0.1, 0.);
@@ -57,6 +66,15 @@ const PROPOSAL_COLOUR: Color = Color::srgb(0.95, 0.95, 0.4);
 
 /// The colour the ground a road cannot turn tightly enough to reach is drawn in
 const UNREACHABLE_COLOUR: Color = Color::srgb(0.95, 0.35, 0.35);
+
+/// The colour the tiles a road runs over are marked in
+const OCCUPIED_COLOUR: Color = Color::srgb(0.95, 0.45, 0.35);
+
+/// The colour a tile under the cursor is marked in when a road already runs over it
+const TAKEN_COLOUR: Color = Color::srgb(0.95, 0.25, 0.2);
+
+/// How wide the mark on an occupied tile is drawn, as a share of the tile's inradius.
+const OCCUPIED_MARK: f32 = 0.35;
 
 /// The roads on the map, and the lanes a rover drives on them.
 ///
@@ -133,22 +151,70 @@ pub struct NextSegment(pub Entity);
 #[relationship_target(relationship = NextSegment)]
 pub struct PreviousSegments(Vec<Entity>);
 
+/// Which roads run over each tile of the map, and which tiles each road runs over.
+///
+/// Under #4 a road was a run of tiles and this was a lookup; under #93 an arc runs over the grid
+/// rather than along it, and the answer has to be walked out of the geometry. It is walked once,
+/// when the road is laid, and read back both ways by a key, because a rule about what may stand on
+/// a tile has to answer without measuring every arc on the map.
+#[derive(Resource, Default)]
+pub struct RoadTiles {
+    over: HashMap<HexCoordinates, Vec<Entity>>,
+    under: HashMap<Entity, Vec<HexCoordinates>>,
+}
+
 #[derive(SystemParam)]
 struct RoadInitializeParams<'w, 's> {
     commands: Commands<'w, 's>,
+    occupied: ResMut<'w, RoadTiles>,
 }
 
 impl Plugin for RoadPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(PreUpdate, initialize_system::<Road, RoadInitializeParams>)
+        app.init_resource::<RoadTiles>()
+            .add_observer(release_the_tiles_of_a_removed_road)
+            .add_systems(PreUpdate, initialize_system::<Road, RoadInitializeParams>)
             .add_systems(
                 Update,
                 (
                     (place_a_node, lay_the_road).chain(),
                     draw_the_lanes,
                     draw_the_road_being_placed,
+                    draw_the_occupied_tiles,
+                    draw_the_road_under_the_cursor,
                 ),
             );
+    }
+}
+
+impl RoadTiles {
+    /// The roads running over `tile`, of which there is more than one where two of them meet.
+    pub fn roads_over(&self, tile: HexCoordinates) -> &[Entity] {
+        self.over.get(&tile).map_or(&[], Vec::as_slice)
+    }
+
+    /// The tiles `road` runs over, in the order its arcs reach them.
+    pub fn tiles_under(&self, road: Entity) -> &[HexCoordinates] {
+        self.under.get(&road).map_or(&[], Vec::as_slice)
+    }
+
+    fn claim(&mut self, road: Entity, tiles: Vec<HexCoordinates>) {
+        for &tile in &tiles {
+            self.over.entry(tile).or_default().push(road);
+        }
+        self.under.insert(road, tiles);
+    }
+
+    fn release(&mut self, road: Entity) {
+        for tile in self.under.remove(&road).unwrap_or_default() {
+            let Some(claimants) = self.over.get_mut(&tile) else {
+                continue;
+            };
+            claimants.retain(|&claimant| claimant != road);
+            if claimants.is_empty() {
+                self.over.remove(&tile);
+            }
+        }
     }
 }
 
@@ -254,6 +320,7 @@ impl Initialize<RoadInitializeParams<'_, '_>> for Road {
         if along.is_empty() {
             return Err("a road of no arcs".into());
         }
+        params.occupied.claim(*entity, tiles_walked_by(&along));
         let back: Vec<Arc> = along.iter().rev().map(Arc::reversed).collect();
 
         let along = spawn_lane(&mut params.commands, *entity, &along)?;
@@ -269,6 +336,35 @@ impl Initialize<RoadInitializeParams<'_, '_>> for Road {
             .insert(NextSegment(along.first));
         Ok(())
     }
+}
+
+/// Give up the tiles a road held, whichever way it left the world.
+fn release_the_tiles_of_a_removed_road(removed: On<Remove, Road>, mut occupied: ResMut<RoadTiles>) {
+    occupied.release(removed.entity);
+}
+
+/// The tiles `arcs` run over, each of them reported once.
+///
+/// Both ends of every arc are stood on exactly rather than merely walked near, so a road is always
+/// found under the tiles its own nodes stand on: a node is where one arc ends and the next begins.
+fn tiles_walked_by(arcs: &[Arc]) -> Vec<HexCoordinates> {
+    let mut walked: Vec<HexCoordinates> = Vec::new();
+    for arc in arcs {
+        for at in walk_of(arc) {
+            let tile = HexCoordinates::from_world_position(arc.position(at));
+            if !walked.contains(&tile) {
+                walked.push(tile);
+            }
+        }
+    }
+    walked
+}
+
+/// How far along `arc` each place it is stood on stands, its far end included.
+fn walk_of(arc: &Arc) -> impl Iterator<Item = f32> {
+    let length = arc.length;
+    let steps = (length / TILE_SAMPLE_STEP).ceil().max(1.);
+    (0..=steps as usize).map(move |step| length * step as f32 / steps)
 }
 
 /// The arcs running through `nodes`, each leaving the one before it at the same tangent.
@@ -583,6 +679,61 @@ fn ring_around(centre: Vec3, radius: f32) -> impl Iterator<Item = Vec3> {
     })
 }
 
+/// Mark every tile a road runs over, which the lanes drawn across them do not say.
+///
+/// A road curves over the grid rather than following it, so which tiles it takes is a question the
+/// map cannot be looked at to answer, and a lane drawn over a corner of one looks the same as a
+/// lane that misses it.
+fn draw_the_occupied_tiles(
+    mut gizmos: Gizmos<DebugGizmos>,
+    occupied: Res<RoadTiles>,
+    roads: Query<Entity, With<Road>>,
+) {
+    for road in &roads {
+        for tile in occupied.tiles_under(road) {
+            gizmos.circle(
+                Isometry3d::new(
+                    tile.world_position() + GIZMO_LIFT,
+                    Quat::from_rotation_x(FRAC_PI_2),
+                ),
+                MAP_TILE_INRADIUS * OCCUPIED_MARK,
+                OCCUPIED_COLOUR,
+            );
+        }
+    }
+}
+
+/// Mark the tile under the cursor when a road already runs over it.
+///
+/// This is the tile question asked from the other end, and the one #98 refuses a building with.
+/// Reading it off a road would mean reading every road, which is what the tile is keyed for.
+fn draw_the_road_under_the_cursor(
+    mut gizmos: Gizmos<DebugGizmos>,
+    occupied: Res<RoadTiles>,
+    player_input: Res<PlayerInput>,
+    tiles: Query<&MapTile>,
+) {
+    let Some(tile) = player_input
+        .cursor_tile
+        .and_then(|tile| tiles.get(tile).ok())
+        .map(|tile| tile.coordinates)
+    else {
+        return;
+    };
+    if occupied.roads_over(tile).is_empty() {
+        return;
+    }
+
+    gizmos.circle(
+        Isometry3d::new(
+            tile.world_position() + GIZMO_LIFT,
+            Quat::from_rotation_x(FRAC_PI_2),
+        ),
+        MAP_TILE_INRADIUS,
+        TAKEN_COLOUR,
+    );
+}
+
 /// Draw every lane, and the order a rover drives its segments in.
 ///
 /// A chain of segments is otherwise only visible in a test: two lanes lying on the same road look
@@ -617,7 +768,6 @@ mod tests {
     use crate::common::cleanup::CleanupPlugin;
     use crate::common::initialize::InitializationFailed;
     use crate::diagnostics::DebugGizmosPlugin;
-    use crate::map::HexCoordinates;
     use crate::testing::{headless_app, tick};
 
     /// How closely two world positions have to agree to be the same place.
@@ -637,6 +787,23 @@ mod tests {
 
     /// A run of tiles crossing `STRAIGHT` at its third tile, in offset-row coordinates.
     const CROSSING: [(i32, i32); 3] = [(2, -1), (2, 0), (2, 1)];
+
+    /// Nodes far enough apart that the arcs between them cross tiles of their own, in offset-row
+    /// coordinates. A drag records the nodes the cursor reached and nothing between them, so this
+    /// is what a flick lays and what the road tool hands the walk to measure.
+    const SWEEPING: [(i32, i32); 3] = [(0, 0), (3, 0), (3, 3)];
+
+    /// Pairs of nodes whose runs cross the grid at lengths and angles of their own, in offset-row
+    /// coordinates. One length would only say the walk lands on tile middles as often as it is
+    /// spaced to; several say it lands on every tile between them whatever it is spaced against.
+    const SPANNING: [[(i32, i32); 2]; 6] = [
+        [(0, 0), (5, 0)],
+        [(0, 0), (0, 5)],
+        [(0, 0), (4, 3)],
+        [(0, 0), (-3, 4)],
+        [(0, 0), (5, -4)],
+        [(0, 0), (-6, -1)],
+    ];
 
     /// A run of tiles setting off from the last tile of `STRAIGHT`, in offset-row coordinates.
     const ONWARD: [(i32, i32); 2] = [(3, 0), (3, 1)];
@@ -1077,7 +1244,7 @@ mod tests {
 
         click_at(
             &mut app,
-            corner_of(STRAIGHT[1], Vec3::Z * MAP_TILE_WIDTH / 2.),
+            corner_of(STRAIGHT[1], Vec3::Z * MAP_TILE_INRADIUS),
         );
         finish_the_road(&mut app);
 
@@ -1337,5 +1504,202 @@ mod tests {
         assert!(a_road_runs_through(&mut app, &STRAIGHT));
         assert!(a_road_runs_through(&mut app, &ONWARD));
         assert_eq!(roads_in_the_world(&mut app), 2);
+    }
+    fn occupied_tiles(app: &App, road: Entity) -> Vec<HexCoordinates> {
+        app.world()
+            .resource::<RoadTiles>()
+            .tiles_under(road)
+            .to_vec()
+    }
+
+    fn roads_over(app: &App, offset: (i32, i32)) -> Vec<Entity> {
+        app.world()
+            .resource::<RoadTiles>()
+            .roads_over(HexCoordinates::from_offset_row(offset.0, offset.1))
+            .to_vec()
+    }
+
+    #[test]
+    fn a_straight_road_occupies_exactly_the_tiles_it_was_drawn_through() {
+        let (app, road) = built_road(&STRAIGHT);
+
+        assert_eq!(
+            occupied_tiles(&app, road)
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            tiles(&STRAIGHT).into_iter().collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn a_road_does_not_occupy_a_tile_it_runs_beside() {
+        let (app, road) = built_road(&STRAIGHT);
+
+        let occupied: HashSet<HexCoordinates> = occupied_tiles(&app, road).into_iter().collect();
+
+        for beside in tiles(&[(0, 1), (1, 1), (2, -1)]) {
+            assert!(!occupied.contains(&beside), "{beside:?} carries no road");
+        }
+    }
+
+    #[test]
+    fn a_turning_road_occupies_the_tiles_it_curves_through() {
+        let (app, road) = built_road(&TURNING);
+
+        let occupied: HashSet<HexCoordinates> = occupied_tiles(&app, road).into_iter().collect();
+
+        for drawn in tiles(&TURNING) {
+            assert!(occupied.contains(&drawn), "{drawn:?} was drawn through");
+        }
+    }
+
+    #[test]
+    fn every_tile_a_road_occupies_has_the_road_running_over_it() {
+        /// How many places along each segment the road is looked for, far more closely spaced than
+        /// the walk that worked the tiles out.
+        const PLACES: usize = 512;
+
+        let (app, road) = built_road(&SWEEPING);
+
+        let mut driven: HashSet<HexCoordinates> = HashSet::new();
+        for lane in lanes(&app, road) {
+            for segment in children_of(&app, lane) {
+                for place in 0..=PLACES {
+                    let along = place as f32 / PLACES as f32;
+                    driven.insert(HexCoordinates::from_world_position(position(
+                        &app, segment, along,
+                    )));
+                }
+            }
+        }
+
+        for occupied in occupied_tiles(&app, road) {
+            assert!(driven.contains(&occupied), "{occupied:?} carries no road");
+        }
+    }
+
+    #[test]
+    fn a_road_occupies_the_tiles_its_arcs_cross_between_its_nodes() {
+        let (app, road) = built_road(&SWEEPING);
+
+        let occupied: HashSet<HexCoordinates> = occupied_tiles(&app, road).into_iter().collect();
+
+        for between in tiles(&[(1, 0), (2, 0)]) {
+            assert!(
+                occupied.contains(&between),
+                "{between:?} lies between nodes"
+            );
+        }
+        assert!(
+            occupied.len() > SWEEPING.len(),
+            "the arcs cross no tile their nodes do not stand on"
+        );
+    }
+
+    /// Whether `tile` and `other` are neighbours, which is to say one tile width apart. Anything
+    /// further off stands at least half as far again.
+    fn are_neighbours(tile: HexCoordinates, other: HexCoordinates) -> bool {
+        let apart = tile.world_position().distance(other.world_position());
+        (apart - MAP_TILE_INRADIUS * 2.).abs() < TOLERANCE
+    }
+
+    /// The tiles of `occupied` that can be walked to from the first of them, neighbour by
+    /// neighbour.
+    fn reachable_within(occupied: &[HexCoordinates]) -> Vec<HexCoordinates> {
+        let mut reached: Vec<HexCoordinates> = occupied.iter().copied().take(1).collect();
+        let mut standing = 0;
+        while standing < reached.len() {
+            let stood = reached[standing];
+            for &tile in occupied {
+                if !reached.contains(&tile) && are_neighbours(stood, tile) {
+                    reached.push(tile);
+                }
+            }
+            standing += 1;
+        }
+        reached
+    }
+
+    #[test]
+    fn the_tiles_a_road_occupies_join_up_with_no_gap_between_them() {
+        let spans = SPANNING.iter().map(|span| &span[..]).chain([&SWEEPING[..]]);
+        for offsets in spans {
+            let (app, road) = built_road(offsets);
+
+            let occupied = occupied_tiles(&app, road);
+
+            assert!(occupied.len() > offsets.len(), "{occupied:?}");
+            assert_eq!(
+                reachable_within(&occupied).len(),
+                occupied.len(),
+                "{occupied:?} falls apart"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tile_reports_the_road_running_over_it() {
+        let (app, road) = built_road(&STRAIGHT);
+
+        assert_eq!(roads_over(&app, STRAIGHT[2]), [road]);
+    }
+
+    #[test]
+    fn a_tile_no_road_reaches_reports_none() {
+        let (app, _) = built_road(&STRAIGHT);
+
+        assert!(roads_over(&app, (0, 3)).is_empty());
+    }
+
+    #[test]
+    fn a_removed_road_leaves_no_tile_occupied_by_it() {
+        let (mut app, road) = built_road(&STRAIGHT);
+        assert!(!occupied_tiles(&app, road).is_empty());
+
+        app.world_mut().entity_mut(road).despawn();
+        tick(&mut app);
+
+        assert!(occupied_tiles(&app, road).is_empty());
+        for drawn in STRAIGHT {
+            assert!(roads_over(&app, drawn).is_empty(), "{drawn:?} still taken");
+        }
+    }
+
+    #[test]
+    fn a_road_occupies_its_tiles_from_the_frame_it_was_laid() {
+        /// How many frames the road is left standing before its tiles are read a second time.
+        const SETTLING_FRAMES: usize = 8;
+
+        let (mut app, road) = built_road(&STRAIGHT);
+        let laid: HashSet<HexCoordinates> = occupied_tiles(&app, road).into_iter().collect();
+
+        assert!(!laid.is_empty());
+        for _ in 0..SETTLING_FRAMES {
+            tick(&mut app);
+        }
+
+        assert_eq!(
+            occupied_tiles(&app, road)
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            laid
+        );
+    }
+
+    #[test]
+    fn splitting_a_road_leaves_the_tile_they_met_on_occupied_by_the_pieces() {
+        let mut app = a_road_placed_onto_another();
+
+        let laid: Vec<Entity> = app
+            .world_mut()
+            .query_filtered::<Entity, With<Road>>()
+            .iter(app.world())
+            .collect();
+        let met = roads_over(&app, STRAIGHT[2]);
+
+        assert_eq!(met.len(), laid.len());
+        for road in met {
+            assert!(laid.contains(&road), "a road that is no longer laid");
+        }
     }
 }
