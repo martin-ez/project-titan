@@ -2,22 +2,31 @@ use crate::common::cleanup::DestroyOnStateChange;
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use crate::diagnostics::DebugGizmos;
 use crate::input::{PlayerAction, PlayerInput};
-use crate::map::{HexCoordinates, MapTile};
+use crate::map::{HexCoordinates, LatticeNode, MapTile};
 use bevy::ecs::system::SystemParam;
-use bevy::math::cubic_splines::InsufficientDataError;
 use bevy::prelude::*;
 use std::collections::HashSet;
 
-/// How many straight pieces a segment's spline is drawn as.
+/// How many straight pieces a segment's arc is drawn as.
 const SEGMENT_SUBDIVISIONS: u32 = 8;
 
 /// How far into a segment the arrow onto the next one reaches, at either end of the handover.
 const HANDOVER_REACH: f32 = 0.1;
 
+/// How long a stretch of an arc a rover should drive in one go.
+///
+/// Arcs come out of a fit at lengths of their own, so each is cut into whichever number of equal
+/// stretches lands nearest this. Keeping segments close to one length is what lets #8 read a
+/// segment's capacity off its geometry rather than store one beside it.
+const SEGMENT_LENGTH: f32 = 5.;
+
+/// How near two tangents have to be to count as the same direction when a biarc is fitted.
+const JOIN_TOLERANCE: f32 = 1e-4;
+
 /// How far the debug view lifts a lane off the ground, so it does not fight the tiles it lies on.
 const GIZMO_LIFT: Vec3 = Vec3::new(0., 0.1, 0.);
 
-/// The colour a lane's spline is drawn in
+/// The colour a lane's arcs are drawn in
 const LANE_COLOUR: Color = Color::srgb(0.35, 0.75, 0.95);
 
 /// The colour the step from one segment onto the next is drawn in
@@ -36,20 +45,21 @@ const DRAWING_COLOUR: Color = Color::srgb(0.6, 0.95, 0.6);
 /// for; making the player draw the return leg charged the saving to the first thing they build.
 pub struct RoadPlugin;
 
-/// A road the player drew: the tiles it runs through, in the order it crossed them.
+/// A road the player drew: the nodes it runs through, in the order it crossed them.
 ///
-/// The tiles are the road. Its spline, the lanes over it and every world position a rover ever
-/// stands at are derived from them, so two roads drawn through the same tiles are the same shape.
+/// The nodes are the road. Its arcs, the lanes over them and every world position a rover ever
+/// stands at are derived from them when it is laid, so two roads drawn through the same nodes are
+/// the same shape. Invariant 3: the integers are the truth and the curve comes out of them.
 #[derive(Component)]
 #[require(NeedsInitialization)]
 pub struct Road {
-    /// The tiles the road was drawn through, from one end to the other.
-    pub path: Vec<HexCoordinates>,
+    /// The nodes the road was drawn through, from one end to the other.
+    pub nodes: Vec<LatticeNode>,
 }
 
 /// The road the player is part way through dragging out, as far as the cursor has taken it.
 ///
-/// It is a record of tiles and nothing else until the button comes up: no lane, no segment and
+/// It is a record of tiles and nothing else until the button comes up: no arc, no lane and
 /// nothing a rover could drive. Putting the tool down destroys it with the rest of the tool's
 /// state, so a drag abandoned half way leaves the network as it was.
 #[derive(Component)]
@@ -58,14 +68,33 @@ struct DrawnRoad {
     path: Vec<HexCoordinates>,
 }
 
+/// A circular arc on the ground, and the whole of a road's geometry.
+///
+/// A straight is an arc of zero curvature rather than a second case, so nothing reading one has to
+/// ask which it holds. It is built when the road is laid and never rewritten: cutting a road moves
+/// which stretch of an arc a segment covers and never the arc itself, which is what makes a
+/// junction cut into a road move none of it, however many times it is cut (invariant 6).
+#[derive(Clone, Copy, Debug)]
+struct Arc {
+    start: Vec3,
+    tangent: Vec3,
+    curvature: f32,
+    length: f32,
+}
+
 /// One direction of travel along a road, owning the segments that make it up.
 #[derive(Component)]
 struct Lane;
 
-/// A stretch of one lane: the piece of the road's spline a rover drives in one go.
+/// A stretch of one lane: the piece of an arc a rover drives in one go.
+///
+/// It holds the arc rather than a curve of its own, and says where along it the stretch begins and
+/// ends. Two segments cut from one arc therefore share it exactly, and neither has moved.
 #[derive(Component)]
 pub struct RoadSegment {
-    curve: CubicSegment<Vec3>,
+    arc: Arc,
+    from: f32,
+    to: f32,
 }
 
 /// The segment a rover leaving this one drives onto next.
@@ -97,17 +126,104 @@ impl Plugin for RoadPlugin {
     }
 }
 
+impl Arc {
+    /// The one arc that leaves `start` along `tangent` and passes through `target`.
+    ///
+    /// There is exactly one, so nothing about the curve is chosen: aiming along the tangent gives
+    /// a straight and aiming off it gives the arc that reaches the target.
+    fn through(start: Vec3, tangent: Vec3, target: Vec3) -> Self {
+        let reach = target - start;
+        let span = reach.length_squared();
+        if span == 0. {
+            return Self {
+                start,
+                tangent,
+                curvature: 0.,
+                length: 0.,
+            };
+        }
+
+        let sideways = turn_of(tangent, reach);
+        let curvature = 2. * sideways / span;
+        let turn = 2. * sideways.atan2(tangent.dot(reach));
+
+        Self {
+            start,
+            tangent,
+            curvature,
+            length: if curvature == 0. {
+                reach.length()
+            } else {
+                turn / curvature
+            },
+        }
+    }
+
+    /// Where on the ground a point `at` along this arc stands.
+    fn position(&self, at: f32) -> Vec3 {
+        let at = at.clamp(0., self.length);
+        if self.curvature == 0. {
+            return self.start + self.tangent * at;
+        }
+
+        let centre = self.start + left_of(self.tangent) / self.curvature;
+        centre + turned(self.start - centre, self.curvature * at)
+    }
+
+    /// Which way a rover `at` along this arc is pointing.
+    fn tangent_at(&self, at: f32) -> Vec3 {
+        turned(self.tangent, self.curvature * at.clamp(0., self.length))
+    }
+
+    /// The same arc driven the other way, for the lane that runs back down the road.
+    fn reversed(&self) -> Self {
+        Self {
+            start: self.position(self.length),
+            tangent: -self.tangent_at(self.length),
+            curvature: -self.curvature,
+            length: self.length,
+        }
+    }
+}
+
+fn turn_of(tangent: Vec3, reach: Vec3) -> f32 {
+    tangent.x * reach.z - tangent.z * reach.x
+}
+
+fn left_of(tangent: Vec3) -> Vec3 {
+    Vec3::new(-tangent.z, 0., tangent.x)
+}
+
+fn turned(vector: Vec3, by: f32) -> Vec3 {
+    let (sin, cos) = by.sin_cos();
+    Vec3::new(
+        vector.x * cos - vector.z * sin,
+        vector.y,
+        vector.x * sin + vector.z * cos,
+    )
+}
+
 impl RoadSegment {
     /// Where on the ground a rover `along` of the way down this segment stands.
+    ///
+    /// Either end of the stretch is read off the arc exactly rather than interpolated to, so a
+    /// rover leaving a segment stands where the next one starts rather than a rounding away.
     pub fn world_position(&self, along: f32) -> Vec3 {
-        self.curve.position(along.clamp(0., 1.))
+        self.arc.position(match along {
+            along if along <= 0. => self.from,
+            along if along >= 1. => self.to,
+            along => self.from + (self.to - self.from) * along,
+        })
     }
 }
 
 impl Initialize<RoadInitializeParams<'_, '_>> for Road {
     fn initialize(&mut self, entity: &Entity, params: &mut RoadInitializeParams) -> Result {
-        let along = spline(self.path.iter().copied())?;
-        let back = spline(self.path.iter().copied().rev())?;
+        let along = arcs_through(&self.nodes);
+        if along.is_empty() {
+            return Err("a road of no arcs".into());
+        }
+        let back: Vec<Arc> = along.iter().rev().map(Arc::reversed).collect();
 
         let along = spawn_lane(&mut params.commands, *entity, &along)?;
         let back = spawn_lane(&mut params.commands, *entity, &back)?;
@@ -124,16 +240,72 @@ impl Initialize<RoadInitializeParams<'_, '_>> for Road {
     }
 }
 
-/// The curve running through the tiles of `path`, one cubic per step between two of them.
+/// The arcs running through `nodes`, each leaving the one before it at the same tangent.
 ///
-/// Catmull-Rom, so the road bends through a turn rather than cornering, and the tiles it was drawn
-/// through are on it. Adjacent tiles all stand the same distance apart, which is what leaves the
-/// cubics of one road roughly the same length without resampling them.
-fn spline(
-    path: impl Iterator<Item = HexCoordinates>,
-) -> std::result::Result<CubicCurve<Vec3>, InsufficientDataError> {
-    let points: Vec<Vec3> = path.map(|tile| tile.world_position()).collect();
-    CubicCardinalSpline::new_catmull_rom(points).to_curve()
+/// A node's direction is the bisector of the two runs meeting there, and a pair of nodes is joined
+/// by the one arc that honours both directions where it can and by two where it cannot. Fitting a
+/// single arc per pair from the previous tangent alone would not do: aiming at a node sixty
+/// degrees off the current heading turns the road a hundred and twenty, and a chain of those winds
+/// further off course at every step rather than following the nodes it was drawn through.
+fn arcs_through(nodes: &[LatticeNode]) -> Vec<Arc> {
+    let points: Vec<Vec3> = nodes.iter().map(LatticeNode::world_position).collect();
+    let tangents = tangents_along(&points);
+
+    (0..points.len().saturating_sub(1))
+        .flat_map(|step| {
+            biarc(
+                points[step],
+                tangents[step],
+                points[step + 1],
+                tangents[step + 1],
+            )
+        })
+        .collect()
+}
+
+fn tangents_along(points: &[Vec3]) -> Vec<Vec3> {
+    (0..points.len())
+        .map(|at| {
+            let before = (at > 0).then(|| (points[at] - points[at - 1]).normalize_or_zero());
+            let after =
+                (at + 1 < points.len()).then(|| (points[at + 1] - points[at]).normalize_or_zero());
+
+            match (before, after) {
+                (Some(before), Some(after)) => (before + after).normalize_or(after),
+                (Some(before), None) => before,
+                (None, Some(after)) => after,
+                (None, None) => Vec3::X,
+            }
+        })
+        .collect()
+}
+
+fn biarc(from: Vec3, leaving: Vec3, to: Vec3, arriving: Vec3) -> Vec<Arc> {
+    let whole = Arc::through(from, leaving, to);
+    if whole
+        .tangent_at(whole.length)
+        .abs_diff_eq(arriving, JOIN_TOLERANCE)
+    {
+        return vec![whole];
+    }
+
+    let joint = joint_between(from, leaving, to, arriving);
+    let first = Arc::through(from, leaving, joint);
+    let second = Arc::through(joint, first.tangent_at(first.length), to);
+    vec![first, second]
+}
+
+fn joint_between(from: Vec3, leaving: Vec3, to: Vec3, arriving: Vec3) -> Vec3 {
+    let reach = to - from;
+    let closing = 2. * (1. - leaving.dot(arriving));
+    let along = reach.dot(leaving + arriving);
+    let reached = if closing.abs() < JOIN_TOLERANCE {
+        reach.length() / 2.
+    } else {
+        (-along + (along * along + closing * reach.length_squared()).sqrt()) / closing
+    };
+
+    (from + leaving * reached).midpoint(to - arriving * reached)
 }
 
 /// The two segments of a lane a road's other lane joins onto.
@@ -142,30 +314,53 @@ struct LaneEnds {
     last: Entity,
 }
 
-/// Put one direction of travel on `road`: a lane, and a segment of it per cubic of `curve`.
-fn spawn_lane(commands: &mut Commands, road: Entity, curve: &CubicCurve<Vec3>) -> Result<LaneEnds> {
+/// Put one direction of travel on `road`: a lane, and a segment of it per stretch of every arc.
+fn spawn_lane(commands: &mut Commands, road: Entity, arcs: &[Arc]) -> Result<LaneEnds> {
     let lane = commands.spawn((Lane, ChildOf(road))).id();
     let mut ends: Option<LaneEnds> = None;
 
-    for &cubic in curve.segments() {
-        let segment = commands
-            .spawn((RoadSegment { curve: cubic }, ChildOf(lane)))
-            .id();
-        match ends {
-            Some(ref mut ends) => {
-                commands.entity(ends.last).insert(NextSegment(segment));
-                ends.last = segment;
-            }
-            None => {
-                ends = Some(LaneEnds {
-                    first: segment,
-                    last: segment,
-                })
+    for &arc in arcs {
+        for (from, to) in stretches_of(&arc) {
+            let segment = commands
+                .spawn((RoadSegment { arc, from, to }, ChildOf(lane)))
+                .id();
+            match ends {
+                Some(ref mut ends) => {
+                    commands.entity(ends.last).insert(NextSegment(segment));
+                    ends.last = segment;
+                }
+                None => {
+                    ends = Some(LaneEnds {
+                        first: segment,
+                        last: segment,
+                    })
+                }
             }
         }
     }
 
     ends.ok_or_else(|| "a lane of no segments".into())
+}
+
+/// Where along `arc` each of its segments begins and ends, all of them the same length.
+///
+/// The count is whichever leaves them nearest `SEGMENT_LENGTH`, so an arc half again as long as
+/// one segment is one segment rather than two short ones. The last ends on the arc's own length
+/// rather than on a multiple of the step, so a rover leaves the arc exactly where it ends.
+fn stretches_of(arc: &Arc) -> Vec<(f32, f32)> {
+    let pieces = (arc.length / SEGMENT_LENGTH).round().max(1.) as usize;
+    let step = arc.length / pieces as f32;
+
+    (0..pieces)
+        .map(|piece| {
+            let ends = if piece + 1 == pieces {
+                arc.length
+            } else {
+                (piece + 1) as f32 * step
+            };
+            (piece as f32 * step, ends)
+        })
+        .collect()
 }
 
 /// Take the road the player is dragging out as far as the tile under the cursor.
@@ -221,50 +416,56 @@ fn lay_the_drawn_road(
     for (entity, drawing) in &drawn {
         commands.entity(entity).despawn();
 
-        let meetings = tiles_shared_with(&drawing.path, &roads);
-        for path in split_at(&drawing.path, &meetings) {
-            commands.spawn(Road { path });
+        let drawn: Vec<LatticeNode> = drawing
+            .path
+            .iter()
+            .copied()
+            .map(LatticeNode::from_tile)
+            .collect();
+        let meetings = nodes_shared_with(&drawn, &roads);
+        for nodes in split_at(&drawn, &meetings) {
+            commands.spawn(Road { nodes });
         }
         for (crossed, road) in &roads {
-            let pieces = split_at(&road.path, &meetings);
+            let pieces = split_at(&road.nodes, &meetings);
             if pieces.len() < 2 {
                 continue;
             }
             commands.entity(crossed).despawn();
-            for path in pieces {
-                commands.spawn(Road { path });
+            for nodes in pieces {
+                commands.spawn(Road { nodes });
             }
         }
     }
 }
 
-/// The tiles of `path` that a road already runs through.
-fn tiles_shared_with(
-    path: &[HexCoordinates],
+/// The nodes of `drawn` that a road already runs through.
+fn nodes_shared_with(
+    drawn: &[LatticeNode],
     roads: &Query<(Entity, &Road)>,
-) -> HashSet<HexCoordinates> {
-    let drawn: HashSet<HexCoordinates> = path.iter().copied().collect();
+) -> HashSet<LatticeNode> {
+    let drawn: HashSet<LatticeNode> = drawn.iter().copied().collect();
     roads
         .iter()
-        .flat_map(|(_, road)| road.path.iter().copied())
-        .filter(|tile| drawn.contains(tile))
+        .flat_map(|(_, road)| road.nodes.iter().copied())
+        .filter(|node| drawn.contains(node))
         .collect()
 }
 
-/// Break `path` into the roads it becomes once cut at every tile in `at`.
+/// Break `nodes` into the roads they become once cut at every node in `at`.
 ///
-/// A cut tile ends the piece before it and starts the piece after, so the roads either side meet
-/// there rather than running through: that shared end is what makes the tile a place a rover has
-/// to be handed over at. A cut at one of `path`'s own ends leaves it whole, being where it already
-/// ended, and a piece of a single tile is no road at all and is dropped.
-fn split_at(path: &[HexCoordinates], at: &HashSet<HexCoordinates>) -> Vec<Vec<HexCoordinates>> {
+/// A cut node ends the piece before it and starts the piece after, so the roads either side meet
+/// there rather than running through: that shared end is what makes the node a place a rover has
+/// to be handed over at. A cut at one of `nodes`' own ends leaves it whole, being where it already
+/// ended, and a piece of a single node is no road at all and is dropped.
+fn split_at(nodes: &[LatticeNode], at: &HashSet<LatticeNode>) -> Vec<Vec<LatticeNode>> {
     let mut pieces = Vec::new();
-    let mut piece: Vec<HexCoordinates> = Vec::new();
+    let mut piece: Vec<LatticeNode> = Vec::new();
 
-    for &tile in path {
-        piece.push(tile);
-        if at.contains(&tile) && piece.len() > 1 {
-            pieces.push(std::mem::replace(&mut piece, vec![tile]));
+    for &node in nodes {
+        piece.push(node);
+        if at.contains(&node) && piece.len() > 1 {
+            pieces.push(std::mem::replace(&mut piece, vec![node]));
         }
     }
     if piece.len() > 1 {
@@ -363,10 +564,25 @@ mod tests {
             .collect()
     }
 
+    fn nodes(offsets: &[(i32, i32)]) -> Vec<LatticeNode> {
+        tiles(offsets)
+            .into_iter()
+            .map(LatticeNode::from_tile)
+            .collect()
+    }
+
+    /// How far it is along the straight runs between the nodes of `offsets`.
+    fn run_through(offsets: &[(i32, i32)]) -> f32 {
+        nodes(offsets)
+            .windows(2)
+            .map(|pair| pair[0].world_position().distance(pair[1].world_position()))
+            .sum()
+    }
+
     fn spawn_road(app: &mut App, offsets: &[(i32, i32)]) -> Entity {
         app.world_mut()
             .spawn(Road {
-                path: tiles(offsets),
+                nodes: nodes(offsets),
             })
             .id()
     }
@@ -415,7 +631,7 @@ mod tests {
             .unwrap_or(Vec3::NAN)
     }
 
-    /// How far it is along `segment`, measured by walking the spline in small steps.
+    /// How far it is along `segment`, measured by walking it in small steps.
     fn length_of(app: &App, segment: Entity) -> f32 {
         (1..=LENGTH_SAMPLES)
             .map(|step| {
@@ -444,11 +660,22 @@ mod tests {
     }
 
     #[test]
-    fn a_lane_is_split_into_a_segment_for_every_step_of_the_road() {
+    fn the_segments_of_a_lane_cover_the_whole_road() {
         let (app, road) = built_road(&STRAIGHT);
+        let drawn = run_through(&STRAIGHT);
 
         for lane in lanes(&app, road) {
-            assert_eq!(children_of(&app, lane).len(), STRAIGHT.len() - 1);
+            let segments = children_of(&app, lane);
+            let driven: f32 = segments
+                .iter()
+                .map(|&segment| length_of(&app, segment))
+                .sum();
+
+            assert!(segments.len() > 1, "one segment for the whole road");
+            assert!(
+                (driven - drawn).abs() < drawn * TOLERANCE,
+                "{driven} driven against {drawn} drawn"
+            );
         }
     }
 
@@ -476,7 +703,7 @@ mod tests {
 
     #[test]
     fn a_segment_starts_where_the_one_before_it_ends() {
-        let (app, road) = built_road(&TURNING);
+        let (mut app, road) = built_road(&TURNING);
 
         let mut joins = 0;
         for lane in lanes(&app, road) {
@@ -488,18 +715,19 @@ mod tests {
             }
         }
 
-        assert_eq!(joins, 2 * (TURNING.len() - 2));
+        assert_eq!(joins, segments_in_the_world(&mut app) - 2);
     }
 
     #[test]
     fn the_segments_of_a_lane_are_roughly_the_same_length() {
         /// How much longer than the shortest segment of a lane the longest may be.
         ///
-        /// A road that runs straight and then turns twice measures 3.4% across, the shortest
-        /// being a straight run between two tiles and the longest the outside of a bend.
-        const SPREAD: f32 = 1.05;
+        /// A road that runs straight and then turns twice measures 4.8% across: the arcs a fit
+        /// leaves are of lengths of their own, and cutting each to the nearest whole number of
+        /// target lengths is what brings them back together.
+        const SPREAD: f32 = 1.06;
 
-        let (app, road) = built_road(&WINDING);
+        let (mut app, road) = built_road(&WINDING);
 
         let lengths: Vec<f32> = lanes(&app, road)
             .into_iter()
@@ -509,12 +737,13 @@ mod tests {
         let longest = lengths.iter().copied().fold(f32::MIN, f32::max);
         let shortest = lengths.iter().copied().fold(f32::MAX, f32::min);
 
-        assert_eq!(lengths.len(), 2 * (WINDING.len() - 1));
+        assert_eq!(lengths.len(), segments_in_the_world(&mut app));
+
         assert!(longest <= shortest * SPREAD, "{lengths:?}");
     }
 
     #[test]
-    fn a_position_along_a_segment_follows_the_spline_rather_than_the_line_between_its_ends() {
+    fn a_position_along_a_segment_follows_its_arc_rather_than_the_line_between_its_ends() {
         /// How far off the straight line the middle of a curved segment has to be, as a share of
         /// the distance between its ends.
         const BEND: f32 = 0.01;
@@ -604,12 +833,12 @@ mod tests {
 
     /// Whether a road runs through exactly `offsets`, drawn from either of its two ends.
     fn a_road_runs_through(app: &mut App, offsets: &[(i32, i32)]) -> bool {
-        let wanted = tiles(offsets);
-        let backwards: Vec<HexCoordinates> = wanted.iter().copied().rev().collect();
+        let wanted = nodes(offsets);
+        let backwards: Vec<LatticeNode> = wanted.iter().copied().rev().collect();
         app.world_mut()
             .query::<&Road>()
             .iter(app.world())
-            .any(|road| road.path == wanted || road.path == backwards)
+            .any(|road| road.nodes == wanted || road.nodes == backwards)
     }
 
     #[test]
@@ -763,6 +992,124 @@ mod tests {
             assert!(!app.world().entity(road).contains::<InitializationFailed>());
             assert_eq!(lanes(&app, road).len(), 2);
         }
+    }
+
+    #[test]
+    fn an_arc_passes_through_the_target_it_was_aimed_at() {
+        for target in [
+            Vec3::new(10., 0., 10.),
+            Vec3::new(10., 0., -10.),
+            Vec3::new(3., 0., 12.),
+            Vec3::new(-4., 0., 6.),
+        ] {
+            let arc = Arc::through(Vec3::ZERO, Vec3::X, target);
+
+            let start = arc.position(0.);
+            let end = arc.position(arc.length);
+            assert!(start.distance(Vec3::ZERO) < TOLERANCE, "starts at {start}");
+            assert!(
+                end.distance(target) < TOLERANCE,
+                "{end} rather than {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_arc_aimed_along_its_own_tangent_is_straight() {
+        let arc = Arc::through(Vec3::ZERO, Vec3::X, Vec3::new(7., 0., 0.));
+
+        assert_eq!(arc.curvature, 0.);
+        assert_eq!(arc.length, 7.);
+    }
+
+    #[test]
+    fn cutting_a_segment_leaves_both_halves_on_the_same_arc() {
+        let arc = Arc::through(Vec3::ZERO, Vec3::X, Vec3::new(10., 0., 10.));
+        let whole = RoadSegment {
+            arc,
+            from: 0.,
+            to: arc.length,
+        };
+        let cut = arc.length / 3.;
+
+        let first = RoadSegment {
+            arc,
+            from: 0.,
+            to: cut,
+        };
+        let second = RoadSegment {
+            arc,
+            from: cut,
+            to: arc.length,
+        };
+
+        assert_eq!(first.arc.curvature, arc.curvature);
+        assert_eq!(second.arc.curvature, arc.curvature);
+        assert_eq!(first.world_position(0.), whole.world_position(0.));
+        assert_eq!(second.world_position(1.), whole.world_position(1.));
+        assert_eq!(first.world_position(1.), second.world_position(0.));
+    }
+
+    #[test]
+    fn cutting_an_arc_a_hundred_times_moves_none_of_it() {
+        /// How many pieces the arc is cut into, one after another.
+        const CUTS: usize = 100;
+
+        let arc = Arc::through(Vec3::ZERO, Vec3::X, Vec3::new(10., 0., 10.));
+        let whole = RoadSegment {
+            arc,
+            from: 0.,
+            to: arc.length,
+        };
+
+        let mut opened = 0.;
+        for cut in 1..=CUTS {
+            let closed = arc.length * cut as f32 / CUTS as f32;
+            let piece = RoadSegment {
+                arc,
+                from: opened,
+                to: closed,
+            };
+
+            assert_eq!(piece.arc.curvature, arc.curvature);
+            assert_eq!(piece.world_position(0.), arc.position(opened));
+            assert_eq!(piece.world_position(1.), arc.position(closed));
+            opened = closed;
+        }
+
+        assert_eq!(arc.position(opened), whole.world_position(1.));
+    }
+
+    #[test]
+    fn every_segment_of_a_road_is_about_the_target_length() {
+        let (app, road) = built_road(&WINDING);
+
+        for lane in lanes(&app, road) {
+            for segment in children_of(&app, lane) {
+                let length = length_of(&app, segment);
+                let strayed = (length - SEGMENT_LENGTH).abs();
+                assert!(strayed <= SEGMENT_LENGTH / 2., "a segment of {length}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_winding_road_is_no_longer_than_the_run_it_was_drawn_through() {
+        /// How much longer than the straight runs between its nodes a road may measure.
+        ///
+        /// A chain of single arcs fitted from the previous tangent alone fails this by turning
+        /// twice as far as it is aimed at every node, which sends the road back the way it came.
+        const WANDER: f32 = 1.15;
+
+        let (app, road) = built_road(&WINDING);
+        let drawn = run_through(&WINDING);
+
+        let driven: f32 = children_of(&app, lanes(&app, road)[0])
+            .into_iter()
+            .map(|segment| length_of(&app, segment))
+            .sum();
+
+        assert!(driven <= drawn * WANDER, "{driven} against {drawn} drawn");
     }
 
     #[test]

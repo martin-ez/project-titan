@@ -12,6 +12,8 @@ const SQRT_3: f32 = 1.732_050_8;
 const MAP_TILE_WIDTH: f32 = MAP_TILE_SIZE / 2. * SQRT_3;
 const MAP_TILE_ROW_SPACING: f32 = MAP_TILE_SIZE * 0.75;
 const MAP_TILE_DEPTH: f32 = 0.25;
+const NODE_SPACING: f32 = MAP_TILE_SIZE / 2.;
+const NODE_BASIS_X: f32 = MAP_TILE_SIZE * SQRT_3 / 4.;
 
 pub struct MapPlugin;
 
@@ -20,6 +22,18 @@ pub struct MapPlugin;
 pub struct HexCoordinates {
     q: i32,
     r: i32,
+}
+
+/// Where a road's nodes stand: the tile centres and their corners, which together are one lattice.
+///
+/// The two sets form a single triangular lattice at half the tile size, in which every point has
+/// six neighbours at that spacing whether it is a centre or a corner. So a road is placed on the
+/// same integers a tile is, at twice the resolution, and invariant 3 holds for a road without a
+/// second coordinate system to keep in step with the first.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct LatticeNode {
+    i: i32,
+    j: i32,
 }
 
 /// One tile of the grid, standing where its coordinates put it.
@@ -71,6 +85,25 @@ fn setup(mut commands: Commands) {
                 Visibility::Hidden,
             ));
         }
+    }
+}
+
+impl LatticeNode {
+    /// The node a tile's middle stands on.
+    pub fn from_tile(tile: HexCoordinates) -> Self {
+        Self {
+            i: 2 * tile.q + tile.r,
+            j: tile.r - tile.q,
+        }
+    }
+
+    /// Where on the ground plane this node stands.
+    pub fn world_position(&self) -> Vec3 {
+        Vec3::new(
+            NODE_BASIS_X * self.i as f32,
+            0.,
+            NODE_SPACING * (self.i as f32 / 2. + self.j as f32),
+        )
     }
 }
 
@@ -370,5 +403,49 @@ mod tests {
                 assert_eq!(run.last().copied(), (to != from).then_some(to));
             }
         }
+    }
+
+    /// The steps to the six nodes around a node of the lattice.
+    const NODE_STEPS: [(i32, i32); 6] = [(1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1)];
+
+    #[test]
+    fn a_tile_stands_on_a_node_of_the_lattice() {
+        const TOLERANCE: f32 = 1e-3;
+
+        for (col, row) in [(0, 0), (2, 3), (-4, 1), (3, -2)] {
+            let tile = HexCoordinates::from_offset_row(col, row);
+            let node = LatticeNode::from_tile(tile);
+
+            let strayed = node.world_position().distance(tile.world_position());
+            assert!(
+                strayed < TOLERANCE,
+                "{node:?} stands {strayed} from {tile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_six_nodes_around_a_tile_are_its_corners() {
+        const TOLERANCE: f32 = 1e-3;
+
+        let centre = LatticeNode::from_tile(HexCoordinates::from_offset_row(2, 3));
+        let mut corners = HashSet::new();
+
+        for (di, dj) in NODE_STEPS {
+            let corner = LatticeNode {
+                i: centre.i + di,
+                j: centre.j + dj,
+            };
+            let distance = corner.world_position().distance(centre.world_position());
+
+            assert!(
+                (distance - MAP_TILE_SIZE / 2.).abs() < TOLERANCE,
+                "{corner:?} stands {distance} from {centre:?}, not {}",
+                MAP_TILE_SIZE / 2.
+            );
+            corners.insert(corner);
+        }
+
+        assert_eq!(corners.len(), NODE_STEPS.len());
     }
 }
