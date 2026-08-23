@@ -600,7 +600,8 @@ fn draw_the_occupied_tiles(
 
 /// Mark the tile under the cursor when a road already runs over it.
 ///
-/// This is the tile question asked from the other end, and the one #98 refuses a building with.
+/// This is the tile question asked from the other end, and the one building placement refuses a
+/// building with.
 /// Reading it off a road would mean reading every road, which is what the tile is keyed for.
 fn draw_the_road_under_the_cursor(
     mut gizmos: Gizmos<DebugGizmos>,
