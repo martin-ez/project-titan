@@ -49,6 +49,9 @@ const STRAIGHT_REACH: f32 = 1e-3;
 /// the way across a tile: too little for anything to stand on.
 const TILE_SAMPLE_STEP: f32 = MAP_TILE_INRADIUS / 4.;
 
+/// How far along a segment its end is, which is where the road node a rover stops at stands.
+const SEGMENT_END: f32 = 1.;
+
 /// How far the debug view lifts a lane off the ground, so it does not fight the tiles it lies on.
 const GIZMO_LIFT: Vec3 = Vec3::new(0., 0.1, 0.);
 
@@ -76,7 +79,16 @@ const TAKEN_COLOUR: Color = Color::srgb(0.95, 0.25, 0.2);
 /// How wide the mark on an occupied tile is drawn, as a share of the tile's inradius.
 const OCCUPIED_MARK: f32 = 0.35;
 
-/// The roads on the map, and the lanes a rover drives on them.
+/// The colour the link from a tile to the road serving it is drawn in
+const SERVED_COLOUR: Color = Color::srgb(0.4, 0.95, 0.7);
+
+/// The colour a tile no road reaches is marked in
+const UNSERVED_COLOUR: Color = Color::srgb(0.95, 0.4, 0.6);
+
+/// How wide the mark on a tile no road reaches is drawn, as a share of the tile's inradius.
+const UNSERVED_MARK: f32 = 0.45;
+
+/// The roads on the map, the lanes a rover drives on them, and where a building meets them.
 ///
 /// A road carries one lane in each direction, built together and removed together, and the two
 /// join at each end so a dead-end spur is drivable. Nothing overtakes anywhere in the network:
@@ -163,6 +175,29 @@ pub struct RoadTiles {
     under: HashMap<Entity, Vec<HexCoordinates>>,
 }
 
+/// Where whatever stands on a tile meets the road network.
+///
+/// A road serves a tile when one of its nodes stands on one of that tile's six corners: integer
+/// equality on the lattice rather than a distance, so what serves a building is a fact of the grid
+/// and answers the same however the arcs curve over it (invariant 3). It is a segment and a place
+/// along it and nothing else — a rover has arrived when it reaches that place, and nothing docks.
+/// An endpoint no road reaches carries none, which is what something offering it a delivery has to
+/// ask before it makes one: a building off the network is useless rather than illegal.
+#[derive(Component)]
+pub struct RoadEndpoint {
+    tile: HexCoordinates,
+    served: Option<ServedBy>,
+}
+
+/// The segment serving an endpoint, and how far along it a rover stops.
+#[derive(Clone, Copy, Debug)]
+pub struct ServedBy {
+    /// The segment a rover arrives on.
+    pub segment: Entity,
+    /// How far along it the endpoint stands, from `0` at its start to `1` at its end.
+    pub along: f32,
+}
+
 #[derive(SystemParam)]
 struct RoadInitializeParams<'w, 's> {
     commands: Commands<'w, 's>,
@@ -178,6 +213,7 @@ impl Plugin for RoadPlugin {
                 Update,
                 (
                     (place_a_node, lay_the_road).chain(),
+                    (connect_the_endpoints, draw_the_endpoints).chain(),
                     draw_the_lanes,
                     draw_the_road_being_placed,
                     draw_the_occupied_tiles,
@@ -311,6 +347,18 @@ impl RoadSegment {
             along if along >= 1. => self.to,
             along => self.from + (self.to - self.from) * along,
         })
+    }
+}
+
+impl RoadEndpoint {
+    /// An endpoint for whatever stands on `tile`, which nothing serves until a road reaches it.
+    pub fn on(tile: HexCoordinates) -> Self {
+        Self { tile, served: None }
+    }
+
+    /// The segment serving it and where along it, or nothing while no road reaches its tile.
+    pub fn served_by(&self) -> Option<ServedBy> {
+        self.served
     }
 }
 
@@ -734,6 +782,119 @@ fn draw_the_road_under_the_cursor(
     );
 }
 
+/// Give every endpoint nothing serves the segment of a road that does.
+///
+/// One that is already served keeps what it has, so a road laid later does not take a building
+/// that is already on the network. One whose segment has gone looks again, which is what a road
+/// cut in two leaves behind it.
+fn connect_the_endpoints(
+    mut endpoints: Query<&mut RoadEndpoint>,
+    occupied: Res<RoadTiles>,
+    roads: Query<&Road>,
+    children: Query<&Children>,
+    segments: Query<&RoadSegment>,
+) {
+    for mut endpoint in &mut endpoints {
+        if endpoint
+            .served
+            .is_some_and(|served| segments.contains(served.segment))
+        {
+            continue;
+        }
+
+        let tile = endpoint.tile;
+        endpoint.served = the_road_serving(tile, &occupied, &roads, &children, &segments);
+    }
+}
+
+/// The place on the network serving `tile`: the first of its corners a road stands on.
+///
+/// Only the roads over the tile and the six around it are read. A road standing on a corner runs
+/// over one of the three tiles sharing that corner, all of which are in that set, so nothing
+/// outside it can serve the tile and no road beyond the neighbours is measured.
+fn the_road_serving(
+    tile: HexCoordinates,
+    occupied: &RoadTiles,
+    roads: &Query<&Road>,
+    children: &Query<&Children>,
+    segments: &Query<&RoadSegment>,
+) -> Option<ServedBy> {
+    LatticeNode::corners_of(tile)
+        .into_iter()
+        .find_map(|corner| {
+            std::iter::once(tile)
+                .chain(tile.neighbours())
+                .flat_map(|near| occupied.roads_over(near))
+                .copied()
+                .find(|&road| {
+                    roads
+                        .get(road)
+                        .is_ok_and(|standing| standing.nodes.contains(&corner))
+                })
+                .and_then(|road| segment_ending_at(corner, road, children, segments))
+        })
+}
+
+/// The segment of `road` whose end stands on `node`, which is where a rover arriving there stops.
+fn segment_ending_at(
+    node: LatticeNode,
+    road: Entity,
+    children: &Query<&Children>,
+    segments: &Query<&RoadSegment>,
+) -> Option<ServedBy> {
+    let standing = node.world_position();
+    children
+        .get(road)
+        .ok()?
+        .iter()
+        .filter_map(|lane| children.get(lane).ok())
+        .flat_map(|lane| lane.iter())
+        .filter_map(|segment| {
+            segments
+                .get(segment)
+                .ok()
+                .map(|piece| (segment, piece.world_position(SEGMENT_END)))
+        })
+        .min_by(|(_, ends), (_, other)| {
+            ends.distance_squared(standing)
+                .total_cmp(&other.distance_squared(standing))
+        })
+        .map(|(segment, _)| ServedBy {
+            segment,
+            along: SEGMENT_END,
+        })
+}
+
+/// Draw what serves each endpoint, and mark the tiles nothing does.
+///
+/// Whether a building is on the network is otherwise invisible: it stands on its tile looking the
+/// same either way, and a road running past it looks like a road serving it (invariant 5).
+fn draw_the_endpoints(
+    mut gizmos: Gizmos<DebugGizmos>,
+    endpoints: Query<&RoadEndpoint>,
+    segments: Query<&RoadSegment>,
+) {
+    for endpoint in &endpoints {
+        let standing = endpoint.tile.world_position() + GIZMO_LIFT;
+        let served = endpoint.served_by().and_then(|served| {
+            segments
+                .get(served.segment)
+                .ok()
+                .map(|segment| segment.world_position(served.along))
+        });
+
+        let Some(place) = served else {
+            gizmos.circle(
+                Isometry3d::new(standing, Quat::from_rotation_x(FRAC_PI_2)),
+                MAP_TILE_INRADIUS * UNSERVED_MARK,
+                UNSERVED_COLOUR,
+            );
+            continue;
+        };
+        gizmos.line(standing, place + GIZMO_LIFT, SERVED_COLOUR);
+    }
+}
+
 /// Draw every lane, and the order a rover drives its segments in.
 ///
 /// A chain of segments is otherwise only visible in a test: two lanes lying on the same road look
@@ -768,6 +929,7 @@ mod tests {
     use crate::common::cleanup::CleanupPlugin;
     use crate::common::initialize::InitializationFailed;
     use crate::diagnostics::DebugGizmosPlugin;
+    use crate::map::MAP_TILE_SIZE;
     use crate::testing::{headless_app, tick};
 
     /// How closely two world positions have to agree to be the same place.
@@ -820,18 +982,20 @@ mod tests {
         app_holding(PlayerAction::Select)
     }
 
+    fn tile(offset: (i32, i32)) -> HexCoordinates {
+        HexCoordinates::from_offset_row(offset.0, offset.1)
+    }
+
     fn tiles(offsets: &[(i32, i32)]) -> Vec<HexCoordinates> {
-        offsets
-            .iter()
-            .map(|&(col, row)| HexCoordinates::from_offset_row(col, row))
-            .collect()
+        offsets.iter().copied().map(tile).collect()
+    }
+
+    fn centre_of(offset: (i32, i32)) -> LatticeNode {
+        LatticeNode::from_tile(tile(offset))
     }
 
     fn nodes(offsets: &[(i32, i32)]) -> Vec<LatticeNode> {
-        tiles(offsets)
-            .into_iter()
-            .map(LatticeNode::from_tile)
-            .collect()
+        offsets.iter().copied().map(centre_of).collect()
     }
 
     /// How far it is along the straight runs between the nodes of `offsets`.
@@ -843,9 +1007,14 @@ mod tests {
     }
 
     fn spawn_road(app: &mut App, offsets: &[(i32, i32)]) -> Entity {
+        spawn_road_through(app, nodes(offsets))
+    }
+
+    /// Put a road through `nodes` into the world, for a road whose nodes are not all tile middles.
+    fn spawn_road_through(app: &mut App, nodes: Vec<LatticeNode>) -> Entity {
         app.world_mut()
             .spawn(Road {
-                nodes: nodes(offsets),
+                nodes,
                 leaving: None,
             })
             .id()
@@ -1212,8 +1381,7 @@ mod tests {
 
     /// The node of the tile at `offset` that lies `towards` from the middle of it.
     fn corner_of(offset: (i32, i32), towards: Vec3) -> LatticeNode {
-        let tile = HexCoordinates::from_offset_row(offset.0, offset.1);
-        LatticeNode::nearest_on(tile, tile.world_position() + towards)
+        LatticeNode::nearest_on(tile(offset), tile(offset).world_position() + towards)
     }
 
     /// The road running through `offsets`, of which there is one once it has been laid.
@@ -1701,5 +1869,146 @@ mod tests {
         for road in met {
             assert!(laid.contains(&road), "a road that is no longer laid");
         }
+    }
+
+    /// The tile the endpoint under test stands on, in offset-row coordinates.
+    const BUILT_ON: (i32, i32) = (0, 0);
+
+    /// The tile sharing the northern corner of `BUILT_ON`, in offset-row coordinates.
+    const BESIDE: (i32, i32) = (0, 1);
+
+    /// The tile east of `BUILT_ON`, which shares two of its corners, in offset-row coordinates.
+    const NEXT_DOOR: (i32, i32) = (1, 0);
+
+    /// A tile sharing no corner with `BUILT_ON`, in offset-row coordinates.
+    const AWAY: (i32, i32) = (2, 0);
+
+    /// The tile the road that gets cut sets off from, in offset-row coordinates. It stands in line
+    /// with `BESIDE` and the corner they serve, so the road it makes runs straight.
+    const ALONG: (i32, i32) = (2, 2);
+
+    /// The tile the road doing the cutting sets off from, in offset-row coordinates.
+    const ACROSS: (i32, i32) = (1, 1);
+
+    /// The corner of `BUILT_ON` the roads in these tests reach it on.
+    fn served_corner() -> LatticeNode {
+        corner_of(BUILT_ON, Vec3::Z * MAP_TILE_SIZE)
+    }
+
+    fn spawn_endpoint(app: &mut App, offset: (i32, i32)) -> Entity {
+        app.world_mut().spawn(RoadEndpoint::on(tile(offset))).id()
+    }
+
+    fn served_by(app: &App, endpoint: Entity) -> Option<ServedBy> {
+        component_of::<RoadEndpoint>(app, endpoint).and_then(RoadEndpoint::served_by)
+    }
+
+    /// Where on the ground the road serving `endpoint` stops for it.
+    fn served_at(app: &App, endpoint: Entity) -> Option<Vec3> {
+        let served = served_by(app, endpoint)?;
+        Some(position(app, served.segment, served.along))
+    }
+
+    /// An app holding an endpoint on `BUILT_ON` and a road ending on the corner that serves it.
+    fn served_app() -> (App, Entity) {
+        let mut app = road_app();
+        let endpoint = spawn_endpoint(&mut app, BUILT_ON);
+        spawn_road_through(&mut app, vec![centre_of(BESIDE), served_corner()]);
+        tick(&mut app);
+        (app, endpoint)
+    }
+
+    #[test]
+    fn an_endpoint_is_served_by_a_road_standing_on_a_corner_of_its_tile() {
+        let (app, endpoint) = served_app();
+
+        assert!(served_by(&app, endpoint).is_some());
+    }
+
+    #[test]
+    fn an_endpoint_is_served_where_the_road_stands_on_its_tile_s_corner() {
+        let (app, endpoint) = served_app();
+
+        let standing = served_at(&app, endpoint).expect("the endpoint is served");
+        let corner = served_corner().world_position();
+
+        assert!(
+            standing.distance(corner) < TOLERANCE,
+            "served at {standing}, not at the corner {corner}"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_no_road_reaches_is_served_by_nothing() {
+        let mut app = road_app();
+        let endpoint = spawn_endpoint(&mut app, BUILT_ON);
+        spawn_road(&mut app, &[NEXT_DOOR, AWAY]);
+
+        tick(&mut app);
+
+        assert!(served_by(&app, endpoint).is_none());
+    }
+
+    #[test]
+    fn a_road_through_the_middle_of_a_tile_does_not_serve_what_stands_on_it() {
+        let mut app = road_app();
+        let endpoint = spawn_endpoint(&mut app, BUILT_ON);
+        spawn_road(&mut app, &[BUILT_ON, NEXT_DOOR]);
+
+        tick(&mut app);
+
+        assert!(served_by(&app, endpoint).is_none());
+    }
+
+    #[test]
+    fn an_endpoint_is_served_by_a_road_laid_after_it() {
+        let mut app = road_app();
+        let endpoint = spawn_endpoint(&mut app, BUILT_ON);
+
+        tick(&mut app);
+        assert!(
+            served_by(&app, endpoint).is_none(),
+            "served before any road was laid"
+        );
+
+        spawn_road_through(&mut app, vec![centre_of(BESIDE), served_corner()]);
+        tick(&mut app);
+
+        assert!(served_by(&app, endpoint).is_some());
+    }
+
+    #[test]
+    fn an_endpoint_whose_road_is_removed_reports_that_nothing_serves_it() {
+        let mut app = road_app();
+        let endpoint = spawn_endpoint(&mut app, BUILT_ON);
+        let road = spawn_road_through(&mut app, vec![centre_of(BESIDE), served_corner()]);
+        tick(&mut app);
+
+        app.world_mut().entity_mut(road).despawn();
+        tick(&mut app);
+
+        assert!(served_by(&app, endpoint).is_none());
+    }
+
+    #[test]
+    fn cutting_the_road_leaves_the_endpoint_served_in_the_same_place() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        let endpoint = spawn_endpoint(&mut app, BUILT_ON);
+        spawn_road_through(
+            &mut app,
+            vec![centre_of(ALONG), centre_of(BESIDE), served_corner()],
+        );
+        tick(&mut app);
+        let before = served_at(&app, endpoint).expect("the endpoint is served");
+
+        click_at(&mut app, centre_of(ACROSS));
+        click_at(&mut app, centre_of(BESIDE));
+        tick(&mut app);
+
+        let after = served_at(&app, endpoint).expect("the endpoint is served after the cut");
+        assert!(
+            after.distance(before) < TOLERANCE,
+            "served at {after} after the cut, having been served at {before}"
+        );
     }
 }

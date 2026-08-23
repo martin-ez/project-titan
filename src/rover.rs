@@ -150,7 +150,7 @@ mod tests {
     use crate::diagnostics::DebugGizmosPlugin;
     use crate::input::{PlayerAction, PlayerInput};
     use crate::map::{HexCoordinates, LatticeNode};
-    use crate::road::{Road, RoadPlugin};
+    use crate::road::{Road, RoadEndpoint, RoadPlugin};
     use crate::testing::{advance, headless_app, tick};
     use std::time::Duration;
 
@@ -371,5 +371,50 @@ mod tests {
             .get::<Cargo>()
             .map(|cargo| cargo.quantity);
         assert_eq!(carried, Some(3));
+    }
+
+    #[test]
+    fn a_rover_standing_where_an_endpoint_is_served_stands_on_the_road_node_serving_it() {
+        let mut app = rover_app();
+        let built_on = HexCoordinates::from_offset_row(0, 0);
+        let corner = LatticeNode::nearest_on(
+            built_on,
+            built_on.world_position() + Vec3::Z * MAP_TILE_SIZE,
+        );
+        let endpoint = app.world_mut().spawn(RoadEndpoint::on(built_on)).id();
+        app.world_mut().spawn(Road {
+            nodes: vec![
+                LatticeNode::from_tile(HexCoordinates::from_offset_row(0, 1)),
+                corner,
+            ],
+            leaving: None,
+        });
+        tick(&mut app);
+
+        let served = app
+            .world()
+            .entity(endpoint)
+            .get::<RoadEndpoint>()
+            .and_then(RoadEndpoint::served_by)
+            .expect("the endpoint is served");
+        let rover = app
+            .world_mut()
+            .spawn(Rover {
+                segment: served.segment,
+                along: served.along,
+            })
+            .id();
+        tick(&mut app);
+
+        let standing = app
+            .world()
+            .entity(rover)
+            .get::<Transform>()
+            .map(|transform| transform.translation)
+            .expect("the rover stands somewhere");
+        assert!(
+            standing.distance(corner.world_position()) < TOLERANCE,
+            "the rover stands at {standing}, not on the node {corner:?} serving the endpoint"
+        );
     }
 }

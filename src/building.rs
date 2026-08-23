@@ -1,9 +1,9 @@
 use crate::common::cleanup::Destroy;
 use crate::common::cursor::CursorSurface;
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
-use crate::endpoint::RoadEndpoint;
 use crate::input::{PlayerAction, PlayerInput};
 use crate::map::{HexCoordinates, MapTile, MAP_TILE_SIZE};
+use crate::road::RoadEndpoint;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
