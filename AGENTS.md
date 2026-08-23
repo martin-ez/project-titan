@@ -85,11 +85,19 @@ tests, and looks tidier.
    frame. Nothing here bans measuring real time. What it bans is gameplay
    depending on it.
 
-3. **Hex coordinates are the truth; a world position is derived.** A tile, a
-   building and a road segment are located by integer grid coordinates, and
-   `Vec3` comes out of a function that converts one. Storing the float and
-   rounding it back means neighbours stop being exact, and adjacency is what the
-   whole map is made of.
+3. **Hex coordinates are the truth; a world position is derived.** A tile and a
+   building are located by integer grid coordinates, and a road node by integer
+   coordinates on the finer lattice the tile centres and their vertices form
+   together — one triangular lattice at half the tile size, not a second
+   coordinate system. `Vec3` comes out of a function that converts one. Storing
+   the float and rounding it back means neighbours stop being exact, and
+   adjacency is what the whole map is made of.
+
+   A curve, a tangent and a distance along a segment are derived from those
+   integers when the player builds, and what is derived is then a fact of
+   record rather than a function still being evaluated. Geometry that
+   re-derives under the player is geometry that moves when something else is
+   edited.
 
 4. **A subsystem is a Bevy plugin, and it owns itself.** Its components,
    resources, states and system registration live together and nothing outside
@@ -110,6 +118,19 @@ tests, and looks tidier.
    it out when the tests already say. What is not a judgement is the ceiling on
    it. Making a system observable is simulation work; making it handsome is
    not.
+
+6. **A road is a chain of arcs, and cutting one moves nothing.** A segment is a
+   circular arc between two nodes — a straight is an arc of zero curvature, not
+   a second case — and its direction is inherited from the arc before it rather
+   than drawn. Cutting an arc yields two arcs on the same circle, and a junction
+   is a distance along an arc rather than a new node, so a road drawn across an
+   existing one changes none of its geometry, and cutting the same road twice
+   drifts no further than cutting it once.
+
+   Any model that smooths by refitting control points pays for it in drift
+   instead. A network that shifts when something is built across it is one the
+   player builds around rather than with, and the whole point of the grid
+   underneath is that what they placed stays where they placed it.
 
 Corollary: **it has to hold at fleet scale.** Thousands of rovers on the map is
 the target, so a per-tick system does not allocate per entity, and does not scan
