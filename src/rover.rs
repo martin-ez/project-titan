@@ -270,6 +270,7 @@ mod tests {
         app.world_mut().spawn(Road {
             nodes,
             leaving: None,
+            one_way: false,
         });
         tick(&mut app);
         app
@@ -372,6 +373,7 @@ mod tests {
         app.world_mut().spawn(Road {
             nodes,
             leaving: None,
+            one_way: false,
         });
     }
 
