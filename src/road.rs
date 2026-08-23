@@ -55,12 +55,13 @@ const OCCUPIED_MARK: f32 = 0.35;
 
 /// The roads on the map, and the lanes a rover drives on them.
 ///
-/// A road carries one lane in each direction, built together and removed together, and the two
-/// join at each end so a dead-end spur is drivable. Nothing overtakes anywhere in the network:
-/// there is no lane to move into, so a slow rover is everyone's problem and one badly placed
-/// building is a queue you can watch form. One lane shared both ways was cheaper and made traffic
-/// a decoration; several each way bought overtaking and spent it softening the jams the game is
-/// for; making the player draw the return leg charged the saving to the first thing they build.
+/// A road carries a lane in each direction unless it was built one-way, and the pair is built,
+/// joined at each end and removed together, so a dead-end spur is drivable. Nothing overtakes
+/// anywhere in the network: there is no lane to move into, so a slow rover is everyone's problem
+/// and one badly placed building is a queue you can watch form. One lane shared both ways was
+/// cheaper and made traffic a decoration; several each way bought overtaking and spent it
+/// softening the jams the game is for; making the player draw the return leg charged the saving
+/// to the first thing they build.
 pub struct RoadPlugin;
 
 /// A road the player drew: the nodes it runs through, in the order it crossed them.
@@ -73,6 +74,11 @@ pub struct RoadPlugin;
 pub struct Road {
     /// The nodes the road was drawn through, from one end to the other.
     pub nodes: Vec<LatticeNode>,
+    /// Whether the road carries only the lane running the way it was drawn.
+    ///
+    /// A one-way road has no lane back and no join at either end, so its far end is a dead end
+    /// rather than a place to turn round, and nothing routes onto it against its direction.
+    pub one_way: bool,
 }
 
 /// The road the player is part way through dragging out, as far as the cursor has taken it.
@@ -290,19 +296,22 @@ impl Initialize<RoadInitializeParams<'_, '_>> for Road {
             return Err("a road of no arcs".into());
         }
         params.occupied.claim(*entity, tiles_walked_by(&along));
-        let back: Vec<Arc> = along.iter().rev().map(Arc::reversed).collect();
+        let forth = spawn_lane(&mut params.commands, *entity, &along)?;
+        if self.one_way {
+            return Ok(());
+        }
 
-        let along = spawn_lane(&mut params.commands, *entity, &along)?;
+        let back: Vec<Arc> = along.iter().rev().map(Arc::reversed).collect();
         let back = spawn_lane(&mut params.commands, *entity, &back)?;
 
         params
             .commands
-            .entity(along.last)
+            .entity(forth.last)
             .insert(NextSegment(back.first));
         params
             .commands
             .entity(back.last)
-            .insert(NextSegment(along.first));
+            .insert(NextSegment(forth.first));
         Ok(())
     }
 }
@@ -510,7 +519,10 @@ fn lay_the_drawn_road(
         let drawn = drawing.path.clone();
         let meetings = nodes_shared_with(&drawn, &roads);
         for nodes in split_at(&drawn, &meetings) {
-            commands.spawn(Road { nodes });
+            commands.spawn(Road {
+                nodes,
+                one_way: false,
+            });
         }
         for (crossed, road) in &roads {
             let pieces = split_at(&road.nodes, &meetings);
@@ -519,7 +531,10 @@ fn lay_the_drawn_road(
             }
             commands.entity(crossed).despawn();
             for nodes in pieces {
-                commands.spawn(Road { nodes });
+                commands.spawn(Road {
+                    nodes,
+                    one_way: false,
+                });
             }
         }
     }
@@ -741,6 +756,7 @@ mod tests {
         app.world_mut()
             .spawn(Road {
                 nodes: nodes(offsets),
+                one_way: false,
             })
             .id()
     }
@@ -748,6 +764,20 @@ mod tests {
     fn built_road(offsets: &[(i32, i32)]) -> (App, Entity) {
         let mut app = road_app();
         let road = spawn_road(&mut app, offsets);
+        tick(&mut app);
+        (app, road)
+    }
+
+    /// An app holding a one-way road through `offsets`, laid and cut into segments.
+    fn built_one_way_road(offsets: &[(i32, i32)]) -> (App, Entity) {
+        let mut app = road_app();
+        let road = app
+            .world_mut()
+            .spawn(Road {
+                nodes: nodes(offsets),
+                one_way: true,
+            })
+            .id();
         tick(&mut app);
         (app, road)
     }
@@ -935,6 +965,83 @@ mod tests {
             next_of(&app, *driven.last().expect("the drive ends")),
             Some(start)
         );
+    }
+
+    #[test]
+    fn a_one_way_road_gets_a_single_lane() {
+        let (app, road) = built_one_way_road(&STRAIGHT);
+
+        assert_eq!(lanes(&app, road).len(), 1);
+    }
+
+    #[test]
+    fn the_lane_of_a_one_way_road_runs_the_way_it_was_drawn() {
+        let path = tiles(&STRAIGHT);
+        let (app, road) = built_one_way_road(&STRAIGHT);
+
+        let lane = lane_from(&app, road, path[0]);
+
+        let end = position(&app, *lane.last().expect("the lane has segments"), 1.);
+        assert!(end.distance(path[STRAIGHT.len() - 1].world_position()) < TOLERANCE);
+    }
+
+    #[test]
+    fn no_lane_of_a_one_way_road_sets_off_from_its_far_end() {
+        let path = tiles(&STRAIGHT);
+        let (app, road) = built_one_way_road(&STRAIGHT);
+
+        assert!(lane_from(&app, road, path[STRAIGHT.len() - 1]).is_empty());
+    }
+
+    #[test]
+    fn the_segments_of_a_one_way_road_cover_the_whole_road_once() {
+        let (app, road) = built_one_way_road(&STRAIGHT);
+        let drawn = run_through(&STRAIGHT);
+
+        let driven: f32 = lanes(&app, road)
+            .into_iter()
+            .flat_map(|lane| children_of(&app, lane))
+            .map(|segment| length_of(&app, segment))
+            .sum();
+
+        assert!(
+            (driven - drawn).abs() < drawn * TOLERANCE,
+            "{driven} driven against {drawn} drawn"
+        );
+    }
+
+    #[test]
+    fn a_one_way_road_ends_rather_than_turning_round() {
+        for offsets in [STRAIGHT.as_slice(), TURNING.as_slice()] {
+            let (mut app, road) = built_one_way_road(offsets);
+            let lane = lane_from(&app, road, tiles(offsets)[0]);
+
+            let mut driven = vec![*lane.first().expect("the lane has segments")];
+            while let Some(next) = next_of(&app, *driven.last().expect("the drive has a segment")) {
+                assert!(!driven.contains(&next), "the drive came back on itself");
+                driven.push(next);
+            }
+
+            assert_eq!(driven.len(), segments_in_the_world(&mut app));
+        }
+    }
+
+    #[test]
+    fn no_segment_of_a_one_way_road_runs_against_it() {
+        let path = tiles(&STRAIGHT);
+        let (app, road) = built_one_way_road(&STRAIGHT);
+        let drawn = path[STRAIGHT.len() - 1].world_position() - path[0].world_position();
+
+        for segment in lanes(&app, road)
+            .into_iter()
+            .flat_map(|lane| children_of(&app, lane))
+        {
+            let heading = position(&app, segment, 1.) - position(&app, segment, 0.);
+            assert!(
+                heading.dot(drawn) > 0.,
+                "a segment runs back along the road"
+            );
+        }
     }
 
     #[test]
@@ -1318,6 +1425,17 @@ mod tests {
         for drawn in tiles(&TURNING) {
             assert!(occupied.contains(&drawn), "{drawn:?} was drawn through");
         }
+    }
+
+    #[test]
+    fn a_one_way_road_occupies_the_same_tiles_as_a_two_way_one() {
+        let (both_ways, two_way) = built_road(&TURNING);
+        let (one_way, single) = built_one_way_road(&TURNING);
+
+        assert_eq!(
+            occupied_tiles(&one_way, single),
+            occupied_tiles(&both_ways, two_way)
+        );
     }
 
     #[test]

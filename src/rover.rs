@@ -191,7 +191,10 @@ mod tests {
             .into_iter()
             .map(LatticeNode::from_tile)
             .collect();
-        app.world_mut().spawn(Road { nodes });
+        app.world_mut().spawn(Road {
+            nodes,
+            one_way: false,
+        });
         tick(&mut app);
         app
     }
