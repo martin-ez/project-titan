@@ -11,6 +11,9 @@ use std::f32::consts::FRAC_PI_2;
 /// How many straight pieces a segment's arc is drawn as.
 const SEGMENT_SUBDIVISIONS: u32 = 8;
 
+/// How many straight pieces a disc the road cannot reach into is drawn as.
+const RING_SUBDIVISIONS: u32 = 24;
+
 /// How far into a segment the arrow onto the next one reaches, at either end of the handover.
 const HANDOVER_REACH: f32 = 0.1;
 
@@ -21,8 +24,22 @@ const HANDOVER_REACH: f32 = 0.1;
 /// segment's capacity off its geometry rather than store one beside it.
 const SEGMENT_LENGTH: f32 = 5.;
 
-/// How near two tangents have to be to count as the same direction when a biarc is fitted.
-const JOIN_TOLERANCE: f32 = 1e-4;
+/// The tightest turn a road may be built to make, as the radius of the arc a rover drives.
+///
+/// A tile's inradius, so the bound comes off the grid rather than out of the air. It leaves the
+/// sixty degree turn onto a neighbouring tile buildable, whose arc has a radius of one lattice
+/// step, and refuses the same turn onto a neighbouring node, which would need two thirds of that.
+/// Under it the nodes a road cannot reach from where it stands are the two discs of this radius
+/// that touch its heading, one either side.
+const MIN_TURN_RADIUS: f32 = MAP_TILE_INRADIUS;
+
+/// How far off the heading a target may sit and still be aimed at straight.
+///
+/// A chain of arcs carries its tangent from one arc to the next, so a target that is dead ahead
+/// arrives a rounding off the heading rather than exactly on it. Curving to meet that rounding
+/// gives an arc of radius in the millions, whose centre is too far from the road for a position
+/// on it to survive being computed in single precision.
+const STRAIGHT_REACH: f32 = 1e-3;
 
 /// How far a rover may travel in one tick on a segment that does not turn at all.
 ///
@@ -59,8 +76,14 @@ const SLOW_LANE_COLOUR: Color = Color::srgb(0.95, 0.35, 0.45);
 /// The colour the step from one segment onto the next is drawn in
 const HANDOVER_COLOUR: Color = Color::srgb(0.95, 0.8, 0.3);
 
-/// The colour the road the player is still dragging out is drawn in
+/// The colour the road the player is still placing is drawn in
 const DRAWING_COLOUR: Color = Color::srgb(0.6, 0.95, 0.6);
+
+/// The colour the arc a click would lay is drawn in
+const PROPOSAL_COLOUR: Color = Color::srgb(0.95, 0.95, 0.4);
+
+/// The colour the ground a road cannot turn tightly enough to reach is drawn in
+const UNREACHABLE_COLOUR: Color = Color::srgb(0.95, 0.35, 0.35);
 
 /// The colour the tiles a road runs over are marked in
 const OCCUPIED_COLOUR: Color = Color::srgb(0.95, 0.45, 0.35);
@@ -81,27 +104,30 @@ const OCCUPIED_MARK: f32 = 0.35;
 /// for; making the player draw the return leg charged the saving to the first thing they build.
 pub struct RoadPlugin;
 
-/// A road the player drew: the nodes it runs through, in the order it crossed them.
+/// A road the player placed: the nodes it runs through, in the order they were clicked.
 ///
 /// The nodes are the road. Its arcs, the lanes over them and every world position a rover ever
-/// stands at are derived from them when it is laid, so two roads drawn through the same nodes are
-/// the same shape. Invariant 3: the integers are the truth and the curve comes out of them.
+/// stands at are derived from them when it is laid, so two roads placed through the same nodes
+/// are the same shape. Invariant 3: the integers are the truth and the curve comes out of them.
 #[derive(Component)]
 #[require(NeedsInitialization)]
 pub struct Road {
-    /// The nodes the road was drawn through, from one end to the other.
+    /// The nodes the road was clicked through, from one end to the other.
     pub nodes: Vec<LatticeNode>,
+    /// The direction the road sets off in, which it has where it was begun on another road's end.
+    pub leaving: Option<Vec3>,
 }
 
-/// The road the player is part way through dragging out, as far as the cursor has taken it.
+/// The road the player is part way through clicking out, as far as they have taken it.
 ///
-/// It is a record of nodes and nothing else until the button comes up: no arc, no lane and
+/// It is a record of nodes and nothing else until the road is finished: no arc, no lane and
 /// nothing a rover could drive. Putting the tool down destroys it with the rest of the tool's
-/// state, so a drag abandoned half way leaves the network as it was.
+/// state, so a road abandoned half way leaves the network as it was.
 #[derive(Component)]
 #[require(DestroyOnStateChange)]
 struct DrawnRoad {
-    path: Vec<LatticeNode>,
+    nodes: Vec<LatticeNode>,
+    leaving: Option<Vec3>,
 }
 
 /// A circular arc on the ground, and the whole of a road's geometry.
@@ -169,9 +195,9 @@ impl Plugin for RoadPlugin {
             .add_systems(
                 Update,
                 (
-                    (extend_the_drawn_road, lay_the_drawn_road).chain(),
+                    (place_a_node, lay_the_road).chain(),
                     draw_the_lanes,
-                    draw_the_drawn_road,
+                    draw_the_road_being_placed,
                     draw_the_occupied_tiles,
                     draw_the_road_under_the_cursor,
                 ),
@@ -228,6 +254,15 @@ impl Arc {
         }
 
         let sideways = turn_of(tangent, reach);
+        if sideways.abs() < STRAIGHT_REACH {
+            return Self {
+                start,
+                tangent,
+                curvature: 0.,
+                length: reach.length(),
+            };
+        }
+
         let curvature = 2. * sideways / span;
         let turn = 2. * sideways.atan2(tangent.dot(reach));
 
@@ -235,11 +270,7 @@ impl Arc {
             start,
             tangent,
             curvature,
-            length: if curvature == 0. {
-                reach.length()
-            } else {
-                turn / curvature
-            },
+            length: turn / curvature,
         }
     }
 
@@ -320,7 +351,7 @@ impl RoadSegment {
 
 impl Initialize<RoadInitializeParams<'_, '_>> for Road {
     fn initialize(&mut self, entity: &Entity, params: &mut RoadInitializeParams) -> Result {
-        let along = arcs_through(&self.nodes);
+        let along = arcs_through(&self.nodes, self.leaving);
         if along.is_empty() {
             return Err("a road of no arcs".into());
         }
@@ -373,70 +404,31 @@ fn walk_of(arc: &Arc) -> impl Iterator<Item = f32> {
 
 /// The arcs running through `nodes`, each leaving the one before it at the same tangent.
 ///
-/// A node's direction is the bisector of the two runs meeting there, and a pair of nodes is joined
-/// by the one arc that honours both directions where it can and by two where it cannot. Fitting a
-/// single arc per pair from the previous tangent alone would not do: aiming at a node sixty
-/// degrees off the current heading turns the road a hundred and twenty, and a chain of those winds
-/// further off course at every step rather than following the nodes it was drawn through.
-fn arcs_through(nodes: &[LatticeNode]) -> Vec<Arc> {
+/// One arc joins each pair, and it is the only one that leaves the node before along the direction
+/// the road arrived on and passes through the node after: `leaving` gives the first that direction,
+/// and a road begun on open ground has none, so it sets off straight. Aiming at a node sixty
+/// degrees off the heading turns the road a hundred and twenty, which is the player steering
+/// rather than the road drifting, because they picked the node and saw the arc before clicking it.
+fn arcs_through(nodes: &[LatticeNode], leaving: Option<Vec3>) -> Vec<Arc> {
     let points: Vec<Vec3> = nodes.iter().map(LatticeNode::world_position).collect();
-    let tangents = tangents_along(&points);
-
-    (0..points.len().saturating_sub(1))
-        .flat_map(|step| {
-            biarc(
-                points[step],
-                tangents[step],
-                points[step + 1],
-                tangents[step + 1],
-            )
-        })
-        .collect()
-}
-
-fn tangents_along(points: &[Vec3]) -> Vec<Vec3> {
-    (0..points.len())
-        .map(|at| {
-            let before = (at > 0).then(|| (points[at] - points[at - 1]).normalize_or_zero());
-            let after =
-                (at + 1 < points.len()).then(|| (points[at + 1] - points[at]).normalize_or_zero());
-
-            match (before, after) {
-                (Some(before), Some(after)) => (before + after).normalize_or(after),
-                (Some(before), None) => before,
-                (None, Some(after)) => after,
-                (None, None) => Vec3::X,
-            }
-        })
-        .collect()
-}
-
-fn biarc(from: Vec3, leaving: Vec3, to: Vec3, arriving: Vec3) -> Vec<Arc> {
-    let whole = Arc::through(from, leaving, to);
-    if whole
-        .tangent_at(whole.length)
-        .abs_diff_eq(arriving, JOIN_TOLERANCE)
-    {
-        return vec![whole];
-    }
-
-    let joint = joint_between(from, leaving, to, arriving);
-    let first = Arc::through(from, leaving, joint);
-    let second = Arc::through(joint, first.tangent_at(first.length), to);
-    vec![first, second]
-}
-
-fn joint_between(from: Vec3, leaving: Vec3, to: Vec3, arriving: Vec3) -> Vec3 {
-    let reach = to - from;
-    let closing = 2. * (1. - leaving.dot(arriving));
-    let along = reach.dot(leaving + arriving);
-    let reached = if closing.abs() < JOIN_TOLERANCE {
-        reach.length() / 2.
-    } else {
-        (-along + (along * along + closing * reach.length_squared()).sqrt()) / closing
+    let Some(setting_off) = leaving.or_else(|| {
+        points
+            .first()
+            .zip(points.get(1))
+            .map(|(from, to)| (*to - *from).normalize_or_zero())
+    }) else {
+        return Vec::new();
     };
 
-    (from + leaving * reached).midpoint(to - arriving * reached)
+    let mut tangent = setting_off;
+    points
+        .windows(2)
+        .map(|pair| {
+            let arc = Arc::through(pair[0], tangent, pair[1]);
+            tangent = arc.tangent_at(arc.length);
+            arc
+        })
+        .collect()
 }
 
 /// The two segments of a lane a road's other lane joins onto.
@@ -494,70 +486,111 @@ fn stretches_of(arc: &Arc) -> Vec<(f32, f32)> {
         .collect()
 }
 
-/// Take the road the player is dragging out as far as the node under the cursor.
+/// Start the road the player is placing, or take it on to the node they clicked.
 ///
-/// The path records the nodes the cursor reached and nothing between them, because an arc spans
-/// from one node to the next rather than passing through every node on the way: filling the gap
-/// would pin the road to nodes the player never aimed at. A cursor resting on one adds nothing.
-fn extend_the_drawn_road(
+/// The first click lays nothing: it says where the road begins, and it inherits the direction of
+/// the road it began on where there is one, so a road joined onto another leaves it without a
+/// kink. Every click after it aims the one arc that leaves the node before along the direction the
+/// road arrived on, and a target that arc cannot turn tightly enough to reach is refused.
+fn place_a_node(
     mut commands: Commands,
     player_input: Res<PlayerInput>,
     action: Res<State<PlayerAction>>,
-    mut drawn: Query<&mut DrawnRoad>,
+    roads: Query<&Road>,
+    mut placing: Query<&mut DrawnRoad>,
 ) {
-    if !player_input.dragging || *action.get() != PlayerAction::EditRoads {
+    if !player_input.tap || *action.get() != PlayerAction::EditRoads {
         return;
     }
-    let Some(reached) = player_input.cursor_node else {
+    let Some(target) = player_input.cursor_node else {
         return;
     };
 
-    match drawn.iter_mut().next() {
-        Some(mut drawn) => {
-            if drawn.path.last() != Some(&reached) {
-                drawn.path.push(reached);
-            }
-        }
-        None => {
-            commands.spawn(DrawnRoad {
-                path: vec![reached],
-            });
-        }
-    }
-}
+    let Some(mut placing) = placing.iter_mut().next() else {
+        commands.spawn(DrawnRoad {
+            nodes: vec![target],
+            leaving: direction_leaving(target, &roads),
+        });
+        return;
+    };
 
-/// Put the drawn road into the world when the player lets the button go.
-///
-/// A drag that never left its node lays nothing, which is what a click with the road tool is.
-fn lay_the_drawn_road(
-    mut commands: Commands,
-    player_input: Res<PlayerInput>,
-    drawn: Query<(Entity, &DrawnRoad)>,
-    roads: Query<(Entity, &Road)>,
-) {
-    if player_input.dragging {
+    if placing.nodes.last() == Some(&target) || proposed_arc(&placing, target).is_none() {
         return;
     }
+    placing.nodes.push(target);
+}
 
-    for (entity, drawing) in &drawn {
+/// The arc a click on `target` would lay, or nothing where no arc can turn tightly enough.
+fn proposed_arc(placing: &DrawnRoad, target: LatticeNode) -> Option<Arc> {
+    let standing = placing.nodes.last()?.world_position();
+    let target = target.world_position();
+    let arcs = arcs_through(&placing.nodes, placing.leaving);
+    let tangent = match arcs.last() {
+        Some(arc) => arc.tangent_at(arc.length),
+        None => placing
+            .leaving
+            .unwrap_or_else(|| (target - standing).normalize_or_zero()),
+    };
+
+    let arc = Arc::through(standing, tangent, target);
+    (arc.curvature.abs() * MIN_TURN_RADIUS <= 1.).then_some(arc)
+}
+
+/// The direction a road already at `node` sets off from it, where `node` is an end of one.
+///
+/// A road met at its middle has two directions rather than one, so only its ends answer: anywhere
+/// else the road being placed begins on open ground and sets off straight.
+fn direction_leaving(node: LatticeNode, roads: &Query<&Road>) -> Option<Vec3> {
+    roads.iter().find_map(|road| {
+        let arcs = arcs_through(&road.nodes, road.leaving);
+        match (road.nodes.first(), road.nodes.last()) {
+            (_, Some(&last)) if last == node => arcs.last().map(|arc| arc.tangent_at(arc.length)),
+            (Some(&first), _) if first == node => arcs.first().map(|arc| -arc.tangent),
+            _ => None,
+        }
+    })
+}
+
+/// Put the road the player placed into the world, once they say it is finished.
+///
+/// Clicking onto a road that is already there finishes it too: reaching one is how a road is
+/// joined to the network, and a road that ends on another's node meets it there rather than
+/// running through it. A road of a single node is no road and lays nothing.
+fn lay_the_road(
+    mut commands: Commands,
+    player_input: Res<PlayerInput>,
+    placing: Query<(Entity, &DrawnRoad)>,
+    roads: Query<(Entity, &Road)>,
+) {
+    for (entity, placed) in &placing {
+        if !player_input.finish && !reaches_a_road(placed, &roads) {
+            continue;
+        }
         commands.entity(entity).despawn();
 
-        let drawn = drawing.path.clone();
-        let meetings = nodes_shared_with(&drawn, &roads);
-        for nodes in split_at(&drawn, &meetings) {
-            commands.spawn(Road { nodes });
+        let meetings = nodes_shared_with(&placed.nodes, &roads);
+        for (nodes, leaving) in split_at(&placed.nodes, placed.leaving, &meetings) {
+            commands.spawn(Road { nodes, leaving });
         }
         for (crossed, road) in &roads {
-            let pieces = split_at(&road.nodes, &meetings);
+            let pieces = split_at(&road.nodes, road.leaving, &meetings);
             if pieces.len() < 2 {
                 continue;
             }
             commands.entity(crossed).despawn();
-            for nodes in pieces {
-                commands.spawn(Road { nodes });
+            for (nodes, leaving) in pieces {
+                commands.spawn(Road { nodes, leaving });
             }
         }
     }
+}
+
+/// Whether the road being placed has arrived on a road that is already there.
+fn reaches_a_road(placed: &DrawnRoad, roads: &Query<(Entity, &Road)>) -> bool {
+    let Some(reached) = placed.nodes.last().filter(|_| placed.nodes.len() > 1) else {
+        return false;
+    };
+    roads.iter().any(|(_, road)| road.nodes.contains(reached))
 }
 
 /// The nodes of `drawn` that a road already runs through.
@@ -573,40 +606,112 @@ fn nodes_shared_with(
         .collect()
 }
 
-/// Break `nodes` into the roads they become once cut at every node in `at`.
+/// Break a road into the roads it becomes once cut at every node in `at`.
 ///
 /// A cut node ends the piece before it and starts the piece after, so the roads either side meet
 /// there rather than running through: that shared end is what makes the node a place a rover has
-/// to be handed over at. A cut at one of `nodes`' own ends leaves it whole, being where it already
+/// to be handed over at. A cut at one of its own ends leaves it whole, being where it already
 /// ended, and a piece of a single node is no road at all and is dropped.
-fn split_at(nodes: &[LatticeNode], at: &HashSet<LatticeNode>) -> Vec<Vec<LatticeNode>> {
-    let mut pieces = Vec::new();
-    let mut piece: Vec<LatticeNode> = Vec::new();
+///
+/// Each piece keeps the direction the whole road had where that piece begins, so the arcs it is
+/// rebuilt from are the arcs it already had: cutting a road moves none of it (invariant 6).
+fn split_at(
+    nodes: &[LatticeNode],
+    leaving: Option<Vec3>,
+    at: &HashSet<LatticeNode>,
+) -> Vec<(Vec<LatticeNode>, Option<Vec3>)> {
+    let arcs = arcs_through(nodes, leaving);
+    let directions: Vec<Option<Vec3>> = (0..nodes.len())
+        .map(
+            |node| match node.checked_sub(1).and_then(|before| arcs.get(before)) {
+                Some(arc) => Some(arc.tangent_at(arc.length)),
+                None => leaving,
+            },
+        )
+        .collect();
 
-    for &node in nodes {
-        piece.push(node);
-        if at.contains(&node) && piece.len() > 1 {
-            pieces.push(std::mem::replace(&mut piece, vec![node]));
+    let mut pieces = Vec::new();
+    let mut opened = 0;
+
+    for (node, &standing) in nodes.iter().enumerate() {
+        let ends = at.contains(&standing) && node > opened;
+        if !ends && node + 1 < nodes.len() {
+            continue;
         }
-    }
-    if piece.len() > 1 {
-        pieces.push(piece);
+        if node > opened {
+            pieces.push((nodes[opened..=node].to_vec(), directions[opened]));
+        }
+        opened = node;
     }
 
     pieces
 }
 
-/// Draw the road the player is dragging out, which has no lane to be seen by until it is laid.
-fn draw_the_drawn_road(mut gizmos: Gizmos<DebugGizmos>, drawn: Query<&DrawnRoad>) {
-    for drawing in &drawn {
+/// Draw the road being placed, the arc the next click would lay, and the ground it cannot reach.
+///
+/// A road being placed has no lane to be seen by until it is laid, and the arc a click lays turns
+/// twice as far as it is aimed, so the player has to see it before committing to it rather than
+/// after (invariant 5). The two discs are the ground no arc from here can turn tightly enough to
+/// reach, and a target inside one is drawn as the refusal it is.
+fn draw_the_road_being_placed(
+    mut gizmos: Gizmos<DebugGizmos>,
+    player_input: Res<PlayerInput>,
+    placing: Query<&DrawnRoad>,
+) {
+    for placed in &placing {
         gizmos.linestrip(
-            drawing
-                .path
+            placed
+                .nodes
                 .iter()
-                .map(|tile| tile.world_position() + GIZMO_LIFT),
+                .map(|node| node.world_position() + GIZMO_LIFT),
             DRAWING_COLOUR,
         );
+
+        let Some(standing) = placed.nodes.last().map(LatticeNode::world_position) else {
+            continue;
+        };
+        if let Some(heading) = heading_of(placed) {
+            for side in [1., -1.] {
+                let centre = standing + left_of(heading) * side * MIN_TURN_RADIUS;
+                gizmos.linestrip(ring_around(centre, MIN_TURN_RADIUS), UNREACHABLE_COLOUR);
+            }
+        }
+
+        let Some(target) = player_input.cursor_node else {
+            continue;
+        };
+        match proposed_arc(placed, target) {
+            Some(arc) => gizmos.linestrip(sampled(&arc), PROPOSAL_COLOUR),
+            None => gizmos.line(
+                standing + GIZMO_LIFT,
+                target.world_position() + GIZMO_LIFT,
+                UNREACHABLE_COLOUR,
+            ),
+        }
     }
+}
+
+/// Which way the road being placed is pointing, which is nothing before it has been aimed at all.
+fn heading_of(placed: &DrawnRoad) -> Option<Vec3> {
+    let arcs = arcs_through(&placed.nodes, placed.leaving);
+    match arcs.last() {
+        Some(arc) => Some(arc.tangent_at(arc.length)),
+        None => placed.leaving,
+    }
+}
+
+fn sampled(arc: &Arc) -> impl Iterator<Item = Vec3> {
+    let arc = *arc;
+    (0..=SEGMENT_SUBDIVISIONS).map(move |step| {
+        arc.position(arc.length * step as f32 / SEGMENT_SUBDIVISIONS as f32) + GIZMO_LIFT
+    })
+}
+
+fn ring_around(centre: Vec3, radius: f32) -> impl Iterator<Item = Vec3> {
+    (0..=RING_SUBDIVISIONS).map(move |step| {
+        let turn = std::f32::consts::TAU * step as f32 / RING_SUBDIVISIONS as f32;
+        centre + turned(Vec3::X * radius, turn) + GIZMO_LIFT
+    })
 }
 
 /// Mark every tile a road runs over, which the lanes drawn across them do not say.
@@ -784,6 +889,7 @@ mod tests {
         app.world_mut()
             .spawn(Road {
                 nodes: nodes(offsets),
+                leaving: None,
             })
             .id()
     }
@@ -942,10 +1048,11 @@ mod tests {
     fn the_segments_of_a_lane_are_roughly_the_same_length() {
         /// How much longer than the shortest segment of a lane the longest may be.
         ///
-        /// A road that runs straight and then turns twice measures 4.8% across: the arcs a fit
-        /// leaves are of lengths of their own, and cutting each to the nearest whole number of
-        /// target lengths is what brings them back together.
-        const SPREAD: f32 = 1.06;
+        /// A road that runs straight and then turns twice measures 21% across: an arc is cut into
+        /// whichever whole number of pieces lands nearest the target length, so a straight run
+        /// between two nodes gives pieces a little under it and the arc that turns a hundred and
+        /// twenty degrees gives pieces a little over.
+        const SPREAD: f32 = 1.25;
 
         let (mut app, road) = built_road(&WINDING);
 
@@ -972,10 +1079,12 @@ mod tests {
         let (app, road) = built_road(&TURNING);
 
         let lane = lane_from(&app, road, path[0]);
-        let segment = *lane.first().expect("the lane has segments");
+        let turning = *lane
+            .last()
+            .expect("the road sets off straight and turns at its far end");
 
-        let (start, end) = (position(&app, segment, 0.), position(&app, segment, 1.));
-        let strayed = position(&app, segment, 0.5).distance(start.midpoint(end));
+        let (start, end) = (position(&app, turning, 0.), position(&app, turning, 1.));
+        let strayed = position(&app, turning, 0.5).distance(start.midpoint(end));
         assert!(strayed > start.distance(end) * BEND, "strayed {strayed}");
     }
 
@@ -1019,22 +1128,40 @@ mod tests {
         assert_eq!(segments_in_the_world(&mut app), 0);
     }
 
-    /// Put the cursor over `node` with the primary button as `dragging` says, and take a frame.
-    fn move_cursor(app: &mut App, node: Option<LatticeNode>, dragging: bool) {
+    /// Click on `node`, and take the frame that reads the click.
+    fn click_at(app: &mut App, node: LatticeNode) {
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.cursor_node = node;
-            input.dragging = dragging;
+            input.cursor_node = Some(node);
+            input.tap = true;
         }
+        tick(app);
+        app.world_mut().resource_mut::<PlayerInput>().tap = false;
+    }
+
+    /// Ask for the road being placed to be laid, and take the frame that reads it.
+    fn finish_the_road(app: &mut App) {
+        app.world_mut().resource_mut::<PlayerInput>().finish = true;
+        tick(app);
+        app.world_mut().resource_mut::<PlayerInput>().finish = false;
+    }
+
+    /// Click through `path` and finish, which is how a whole road is placed.
+    ///
+    /// The frame after the road is laid is what builds its lanes, so it takes one more.
+    fn place_road(app: &mut App, path: &[LatticeNode]) {
+        for &node in path {
+            click_at(app, node);
+        }
+        finish_the_road(app);
         tick(app);
     }
 
-    /// Drag over `path` a node at a frame, then let the button go over the last of them.
-    fn drag_over(app: &mut App, path: &[LatticeNode]) {
-        for &node in path {
-            move_cursor(app, Some(node), true);
-        }
-        move_cursor(app, path.last().copied(), false);
+    fn placing(app: &mut App) -> usize {
+        app.world_mut()
+            .query_filtered::<Entity, With<DrawnRoad>>()
+            .iter(app.world())
+            .count()
     }
 
     fn roads_in_the_world(app: &mut App) -> usize {
@@ -1055,142 +1182,212 @@ mod tests {
     }
 
     #[test]
-    fn a_drag_across_nodes_lays_a_road_through_them() {
+    fn a_road_clicked_through_nodes_runs_through_them() {
         let mut app = app_holding(PlayerAction::EditRoads);
-        let path = nodes(&STRAIGHT);
 
-        drag_over(&mut app, &path);
+        place_road(&mut app, &nodes(&STRAIGHT));
 
         assert!(a_road_runs_through(&mut app, &STRAIGHT));
         assert_eq!(roads_in_the_world(&mut app), 1);
     }
 
     #[test]
-    fn nothing_is_laid_until_the_drag_ends() {
+    fn the_first_click_starts_a_road_and_lays_nothing() {
         let mut app = app_holding(PlayerAction::EditRoads);
-        let path = nodes(&STRAIGHT);
 
-        for &node in &path {
-            move_cursor(&mut app, Some(node), true);
+        click_at(&mut app, nodes(&STRAIGHT)[0]);
+
+        assert_eq!(roads_in_the_world(&mut app), 0);
+        assert_eq!(placing(&mut app), 1);
+    }
+
+    #[test]
+    fn nothing_is_laid_until_the_road_is_finished() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+
+        for &node in &nodes(&STRAIGHT) {
+            click_at(&mut app, node);
         }
 
         assert_eq!(roads_in_the_world(&mut app), 0);
     }
 
     #[test]
-    fn a_drag_that_never_left_its_node_lays_no_road() {
+    fn finishing_a_road_of_one_node_lays_nothing() {
         let mut app = app_holding(PlayerAction::EditRoads);
-        let path = nodes(&[(0, 0)]);
 
-        drag_over(&mut app, &path);
+        place_road(&mut app, &nodes(&[(0, 0)]));
 
         assert_eq!(roads_in_the_world(&mut app), 0);
     }
 
     #[test]
-    fn a_drag_while_selecting_lays_nothing() {
+    fn clicking_the_node_the_road_already_stands_on_adds_nothing() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        let path = nodes(&[(0, 0), (1, 0)]);
+
+        click_at(&mut app, path[0]);
+        click_at(&mut app, path[0]);
+        click_at(&mut app, path[1]);
+        click_at(&mut app, path[1]);
+        finish_the_road(&mut app);
+
+        assert!(a_road_runs_through(&mut app, &[(0, 0), (1, 0)]));
+    }
+
+    #[test]
+    fn a_click_on_no_node_at_all_adds_nothing() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        let path = nodes(&[(0, 0), (1, 0)]);
+
+        click_at(&mut app, path[0]);
+        {
+            let mut input = app.world_mut().resource_mut::<PlayerInput>();
+            input.cursor_node = None;
+            input.tap = true;
+        }
+        tick(&mut app);
+        app.world_mut().resource_mut::<PlayerInput>().tap = false;
+        click_at(&mut app, path[1]);
+        finish_the_road(&mut app);
+
+        assert!(a_road_runs_through(&mut app, &[(0, 0), (1, 0)]));
+    }
+
+    #[test]
+    fn clicking_while_selecting_lays_nothing() {
         let mut app = app_holding(PlayerAction::Select);
-        let path = nodes(&STRAIGHT);
 
-        drag_over(&mut app, &path);
+        place_road(&mut app, &nodes(&STRAIGHT));
 
         assert_eq!(roads_in_the_world(&mut app), 0);
     }
 
     #[test]
-    fn a_drag_while_editing_buildings_lays_nothing() {
+    fn clicking_while_editing_buildings_lays_nothing() {
         let mut app = app_holding(PlayerAction::EditBuildings);
-        let path = nodes(&STRAIGHT);
 
-        drag_over(&mut app, &path);
+        place_road(&mut app, &nodes(&STRAIGHT));
 
         assert_eq!(roads_in_the_world(&mut app), 0);
     }
 
-    #[test]
-    fn a_drag_that_skipped_a_node_runs_straight_to_the_one_it_reached() {
-        let mut app = app_holding(PlayerAction::EditRoads);
-        let ends = [STRAIGHT[0], STRAIGHT[STRAIGHT.len() - 1]];
+    /// The node of the tile at `offset` that lies `towards` from the middle of it.
+    fn corner_of(offset: (i32, i32), towards: Vec3) -> LatticeNode {
+        let tile = HexCoordinates::from_offset_row(offset.0, offset.1);
+        LatticeNode::nearest_on(tile, tile.world_position() + towards)
+    }
 
-        drag_over(&mut app, &nodes(&ends));
+    /// The road running through `offsets`, of which there is one once it has been laid.
+    fn road_through(app: &mut App, offsets: &[(i32, i32)]) -> Entity {
+        let wanted = nodes(offsets);
+        let backwards: Vec<LatticeNode> = wanted.iter().copied().rev().collect();
+        app.world_mut()
+            .query::<(Entity, &Road)>()
+            .iter(app.world())
+            .find(|(_, road)| road.nodes == wanted || road.nodes == backwards)
+            .map(|(entity, _)| entity)
+            .expect("the road was laid")
+    }
 
-        assert!(a_road_runs_through(&mut app, &ends));
-        assert_eq!(roads_in_the_world(&mut app), 1);
+    /// Which way a rover setting off down `segment` is pointing.
+    fn direction_leaving(app: &App, segment: Entity) -> Vec3 {
+        component_of::<RoadSegment>(app, segment)
+            .map(|segment| segment.arc.tangent_at(segment.from))
+            .unwrap_or(Vec3::NAN)
     }
 
     #[test]
-    fn resting_on_a_node_does_not_repeat_it() {
+    fn a_click_no_arc_can_turn_tightly_enough_to_reach_adds_nothing() {
         let mut app = app_holding(PlayerAction::EditRoads);
-        let path = nodes(&[(0, 0), (1, 0)]);
+        let path = nodes(&STRAIGHT[..2]);
+        click_at(&mut app, path[0]);
+        click_at(&mut app, path[1]);
 
-        move_cursor(&mut app, path.first().copied(), true);
-        move_cursor(&mut app, path.first().copied(), true);
-        move_cursor(&mut app, path.last().copied(), true);
-        move_cursor(&mut app, path.last().copied(), true);
-        move_cursor(&mut app, path.last().copied(), false);
+        click_at(
+            &mut app,
+            corner_of(STRAIGHT[1], Vec3::Z * MAP_TILE_INRADIUS),
+        );
+        finish_the_road(&mut app);
 
-        assert!(a_road_runs_through(&mut app, &[(0, 0), (1, 0)]));
+        assert!(a_road_runs_through(&mut app, &STRAIGHT[..2]));
     }
 
     #[test]
-    fn a_drag_passing_over_no_node_carries_on_from_where_it_left_off() {
+    fn a_road_begun_on_open_ground_sets_off_towards_the_node_it_was_aimed_at() {
         let mut app = app_holding(PlayerAction::EditRoads);
-        let path = nodes(&[(0, 0), (1, 0)]);
 
-        move_cursor(&mut app, path.first().copied(), true);
-        move_cursor(&mut app, None, true);
-        move_cursor(&mut app, path.last().copied(), true);
-        move_cursor(&mut app, path.last().copied(), false);
+        place_road(&mut app, &nodes(&TURNING));
 
-        assert!(a_road_runs_through(&mut app, &[(0, 0), (1, 0)]));
+        let road = road_through(&mut app, &TURNING);
+        let lane = lane_from(&app, road, tiles(&TURNING)[0]);
+        let setting_off = direction_leaving(&app, lane[0]);
+
+        assert!(setting_off.abs_diff_eq(Vec3::X, TOLERANCE), "{setting_off}");
     }
 
     #[test]
-    fn putting_the_tool_down_mid_drag_lays_nothing() {
+    fn a_road_begun_on_another_s_end_leaves_it_without_a_kink() {
         let mut app = app_holding(PlayerAction::EditRoads);
-        let path = nodes(&STRAIGHT);
-        for &node in &path {
-            move_cursor(&mut app, Some(node), true);
+        place_road(&mut app, &nodes(&STRAIGHT));
+
+        place_road(&mut app, &nodes(&ONWARD));
+
+        let onward = road_through(&mut app, &ONWARD);
+        let lane = lane_from(&app, onward, tiles(&ONWARD)[0]);
+        let setting_off = direction_leaving(&app, lane[0]);
+
+        assert!(setting_off.abs_diff_eq(Vec3::X, TOLERANCE), "{setting_off}");
+    }
+
+    #[test]
+    fn putting_the_tool_down_mid_road_lays_nothing() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        for &node in &nodes(&STRAIGHT) {
+            click_at(&mut app, node);
         }
 
         app.world_mut()
             .resource_mut::<NextState<PlayerAction>>()
             .set(PlayerAction::Select);
-        move_cursor(&mut app, path.last().copied(), true);
-        move_cursor(&mut app, path.last().copied(), false);
+        tick(&mut app);
+        finish_the_road(&mut app);
 
         assert_eq!(roads_in_the_world(&mut app), 0);
     }
 
-    /// Lay `STRAIGHT`, then drag `CROSSING` over the middle of it.
-    fn a_road_drawn_across_another() -> App {
+    /// Lay `STRAIGHT`, then place a road that arrives on the node in the middle of it.
+    fn a_road_placed_onto_another() -> App {
         let mut app = app_holding(PlayerAction::EditRoads);
-        drag_over(&mut app, &nodes(&STRAIGHT));
-        drag_over(&mut app, &nodes(&CROSSING));
+        place_road(&mut app, &nodes(&STRAIGHT));
+
+        let meeting = nodes(&CROSSING);
+        click_at(&mut app, meeting[0]);
+        click_at(&mut app, meeting[1]);
         tick(&mut app);
         app
     }
 
     #[test]
-    fn a_road_drawn_across_another_ends_where_they_meet() {
-        let mut app = a_road_drawn_across_another();
+    fn arriving_on_a_road_finishes_the_one_being_placed() {
+        let mut app = a_road_placed_onto_another();
 
         assert!(a_road_runs_through(&mut app, &CROSSING[..2]));
-        assert!(a_road_runs_through(&mut app, &CROSSING[1..]));
+        assert_eq!(placing(&mut app), 0);
     }
 
     #[test]
-    fn the_road_it_crossed_is_split_at_the_node_they_share() {
-        let mut app = a_road_drawn_across_another();
+    fn the_road_it_arrived_on_is_split_at_the_node_they_share() {
+        let mut app = a_road_placed_onto_another();
 
         assert!(a_road_runs_through(&mut app, &STRAIGHT[..3]));
         assert!(a_road_runs_through(&mut app, &STRAIGHT[2..]));
-        assert_eq!(roads_in_the_world(&mut app), 4);
+        assert_eq!(roads_in_the_world(&mut app), 3);
     }
 
     #[test]
-    fn every_road_a_crossing_leaves_behind_gets_its_lanes() {
-        let mut app = a_road_drawn_across_another();
+    fn every_road_a_meeting_leaves_behind_gets_its_lanes() {
+        let mut app = a_road_placed_onto_another();
 
         let laid: Vec<Entity> = app
             .world_mut()
@@ -1198,11 +1395,66 @@ mod tests {
             .iter(app.world())
             .collect();
 
-        assert_eq!(laid.len(), 4);
+        assert_eq!(laid.len(), 3);
         for road in laid {
             assert!(!app.world().entity(road).contains::<InitializationFailed>());
             assert_eq!(lanes(&app, road).len(), 2);
         }
+    }
+
+    #[test]
+    fn a_road_lays_one_arc_between_each_pair_of_nodes() {
+        let path = nodes(&WINDING);
+
+        let arcs = arcs_through(&path, None);
+
+        assert_eq!(arcs.len(), path.len() - 1);
+    }
+
+    #[test]
+    fn every_arc_of_a_road_ends_on_the_node_it_was_aimed_at() {
+        let path = nodes(&WINDING);
+
+        let arcs = arcs_through(&path, None);
+
+        for (arc, node) in arcs.iter().zip(path.iter().skip(1)) {
+            let end = arc.position(arc.length);
+            assert!(
+                end.distance(node.world_position()) < TOLERANCE,
+                "{end} rather than {}",
+                node.world_position()
+            );
+        }
+    }
+
+    #[test]
+    fn every_arc_of_a_road_leaves_the_one_before_it_at_the_same_tangent() {
+        let arcs = arcs_through(&nodes(&WINDING), None);
+
+        for pair in arcs.windows(2) {
+            let arriving = pair[0].tangent_at(pair[0].length);
+            assert!(
+                pair[1].tangent.abs_diff_eq(arriving, TOLERANCE),
+                "{} rather than {arriving}",
+                pair[1].tangent
+            );
+        }
+    }
+
+    #[test]
+    fn a_road_begun_on_open_ground_starts_straight() {
+        let arcs = arcs_through(&nodes(&TURNING), None);
+
+        assert_eq!(arcs[0].curvature, 0.);
+    }
+
+    #[test]
+    fn a_road_begun_on_a_direction_leaves_along_it() {
+        let leaving = Vec3::new(0., 0., 1.);
+
+        let arcs = arcs_through(&nodes(&STRAIGHT), Some(leaving));
+
+        assert!(arcs[0].tangent.abs_diff_eq(leaving, TOLERANCE));
     }
 
     #[test]
@@ -1305,30 +1557,11 @@ mod tests {
     }
 
     #[test]
-    fn a_winding_road_is_no_longer_than_the_run_it_was_drawn_through() {
-        /// How much longer than the straight runs between its nodes a road may measure.
-        ///
-        /// A chain of single arcs fitted from the previous tangent alone fails this by turning
-        /// twice as far as it is aimed at every node, which sends the road back the way it came.
-        const WANDER: f32 = 1.15;
-
-        let (app, road) = built_road(&WINDING);
-        let drawn = run_through(&WINDING);
-
-        let driven: f32 = children_of(&app, lanes(&app, road)[0])
-            .into_iter()
-            .map(|segment| length_of(&app, segment))
-            .sum();
-
-        assert!(driven <= drawn * WANDER, "{driven} against {drawn} drawn");
-    }
-
-    #[test]
-    fn a_road_drawn_onto_the_end_of_another_leaves_it_whole() {
+    fn a_road_placed_onto_the_end_of_another_leaves_it_whole() {
         let mut app = app_holding(PlayerAction::EditRoads);
-        drag_over(&mut app, &nodes(&STRAIGHT));
+        place_road(&mut app, &nodes(&STRAIGHT));
 
-        drag_over(&mut app, &nodes(&ONWARD));
+        place_road(&mut app, &nodes(&ONWARD));
 
         assert!(a_road_runs_through(&mut app, &STRAIGHT));
         assert!(a_road_runs_through(&mut app, &ONWARD));
@@ -1517,7 +1750,7 @@ mod tests {
 
     #[test]
     fn splitting_a_road_leaves_the_tile_they_met_on_occupied_by_the_pieces() {
-        let mut app = a_road_drawn_across_another();
+        let mut app = a_road_placed_onto_another();
 
         let laid: Vec<Entity> = app
             .world_mut()

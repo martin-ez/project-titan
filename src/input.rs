@@ -17,6 +17,8 @@ const SELECT_TOOL_KEY: KeyCode = KeyCode::Digit1;
 const ROAD_TOOL_KEY: KeyCode = KeyCode::Digit2;
 /// Key binding for holding the building editing tool
 const BUILDING_TOOL_KEY: KeyCode = KeyCode::Digit3;
+/// Key binding for finishing what the player is placing
+const FINISH_KEY: KeyCode = KeyCode::Escape;
 
 pub struct PlayerInputPlugin;
 
@@ -53,8 +55,8 @@ pub struct PlayerInput {
     pub tap: bool,
     /// Whether the player just clicked with the secondary mouse button
     pub secondary_tap: bool,
-    /// Whether the player is holding the primary mouse button down
-    pub dragging: bool,
+    /// Whether the player just asked to finish placing what they are part way through
+    pub finish: bool,
 }
 
 #[derive(Component)]
@@ -166,7 +168,7 @@ fn update_player_input(
 ) {
     player_input.tap = mouse_input.just_pressed(MouseButton::Left);
     player_input.secondary_tap = mouse_input.just_pressed(MouseButton::Right);
-    player_input.dragging = mouse_input.pressed(MouseButton::Left);
+    player_input.finish = player_input.secondary_tap || input.just_pressed(FINISH_KEY);
 
     let Some(camera) = &cursor.camera else {
         player_input.movement_vector = Vec3::ZERO;
@@ -473,28 +475,47 @@ mod tests {
     }
 
     #[test]
-    fn holding_the_primary_button_down_is_reported_as_a_drag() {
+    fn a_right_click_is_reported_as_finishing() {
         let mut app = input_app();
         tick(&mut app);
 
-        press_mouse(&mut app, MouseButton::Left);
-        tick(&mut app);
+        press_mouse(&mut app, MouseButton::Right);
         tick(&mut app);
 
-        assert!(player_input(&app).dragging);
-        assert!(!player_input(&app).tap);
+        assert!(player_input(&app).finish);
     }
 
     #[test]
-    fn letting_the_primary_button_go_ends_the_drag() {
+    fn pressing_escape_is_reported_as_finishing() {
         let mut app = input_app();
+        tick(&mut app);
+
+        press_key(&mut app, FINISH_KEY);
+        tick(&mut app);
+
+        assert!(player_input(&app).finish);
+    }
+
+    #[test]
+    fn holding_escape_down_finishes_only_once() {
+        let mut app = input_app();
+        press_key(&mut app, FINISH_KEY);
+        tick(&mut app);
+
+        tick(&mut app);
+
+        assert!(!player_input(&app).finish);
+    }
+
+    #[test]
+    fn a_left_click_is_not_reported_as_finishing() {
+        let mut app = input_app();
+        tick(&mut app);
+
         press_mouse(&mut app, MouseButton::Left);
         tick(&mut app);
 
-        release_mouse(&mut app, MouseButton::Left);
-        tick(&mut app);
-
-        assert!(!player_input(&app).dragging);
+        assert!(!player_input(&app).finish);
     }
 
     #[test]
