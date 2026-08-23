@@ -3,6 +3,7 @@ mod building;
 mod camera;
 mod common;
 mod diagnostics;
+mod endpoint;
 mod input;
 mod map;
 mod road;
@@ -19,6 +20,7 @@ fn main() {
         .add_plugins(common::CommonPlugin)
         .add_plugins(diagnostics::DebugGizmosPlugin)
         .add_plugins(diagnostics::DiagnosticsPlugin)
+        .add_plugins(endpoint::EndpointPlugin)
         .add_plugins(input::PlayerInputPlugin)
         .add_plugins(map::MapPlugin)
         .add_plugins(road::RoadPlugin)

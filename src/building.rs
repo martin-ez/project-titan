@@ -1,6 +1,7 @@
 use crate::common::cleanup::Destroy;
 use crate::common::cursor::CursorSurface;
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
+use crate::endpoint::RoadEndpoint;
 use crate::input::{PlayerAction, PlayerInput};
 use crate::map::{HexCoordinates, MapTile, MAP_TILE_SIZE};
 use bevy::ecs::system::SystemParam;
@@ -87,6 +88,7 @@ fn place_building_system(
             Building {
                 coordinates: tile.coordinates,
             },
+            RoadEndpoint::on(tile.coordinates),
             Visibility::Hidden,
         ))
         .id();
@@ -209,6 +211,17 @@ mod tests {
         tap_on(&mut app, Some(tile));
 
         assert_eq!(buildings(&mut app), [HexCoordinates::from_offset_row(2, 3)]);
+    }
+
+    #[test]
+    fn a_placed_building_gets_an_endpoint_to_meet_the_road_network_on() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        let tile = spawn_tile(&mut app, 2, 3);
+
+        tap_on(&mut app, Some(tile));
+
+        let building = building_entity(&mut app).expect("the tap placed a building");
+        assert!(app.world().entity(building).contains::<RoadEndpoint>());
     }
 
     #[test]
