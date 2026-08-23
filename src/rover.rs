@@ -1,7 +1,8 @@
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use crate::diagnostics::DebugGizmos;
 use crate::map::MAP_TILE_SIZE;
-use crate::road::RoadSegment;
+use crate::road::{NextSegment, RoadSegment};
+use crate::simulation::Simulation;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
@@ -10,6 +11,13 @@ const ROVER_SIZE: f32 = MAP_TILE_SIZE / 5.;
 
 /// How tall the box standing in for a rover is.
 const ROVER_HEIGHT: f32 = MAP_TILE_SIZE / 10.;
+
+/// How many segments a rover may be handed onto in one tick.
+///
+/// Nothing the road tool lays comes near it: a rover crosses a segment in tens of ticks, not the
+/// other way round. It is here so that a lane of segments too short to spend a whole tick on
+/// cannot spin the driver, rather than to cap how fast anything goes.
+const HANDOVERS_PER_TICK: usize = 8;
 
 /// How far the debug view lifts a rover's marks off the road, so they do not fight the lane.
 const GIZMO_LIFT: Vec3 = Vec3::new(0., 0.2, 0.);
@@ -67,6 +75,7 @@ struct RoverInitializeParams<'w, 's> {
 impl Plugin for RoverPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(PreUpdate, initialize_system::<Rover, RoverInitializeParams>)
+            .add_systems(FixedUpdate, drive_the_rovers.in_set(Simulation))
             .add_systems(
                 Update,
                 (stand_the_rovers_on_their_segments, draw_the_rovers).chain(),
@@ -91,6 +100,45 @@ impl Initialize<RoverInitializeParams<'_, '_>> for Rover {
             ));
         });
         Ok(())
+    }
+}
+
+/// Drive every rover along its lane, at whatever each segment it crosses allows.
+///
+/// A tick buys a rover an amount of time rather than an amount of ground, and it is spent segment
+/// by segment: what is left of the tick when a rover reaches the end of one is carried onto the
+/// next and spent at the next one's speed limit, so a rover joining a curve slows down on the
+/// curve rather than a tick early. A rover that runs out of road stops at the end of it, and one
+/// whose segment is gone is left where it is — what should become of that one is #102's.
+fn drive_the_rovers(
+    mut rovers: Query<&mut Rover>,
+    segments: Query<(&RoadSegment, Option<&NextSegment>)>,
+) {
+    for mut rover in &mut rovers {
+        let mut left = 1.;
+        for _ in 0..HANDOVERS_PER_TICK {
+            let Ok((segment, next)) = segments.get(rover.segment) else {
+                break;
+            };
+            let length = segment.length();
+            let crossing = (1. - rover.along) * length / segment.speed_limit();
+            if crossing > left {
+                rover.along += left * segment.speed_limit() / length;
+                break;
+            }
+
+            left -= crossing;
+            match next {
+                Some(next) => {
+                    rover.segment = next.0;
+                    rover.along = 0.;
+                }
+                None => {
+                    rover.along = 1.;
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -151,6 +199,7 @@ mod tests {
     use crate::input::{PlayerAction, PlayerInput};
     use crate::map::{HexCoordinates, LatticeNode};
     use crate::road::{Road, RoadPlugin};
+    use crate::simulation::SimulationPlugin;
     use crate::testing::{advance, headless_app, tick};
     use std::time::Duration;
 
@@ -163,8 +212,29 @@ mod tests {
     /// its segment does not run through rather than at the first tile by coincidence.
     const STRAIGHT: [(i32, i32); 4] = [(1, 0), (2, 0), (3, 0), (4, 0)];
 
+    /// A run of tiles that turns back on itself twice, in offset-row coordinates.
+    ///
+    /// The same number of tiles as `STRAIGHT` and the same distance between each, so a rover has
+    /// as much road ahead of it here as there and only the curves tell the two apart.
+    const WINDING: [(i32, i32); 4] = [(1, 6), (2, 6), (1, 7), (2, 7)];
+
     /// A frame far too short to carry a tick of the fixed clock.
     const SHORT_FRAME: Duration = Duration::from_micros(100);
+
+    /// How many segments a lane may hold before a walk along it has plainly lost its way.
+    const LAP_SEGMENTS: usize = 1024;
+
+    /// How many ticks a rover is given to cross one segment before the test gives up on it.
+    const TICKS_ALLOWED: u32 = 4096;
+
+    /// How many ticks the two roads are driven for before what each delivered is compared.
+    ///
+    /// Well short of what either rover needs to reach the end of its road, so both were offered
+    /// the same stretch of it and only their speed limits decide how much went under them.
+    const TICKS_MEASURED: u32 = 100;
+
+    /// How many frames carrying no tick it takes for a rover driven by the frame to have moved.
+    const FRAMES_WITHOUT_A_TICK: u32 = 32;
 
     /// Somewhere no segment of the road under test runs through.
     const NOWHERE: Vec3 = Vec3::new(999., 999., 999.);
@@ -173,7 +243,13 @@ mod tests {
         let mut app = headless_app();
         app.insert_state(PlayerAction::Select)
             .insert_resource(PlayerInput::default())
-            .add_plugins((DebugGizmosPlugin, CleanupPlugin, RoadPlugin, RoverPlugin));
+            .add_plugins((
+                SimulationPlugin,
+                DebugGizmosPlugin,
+                CleanupPlugin,
+                RoadPlugin,
+                RoverPlugin,
+            ));
         app
     }
 
@@ -193,6 +269,7 @@ mod tests {
             .collect();
         app.world_mut().spawn(Road {
             nodes,
+            leaving: None,
             one_way: false,
         });
         tick(&mut app);
@@ -224,6 +301,116 @@ mod tests {
         app.world_mut().spawn(Rover { segment, along }).id()
     }
 
+    /// The rover's segment and how far along it, which together are where it is.
+    fn place_of(app: &App, rover: Entity) -> (Entity, f32) {
+        let rover = app
+            .world()
+            .entity(rover)
+            .get::<Rover>()
+            .expect("the rover is still there");
+        (rover.segment, rover.along)
+    }
+
+    /// How far `rover` has driven since it set off from the start of `from`.
+    ///
+    /// Walked along the lane rather than measured between two world positions: a rover round a
+    /// bend covers more ground than the straight line it ends up displaced by, and how much road
+    /// went under it is the whole of what a speed limit decides.
+    fn driven_from(app: &App, rover: Entity, from: Entity) -> f32 {
+        let (standing, along) = place_of(app, rover);
+        let mut segment = from;
+        let mut driven = 0.;
+        for _ in 0..LAP_SEGMENTS {
+            let length = length_of(app, segment);
+            if segment == standing {
+                return driven + along * length;
+            }
+            driven += length;
+            segment = app
+                .world()
+                .entity(segment)
+                .get::<NextSegment>()
+                .expect("the lane runs on")
+                .0;
+        }
+        f32::NAN
+    }
+
+    fn length_of(app: &App, segment: Entity) -> f32 {
+        app.world()
+            .entity(segment)
+            .get::<RoadSegment>()
+            .expect("the segment is still there")
+            .length()
+    }
+
+    fn speed_limit_of(app: &App, segment: Entity) -> f32 {
+        app.world()
+            .entity(segment)
+            .get::<RoadSegment>()
+            .expect("the segment is still there")
+            .speed_limit()
+    }
+
+    /// How many ticks it takes `rover` to leave the segment it is standing on.
+    fn ticks_to_cross(app: &mut App, rover: Entity) -> u32 {
+        let (setting_off, _) = place_of(app, rover);
+        for taken in 1..=TICKS_ALLOWED {
+            tick(app);
+            if place_of(app, rover).0 != setting_off {
+                return taken;
+            }
+        }
+        TICKS_ALLOWED
+    }
+
+    /// Lay a road through `offsets` on `app`, which takes a tick to become segments.
+    fn lay_road(app: &mut App, offsets: &[(i32, i32)]) {
+        let nodes = tiles(offsets)
+            .into_iter()
+            .map(LatticeNode::from_tile)
+            .collect();
+        app.world_mut().spawn(Road {
+            nodes,
+            leaving: None,
+            one_way: false,
+        });
+    }
+
+    /// Set a rover off from the start of the first segment of the road through `offsets`.
+    fn set_off_along(app: &mut App, offsets: &[(i32, i32)]) -> (Entity, Entity) {
+        let segment = segment_from(app, tiles(offsets)[0]);
+        (spawn_rover(app, segment, 0.), segment)
+    }
+
+    /// The segment of the one road in `app` that holds a rover to the lowest speed.
+    fn slowest_segment_in(app: &mut App) -> Entity {
+        app.world_mut()
+            .query::<(Entity, &RoadSegment)>()
+            .iter(app.world())
+            .min_by(|(_, one), (_, other)| one.speed_limit().total_cmp(&other.speed_limit()))
+            .map(|(segment, _)| segment)
+            .expect("the road has segments")
+    }
+
+    /// How fast a segment with no curve in it allows, which is the fastest a segment gets.
+    fn the_open_road() -> f32 {
+        let (app, _, straight) = road_with_a_driver(&STRAIGHT);
+        speed_limit_of(&app, straight)
+    }
+
+    /// An app of its own holding one road and one rover at the start of it.
+    ///
+    /// Its own, because a tick drives every rover in the world: two rovers measured in one app
+    /// would each be carried along by the other's measurement.
+    fn road_with_a_driver(offsets: &[(i32, i32)]) -> (App, Entity, Entity) {
+        let mut app = rover_app();
+        lay_road(&mut app, offsets);
+        tick(&mut app);
+        let (rover, segment) = set_off_along(&mut app, offsets);
+        (app, rover, segment)
+    }
+
     fn standing_at(app: &App, rover: Entity) -> Vec3 {
         app.world()
             .entity(rover)
@@ -249,11 +436,14 @@ mod tests {
     }
 
     /// A road laid, a rover put on its first segment, and a frame for both to be seen.
+    ///
+    /// The frame carries no tick, so the rover is placed where it was put rather than where a
+    /// tick of driving would have taken it: these are the tests of what a box on a lane shows.
     fn road_and_rover(along: f32) -> (App, Entity, Entity) {
         let mut app = road_app();
         let segment = segment_from(&mut app, tiles(&STRAIGHT)[0]);
         let rover = spawn_rover(&mut app, segment, along);
-        tick(&mut app);
+        advance(&mut app, SHORT_FRAME);
         (app, rover, segment)
     }
 
@@ -283,7 +473,7 @@ mod tests {
         let (from, _) = ends_of(&mut app, segment);
 
         move_to(&mut app, rover, 0.75);
-        tick(&mut app);
+        advance(&mut app, SHORT_FRAME);
 
         assert!(standing_at(&app, rover).distance(from) > TOLERANCE);
     }
@@ -294,7 +484,7 @@ mod tests {
         let (from, to) = ends_of(&mut app, segment);
 
         put_the_box_at(&mut app, rover, NOWHERE);
-        tick(&mut app);
+        advance(&mut app, SHORT_FRAME);
 
         let along = app
             .world()
@@ -362,8 +552,8 @@ mod tests {
             .insert(Cargo { quantity: 3 });
 
         move_to(&mut app, rover, 0.5);
-        tick(&mut app);
-        tick(&mut app);
+        advance(&mut app, SHORT_FRAME);
+        advance(&mut app, SHORT_FRAME);
 
         let carried = app
             .world()
@@ -371,5 +561,94 @@ mod tests {
             .get::<Cargo>()
             .map(|cargo| cargo.quantity);
         assert_eq!(carried, Some(3));
+    }
+    #[test]
+    fn a_rover_advances_along_its_lane_on_the_tick() {
+        let (mut app, rover, _) = road_and_rover(0.);
+
+        tick(&mut app);
+
+        assert!(place_of(&app, rover).1 > 0.);
+    }
+
+    #[test]
+    fn a_rover_does_not_advance_on_a_frame_that_carries_no_tick() {
+        let (mut app, rover, _) = road_and_rover(0.25);
+
+        for _ in 0..FRAMES_WITHOUT_A_TICK {
+            advance(&mut app, SHORT_FRAME);
+        }
+
+        assert_eq!(place_of(&app, rover).1, 0.25);
+    }
+
+    #[test]
+    fn a_rover_crosses_a_segment_in_ticks_its_length_over_its_speed_limit() {
+        let (mut app, rover, segment) = road_and_rover(0.);
+        let expected = length_of(&app, segment) / speed_limit_of(&app, segment);
+
+        let taken = ticks_to_cross(&mut app, rover) as f32;
+
+        assert!(
+            (taken - expected).abs() <= 1.,
+            "{taken} ticks against the {expected} its length over its limit asks for"
+        );
+    }
+
+    #[test]
+    fn a_rover_crosses_a_slower_segment_in_more_ticks() {
+        let mut app = rover_app();
+        lay_road(&mut app, &WINDING);
+        tick(&mut app);
+        let bend = slowest_segment_in(&mut app);
+        let round_the_bend = spawn_rover(&mut app, bend, 0.);
+        let ground = length_of(&app, bend);
+        let open_road = the_open_road();
+
+        let slowly = speed_limit_of(&app, bend);
+        let taken = ticks_to_cross(&mut app, round_the_bend) as f32;
+
+        assert!(slowly < open_road, "{slowly} round the bend is no slower");
+        assert!(
+            taken > ground / open_road,
+            "{taken} ticks round the bend against the {} the same {ground} of straight takes",
+            ground / open_road
+        );
+    }
+
+    #[test]
+    fn a_rover_hands_over_to_the_next_segment_at_the_end_of_this_one() {
+        let (mut app, rover, segment) = road_and_rover(0.);
+        let onward = app
+            .world()
+            .entity(segment)
+            .get::<NextSegment>()
+            .expect("the lane runs on")
+            .0;
+
+        ticks_to_cross(&mut app, rover);
+
+        assert_eq!(place_of(&app, rover).0, onward);
+    }
+
+    #[test]
+    fn a_straight_road_delivers_more_than_a_winding_one_beside_it() {
+        let mut app = rover_app();
+        lay_road(&mut app, &STRAIGHT);
+        lay_road(&mut app, &WINDING);
+        tick(&mut app);
+        let (on_the_straight, straight) = set_off_along(&mut app, &STRAIGHT);
+        let (round_the_bend, winding) = set_off_along(&mut app, &WINDING);
+
+        for _ in 0..TICKS_MEASURED {
+            tick(&mut app);
+        }
+
+        let quick = driven_from(&app, on_the_straight, straight);
+        let slow = driven_from(&app, round_the_bend, winding);
+        assert!(
+            quick > slow,
+            "{quick} covered on the straight against {slow} round the bends"
+        );
     }
 }
