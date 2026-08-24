@@ -1,5 +1,5 @@
 use crate::building::BuildingTiles;
-use crate::common::cleanup::DestroyOnStateChange;
+use crate::common::cleanup::{Destroy, DestroyOnStateChange};
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use crate::diagnostics::DebugGizmos;
 use crate::input::{PlayerAction, PlayerInput};
@@ -92,6 +92,9 @@ const OCCUPIED_COLOUR: Color = Color::srgb(0.95, 0.45, 0.35);
 
 /// The colour a tile under the cursor is marked in when a road already runs over it
 const TAKEN_COLOUR: Color = Color::srgb(0.95, 0.25, 0.2);
+
+/// The colour the arc a click would take off the map is drawn in
+const REMOVING_COLOUR: Color = Color::srgb(1., 0.4, 0.75);
 
 /// How wide the mark on an occupied tile is drawn, as a share of the tile's inradius.
 const OCCUPIED_MARK: f32 = 0.35;
@@ -357,7 +360,7 @@ impl Plugin for RoadPlugin {
                 },
                 Binding {
                     input: BindingInput::Mouse(MouseButton::Right),
-                    action: "Finish the road",
+                    action: "Finish the road, or take off the arc under the cursor",
                     context: BindingContext::Tool(PlayerAction::EditRoads),
                 },
             ])
@@ -375,11 +378,12 @@ impl Plugin for RoadPlugin {
             .add_systems(
                 Update,
                 (
-                    (place_a_node, lay_the_road).chain(),
+                    (place_a_node, remove_the_arc_under_the_cursor, lay_the_road).chain(),
                     (connect_the_endpoints, draw_the_endpoints).chain(),
                     draw_the_lanes,
                     draw_the_junctions,
                     draw_the_road_being_placed,
+                    draw_the_arc_the_cursor_would_remove,
                     draw_the_occupied_tiles,
                     draw_the_taken_tile_under_the_cursor,
                 ),
@@ -482,29 +486,28 @@ impl Arc {
         (1. / self.curvature).abs()
     }
 
+    /// How far along this arc the place nearest `point` stands.
+    ///
+    /// A point beside the curve, off the end of it or nowhere near it at all answers the place on
+    /// the arc closest to it, which is what a click on the map has to be measured against.
+    fn nearest_to(&self, point: Vec3) -> f32 {
+        let at = if self.curvature == 0. {
+            (point - self.start).dot(self.tangent)
+        } else {
+            let centre = self.centre();
+            let (from, to) = (self.start - centre, point - centre);
+            driven(turn_of(from, to).atan2(from.dot(to)), self.curvature) / self.curvature
+        };
+        at.clamp(0., self.length)
+    }
+
     /// How far along this arc `point` stands, or nothing where it is off the curve or past an end.
     ///
     /// A point beside the curve is not on this arc, and one on the circle the arc lies on but past
     /// either end is not on it either, so both answer nothing rather than the nearest place.
     fn distance_along(&self, point: Vec3) -> Option<f32> {
-        let at = if self.curvature == 0. {
-            let reach = point - self.start;
-            let at = reach.dot(self.tangent);
-            if (reach - self.tangent * at).length() > CROSSING_TOLERANCE {
-                return None;
-            }
-            at
-        } else {
-            let centre = self.centre();
-            let (from, to) = (self.start - centre, point - centre);
-            if (to.length() - self.radius()).abs() > CROSSING_TOLERANCE {
-                return None;
-            }
-            driven(turn_of(from, to).atan2(from.dot(to)), self.curvature) / self.curvature
-        };
-
-        (at >= -CROSSING_TOLERANCE && at <= self.length + CROSSING_TOLERANCE)
-            .then(|| at.clamp(0., self.length))
+        let at = self.nearest_to(point);
+        (self.position(at).distance(point) <= CROSSING_TOLERANCE).then_some(at)
     }
 
     /// The same arc driven the other way, for the lane that runs back down the road.
@@ -945,6 +948,95 @@ fn reaches_a_road(placed: &DrawnRoad, roads: &Query<&Road>) -> bool {
     roads.iter().any(|road| road.nodes.contains(reached))
 }
 
+/// Take the arc under the cursor off the map when the player clicks the secondary button.
+///
+/// A road is its nodes, so an arc between two of them is what a removal takes, and what is left is
+/// the same road either side of it: derived from the same integers and the same direction it set
+/// off in, so nothing that survived has moved (invariant 6). The same click finishes a road being
+/// placed, which is what it is for while there is one, so nothing is taken off until there is not.
+fn remove_the_arc_under_the_cursor(
+    mut commands: Commands,
+    player_input: Res<PlayerInput>,
+    action: Res<State<PlayerAction>>,
+    occupied: Res<RoadTiles>,
+    placing: Query<&DrawnRoad>,
+    roads: Query<&Road>,
+) {
+    if !player_input.secondary_tap
+        || *action.get() != PlayerAction::EditRoads
+        || !placing.is_empty()
+    {
+        return;
+    }
+
+    let Some(at) = player_input.ground_cursor_position else {
+        return;
+    };
+    let Some((entity, taken, gone)) = the_arc_under(at, &occupied, &roads) else {
+        return;
+    };
+    let Ok(road) = roads.get(entity) else {
+        return;
+    };
+
+    commands.entity(entity).insert(Destroy);
+    for left in roads_left_by(road, taken, &gone) {
+        commands.spawn(left);
+    }
+}
+
+/// The road nearest `at`, which of its arcs is nearest, and that arc.
+///
+/// Only the roads over the tile `at` stands on are measured, by the key `RoadTiles` already holds,
+/// so a click is answered without walking a map of thousands of roads.
+fn the_arc_under(
+    at: Vec3,
+    occupied: &RoadTiles,
+    roads: &Query<&Road>,
+) -> Option<(Entity, usize, Arc)> {
+    occupied
+        .roads_over(HexCoordinates::from_world_position(at))
+        .iter()
+        .filter_map(|&road| Some((road, roads.get(road).ok()?)))
+        .flat_map(|(road, standing)| {
+            arcs_through(&standing.nodes, standing.leaving)
+                .into_iter()
+                .enumerate()
+                .map(move |(taken, arc)| (road, taken, arc))
+        })
+        .min_by(|(.., arc), (.., other)| distance_to(arc, at).total_cmp(&distance_to(other, at)))
+}
+
+/// How far `point` stands from the nearest place on `arc`.
+fn distance_to(arc: &Arc, point: Vec3) -> f32 {
+    arc.position(arc.nearest_to(point)).distance_squared(point)
+}
+
+/// The roads left when the arc `taken` of `road`, which is `gone`, is taken off it.
+///
+/// A road of one arc leaves nothing behind, and one that loses an arc at either end leaves the
+/// rest of itself whole rather than a road and a node. The far half sets off along the tangent the
+/// removed arc ended on, which is the one the arc after it was built from, so each half derives
+/// the arcs it already had rather than a refitted curve through the same nodes.
+fn roads_left_by(road: &Road, taken: usize, gone: &Arc) -> Vec<Road> {
+    let mut left = Vec::new();
+    if taken > 0 {
+        left.push(Road {
+            nodes: road.nodes[..=taken].to_vec(),
+            leaving: road.leaving,
+            one_way: road.one_way,
+        });
+    }
+    if taken + 2 < road.nodes.len() {
+        left.push(Road {
+            nodes: road.nodes[taken + 1..].to_vec(),
+            leaving: Some(gone.tangent_at(gone.length)),
+            one_way: road.one_way,
+        });
+    }
+    left
+}
+
 /// Put a junction wherever a road just laid crosses one that was already there.
 ///
 /// It runs beside the initialization that lays a road, so the crossing is worked out from the arcs
@@ -1381,6 +1473,32 @@ fn draw_the_road_being_placed(
             ),
         }
     }
+}
+
+/// Draw the arc a secondary click would take off the map.
+///
+/// One arc of a road looks like the one beside it, and which of them the click would take is a
+/// measurement from the cursor rather than anything standing on the ground, so a player who cannot
+/// see it finds out by losing the wrong one (invariant 5). Nothing is drawn while a road is being
+/// placed, because that is what the click does instead.
+fn draw_the_arc_the_cursor_would_remove(
+    mut gizmos: Gizmos<DebugGizmos>,
+    player_input: Res<PlayerInput>,
+    action: Res<State<PlayerAction>>,
+    occupied: Res<RoadTiles>,
+    placing: Query<&DrawnRoad>,
+    roads: Query<&Road>,
+) {
+    if *action.get() != PlayerAction::EditRoads || !placing.is_empty() {
+        return;
+    }
+    let Some(at) = player_input.ground_cursor_position else {
+        return;
+    };
+    let Some((.., arc)) = the_arc_under(at, &occupied, &roads) else {
+        return;
+    };
+    gizmos.linestrip(sampled(&arc), REMOVING_COLOUR);
 }
 
 /// Which way the road being placed is pointing, which is nothing before it has been aimed at all.
@@ -3593,5 +3711,301 @@ mod tests {
             standing.distance(corner) < TOLERANCE,
             "served at {standing}, not at the corner {corner} the lane sets off from"
         );
+    }
+
+    /// A straight run whose arcs cross tiles neither of their nodes stands on, in offset-row
+    /// coordinates. Removing the first of them gives back ground no surviving node stands on.
+    const SPANNING_RUN: [(i32, i32); 3] = [(0, 0), (5, 0), (10, 0)];
+
+    /// A tile far enough from anything laid that no road runs over it, in offset-row coordinates.
+    const OFF_THE_MAP: (i32, i32) = (-6, -6);
+
+    /// Right-click on the ground at `at`, and take the frame that reads it and the one after it.
+    ///
+    /// A right click is a secondary tap and a finish at once, which is what the mouse reports, so
+    /// a test of removing a road is also a test of not finishing one. The frame after is what lays
+    /// the roads a removal left and cuts them where they cross.
+    fn right_click_at(app: &mut App, at: Vec3) {
+        {
+            let mut input = app.world_mut().resource_mut::<PlayerInput>();
+            input.ground_cursor_position = Some(at);
+            input.secondary_tap = true;
+            input.finish = true;
+        }
+        tick(app);
+        {
+            let mut input = app.world_mut().resource_mut::<PlayerInput>();
+            input.secondary_tap = false;
+            input.finish = false;
+        }
+        tick(app);
+    }
+
+    /// Half way along the straight between the `index`th node of `offsets` and the one after it.
+    fn middle_of(offsets: &[(i32, i32)], index: usize) -> Vec3 {
+        let run = nodes(offsets);
+        (run[index].world_position() + run[index + 1].world_position()) / 2.
+    }
+
+    /// `STRAIGHT` and an arm laid across the middle of it, with the road tool held.
+    fn a_crossed_road_to_edit() -> App {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        spawn_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+        spawn_road_through(&mut app, &crossing_arm(STRAIGHT[1]));
+        tick(&mut app);
+        app
+    }
+
+    /// The arc under every segment in the world, whichever road it belongs to.
+    fn arcs_in_the_world(app: &mut App) -> Vec<Arc> {
+        app.world_mut()
+            .query::<&RoadSegment>()
+            .iter(app.world())
+            .map(|segment| segment.arc)
+            .collect()
+    }
+
+    /// Whether any segment in the world covers the place `at`.
+    fn a_segment_stands_at(app: &mut App, at: Vec3) -> bool {
+        app.world_mut()
+            .query::<&RoadSegment>()
+            .iter(app.world())
+            .any(|segment| {
+                segment
+                    .arc
+                    .distance_along(at)
+                    .is_some_and(|along| along >= segment.from && along <= segment.to)
+            })
+    }
+
+    fn all_roads(app: &mut App) -> Vec<Entity> {
+        app.world_mut()
+            .query_filtered::<Entity, With<Road>>()
+            .iter(app.world())
+            .collect()
+    }
+
+    #[test]
+    fn removing_the_arc_under_the_cursor_leaves_the_road_either_side_of_it() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        spawn_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+
+        right_click_at(&mut app, middle_of(&STRAIGHT, 1));
+
+        assert_eq!(roads_in_the_world(&mut app), 2);
+        assert!(a_road_runs_through(&mut app, &STRAIGHT[..2]));
+        assert!(a_road_runs_through(&mut app, &STRAIGHT[2..]));
+    }
+
+    #[test]
+    fn the_arcs_either_side_of_the_one_removed_stand_exactly_where_they_did() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        let road = spawn_road(&mut app, &WINDING);
+        tick(&mut app);
+        let before = arcs_under(&app, road);
+
+        right_click_at(&mut app, middle_of(&WINDING, 1));
+
+        let after = arcs_in_the_world(&mut app);
+        assert!(!after.is_empty(), "a removal that left nothing standing");
+        for arc in after {
+            assert!(before.contains(&arc), "an arc that moved: {arc:?}");
+        }
+    }
+
+    #[test]
+    fn nothing_stands_where_the_arc_that_went_stood() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        spawn_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+        let taken = middle_of(&STRAIGHT, 1);
+        assert!(a_segment_stands_at(&mut app, taken));
+
+        right_click_at(&mut app, taken);
+
+        assert!(!a_segment_stands_at(&mut app, taken));
+    }
+
+    #[test]
+    fn removing_the_arc_at_the_end_of_a_road_leaves_the_rest_of_it_whole() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        spawn_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+
+        right_click_at(&mut app, middle_of(&STRAIGHT, 2));
+
+        assert_eq!(roads_in_the_world(&mut app), 1);
+        assert!(a_road_runs_through(&mut app, &STRAIGHT[..3]));
+    }
+
+    #[test]
+    fn removing_the_only_arc_of_a_road_takes_the_road_with_it() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        spawn_road(&mut app, &STRAIGHT[..2]);
+        tick(&mut app);
+
+        right_click_at(&mut app, middle_of(&STRAIGHT, 0));
+
+        assert_eq!(roads_in_the_world(&mut app), 0);
+        assert_eq!(segments_in_the_world(&mut app), 0);
+    }
+
+    #[test]
+    fn removing_every_arc_of_a_road_takes_the_road_off_the_map() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        spawn_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+
+        for arc in [1, 0, 2] {
+            right_click_at(&mut app, middle_of(&STRAIGHT, arc));
+        }
+
+        assert_eq!(roads_in_the_world(&mut app), 0);
+        assert_eq!(segments_in_the_world(&mut app), 0);
+    }
+
+    #[test]
+    fn nothing_in_the_network_points_at_a_segment_that_went() {
+        let mut app = a_crossed_road_to_edit();
+
+        right_click_at(&mut app, middle_of(&STRAIGHT, 1));
+
+        let standing: HashSet<Entity> = app
+            .world_mut()
+            .query_filtered::<Entity, With<RoadSegment>>()
+            .iter(app.world())
+            .collect();
+        let onward: Vec<Entity> = app
+            .world_mut()
+            .query::<&NextSegment>()
+            .iter(app.world())
+            .map(|next| next.0)
+            .collect();
+        assert!(!onward.is_empty(), "a network of nothing to drive");
+        for next in onward {
+            assert!(standing.contains(&next), "a segment onto nothing: {next}");
+        }
+    }
+
+    #[test]
+    fn no_segment_runs_into_a_junction_that_went() {
+        let mut app = a_crossed_road_to_edit();
+
+        right_click_at(&mut app, middle_of(&STRAIGHT, 1));
+
+        let standing: HashSet<Entity> = app
+            .world_mut()
+            .query_filtered::<Entity, With<Junction>>()
+            .iter(app.world())
+            .collect();
+        let reached: Vec<Entity> = app
+            .world_mut()
+            .query::<&EndsAtJunction>()
+            .iter(app.world())
+            .map(|ends| ends.junction)
+            .collect();
+        for junction in reached {
+            assert!(
+                standing.contains(&junction),
+                "a segment into nothing: {junction}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tiles_under_the_arc_that_went_take_a_road_again() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        spawn_road(&mut app, &SPANNING_RUN);
+        tick(&mut app);
+        assert!(
+            !roads_over(&app, IN_THE_WAY).is_empty(),
+            "a tile the run misses"
+        );
+
+        right_click_at(&mut app, middle_of(&SPANNING_RUN, 0));
+
+        assert!(roads_over(&app, IN_THE_WAY).is_empty());
+    }
+
+    #[test]
+    fn a_junction_a_removal_leaves_on_one_road_is_no_longer_a_junction() {
+        let mut app = a_crossed_road_to_edit();
+        assert_eq!(junctions(&mut app).len(), 1);
+
+        right_click_at(&mut app, middle_of(&STRAIGHT, 1));
+
+        assert!(junctions(&mut app).is_empty());
+    }
+
+    #[test]
+    fn a_junction_away_from_a_removal_keeps_the_legs_it_had() {
+        let mut app = a_crossed_road_to_edit();
+        let (before, _) = the_junction(&mut app);
+        let legs = the_legs(&mut app).len();
+
+        right_click_at(&mut app, middle_of(&STRAIGHT, 0));
+
+        let (after, _) = the_junction(&mut app);
+        assert!(
+            after.distance(before) < TOLERANCE,
+            "a junction at {after}, having stood at {before}"
+        );
+        assert_eq!(the_legs(&mut app).len(), legs);
+    }
+
+    #[test]
+    fn a_one_way_road_a_removal_splits_leaves_two_one_way_roads() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        spawn_one_way_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+
+        right_click_at(&mut app, middle_of(&STRAIGHT, 1));
+
+        let left = all_roads(&mut app);
+        assert_eq!(left.len(), 2);
+        for road in left {
+            assert_eq!(lanes(&app, road).len(), 1);
+        }
+    }
+
+    #[test]
+    fn right_clicking_while_a_road_is_being_placed_finishes_it_and_removes_nothing() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        spawn_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+        for node in nodes(&ONWARD) {
+            click_at(&mut app, node);
+        }
+
+        right_click_at(&mut app, middle_of(&STRAIGHT, 1));
+
+        assert!(a_road_runs_through(&mut app, &STRAIGHT));
+        assert!(a_road_runs_through(&mut app, &ONWARD));
+    }
+
+    #[test]
+    fn right_clicking_where_no_road_runs_removes_nothing() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        spawn_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+
+        right_click_at(&mut app, centre_of(OFF_THE_MAP).world_position());
+
+        assert!(a_road_runs_through(&mut app, &STRAIGHT));
+        assert_eq!(roads_in_the_world(&mut app), 1);
+    }
+
+    #[test]
+    fn right_clicking_while_another_tool_is_held_removes_nothing() {
+        let mut app = road_app();
+        spawn_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+
+        right_click_at(&mut app, middle_of(&STRAIGHT, 1));
+
+        assert!(a_road_runs_through(&mut app, &STRAIGHT));
+        assert_eq!(roads_in_the_world(&mut app), 1);
     }
 }
