@@ -194,6 +194,7 @@ fn draw_the_rovers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::building::BuildingPlugin;
     use crate::common::cleanup::CleanupPlugin;
     use crate::diagnostics::DebugGizmosPlugin;
     use crate::input::{PlayerAction, PlayerInput};
@@ -249,6 +250,7 @@ mod tests {
                 CleanupPlugin,
                 RoadPlugin,
                 RoverPlugin,
+                BuildingPlugin,
             ));
         app
     }

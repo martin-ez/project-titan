@@ -1,3 +1,4 @@
+use crate::building::BuildingTiles;
 use crate::common::cleanup::DestroyOnStateChange;
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use crate::diagnostics::DebugGizmos;
@@ -256,7 +257,7 @@ impl Plugin for RoadPlugin {
                     draw_the_junctions,
                     draw_the_road_being_placed,
                     draw_the_occupied_tiles,
-                    draw_the_road_under_the_cursor,
+                    draw_the_taken_tile_under_the_cursor,
                 ),
             );
     }
@@ -599,11 +600,13 @@ fn stretches_of(arc: &Arc) -> Vec<(f32, f32)> {
 /// The first click lays nothing: it says where the road begins, and it inherits the direction of
 /// the road it began on where there is one, so a road joined onto another leaves it without a
 /// kink. Every click after it aims the one arc that leaves the node before along the direction the
-/// road arrived on, and a target that arc cannot turn tightly enough to reach is refused.
+/// road arrived on, and a target that arc cannot turn tightly enough to reach is refused, as is
+/// one whose arc would run over ground a building stands on.
 fn place_a_node(
     mut commands: Commands,
     player_input: Res<PlayerInput>,
     action: Res<State<PlayerAction>>,
+    buildings: Res<BuildingTiles>,
     roads: Query<&Road>,
     mut placing: Query<&mut DrawnRoad>,
 ) {
@@ -615,6 +618,9 @@ fn place_a_node(
     };
 
     let Some(mut placing) = placing.iter_mut().next() else {
+        if stands_on_a_building(target.world_position(), &buildings) {
+            return;
+        }
         commands.spawn(DrawnRoad {
             nodes: vec![target],
             leaving: direction_leaving(target, &roads),
@@ -622,14 +628,23 @@ fn place_a_node(
         return;
     };
 
-    if placing.nodes.last() == Some(&target) || proposed_arc(&placing, target).is_none() {
+    if placing.nodes.last() == Some(&target) || proposed_arc(&placing, target, &buildings).is_none()
+    {
         return;
     }
     placing.nodes.push(target);
 }
 
-/// The arc a click on `target` would lay, or nothing where no arc can turn tightly enough.
-fn proposed_arc(placing: &DrawnRoad, target: LatticeNode) -> Option<Arc> {
+/// The arc a click on `target` would lay, or nothing where the road tool refuses it.
+///
+/// It refuses a target no arc can turn tightly enough to reach, and one whose arc would run over a
+/// tile a building stands on. Both answers come from here, so the tool says no in one voice and
+/// draws the refusal the same way whichever of them it is.
+fn proposed_arc(
+    placing: &DrawnRoad,
+    target: LatticeNode,
+    buildings: &BuildingTiles,
+) -> Option<Arc> {
     let standing = placing.nodes.last()?.world_position();
     let target = target.world_position();
     let arcs = arcs_through(&placing.nodes, placing.leaving);
@@ -641,7 +656,25 @@ fn proposed_arc(placing: &DrawnRoad, target: LatticeNode) -> Option<Arc> {
     };
 
     let arc = Arc::through(standing, tangent, target);
-    (arc.curvature.abs() * MIN_TURN_RADIUS <= 1.).then_some(arc)
+    (arc.curvature.abs() * MIN_TURN_RADIUS <= 1. && nothing_stands_under(&arc, buildings))
+        .then_some(arc)
+}
+
+/// Whether the tiles `arc` would take are clear of buildings.
+///
+/// The arc is walked the way the tiles it claims are walked once it is laid, so what the road tool
+/// refuses and what the road would occupy are the same tiles rather than two measurements of it.
+/// It is asked of an arc that does not exist yet, which is why it walks one rather than reading a
+/// road's claim back.
+fn nothing_stands_under(arc: &Arc, buildings: &BuildingTiles) -> bool {
+    !walk_of(arc).any(|at| stands_on_a_building(arc.position(at), buildings))
+}
+
+/// Whether a building stands on the tile `position` falls on.
+fn stands_on_a_building(position: Vec3, buildings: &BuildingTiles) -> bool {
+    buildings
+        .building_on(HexCoordinates::from_world_position(position))
+        .is_some()
 }
 
 /// The direction a road already at `node` sets off from it, where `node` is an end of one.
@@ -972,6 +1005,7 @@ fn forget_a_removed_road_at_the_junctions_on_it(
 fn draw_the_road_being_placed(
     mut gizmos: Gizmos<DebugGizmos>,
     player_input: Res<PlayerInput>,
+    buildings: Res<BuildingTiles>,
     placing: Query<&DrawnRoad>,
 ) {
     for placed in &placing {
@@ -996,7 +1030,7 @@ fn draw_the_road_being_placed(
         let Some(target) = player_input.cursor_node else {
             continue;
         };
-        match proposed_arc(placed, target) {
+        match proposed_arc(placed, target, &buildings) {
             Some(arc) => gizmos.linestrip(sampled(&arc), PROPOSAL_COLOUR),
             None => gizmos.line(
                 standing + GIZMO_LIFT,
@@ -1068,14 +1102,16 @@ fn draw_the_occupied_tiles(
     }
 }
 
-/// Mark the tile under the cursor when a road already runs over it.
+/// Mark the tile under the cursor when something already stands on it.
 ///
-/// This is the tile question asked from the other end, and the one building placement refuses a
-/// building with.
-/// Reading it off a road would mean reading every road, which is what the tile is keyed for.
-fn draw_the_road_under_the_cursor(
+/// A road running over it is the tile question building placement refuses a building with; a
+/// building on it is the same question the other way round, and is what the road tool refuses a
+/// first click with — which lays no arc and so has no proposal to draw red. Reading either off the
+/// things themselves would mean reading every one of them, which is what the tile is keyed for.
+fn draw_the_taken_tile_under_the_cursor(
     mut gizmos: Gizmos<DebugGizmos>,
     occupied: Res<RoadTiles>,
+    buildings: Res<BuildingTiles>,
     player_input: Res<PlayerInput>,
     tiles: Query<&MapTile>,
 ) {
@@ -1086,7 +1122,7 @@ fn draw_the_road_under_the_cursor(
     else {
         return;
     };
-    if occupied.roads_over(tile).is_empty() {
+    if occupied.roads_over(tile).is_empty() && buildings.building_on(tile).is_none() {
         return;
     }
 
@@ -1133,6 +1169,7 @@ fn draw_the_lanes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::building::BuildingPlugin;
     use crate::common::cleanup::CleanupPlugin;
     use crate::common::initialize::InitializationFailed;
     use crate::diagnostics::DebugGizmosPlugin;
@@ -1181,6 +1218,15 @@ mod tests {
         [(0, 0), (-6, -1)],
     ];
 
+    /// A run whose arc crosses tiles its two nodes do not stand on, in offset-row coordinates.
+    const ACROSS_THE_TILES: [(i32, i32); 2] = SPANNING[0];
+
+    /// A tile the run of `ACROSS_THE_TILES` crosses on its way, in offset-row coordinates.
+    const IN_THE_WAY: (i32, i32) = (3, 0);
+
+    /// A tile the run of `ACROSS_THE_TILES` passes beside, in offset-row coordinates.
+    const OFF_TO_THE_SIDE: (i32, i32) = (3, 1);
+
     /// A run of tiles setting off from the last tile of `STRAIGHT`, in offset-row coordinates.
     const ONWARD: [(i32, i32); 2] = [(3, 0), (3, 1)];
 
@@ -1202,7 +1248,7 @@ mod tests {
         let mut app = headless_app();
         app.insert_state(tool)
             .insert_resource(PlayerInput::default())
-            .add_plugins((DebugGizmosPlugin, CleanupPlugin, RoadPlugin));
+            .add_plugins((DebugGizmosPlugin, CleanupPlugin, RoadPlugin, BuildingPlugin));
         app
     }
 
@@ -1758,6 +1804,130 @@ mod tests {
         finish_the_road(&mut app);
 
         assert!(a_road_runs_through(&mut app, &STRAIGHT[..2]));
+    }
+
+    /// Pick up `tool`, and take the frame the change lands on.
+    fn take_up(app: &mut App, tool: PlayerAction) {
+        app.world_mut()
+            .resource_mut::<NextState<PlayerAction>>()
+            .set(tool);
+        tick(app);
+    }
+
+    /// Put a building on the tile at `offset`, and give the road tool back.
+    ///
+    /// The building tool is what places one, so the test picks it up the way a player does rather
+    /// than writing the building into the world behind the rule that refuses it.
+    fn put_a_building_on(app: &mut App, offset: (i32, i32)) -> Entity {
+        let (col, row) = offset;
+        let tile = app
+            .world_mut()
+            .spawn(MapTile {
+                coordinates: HexCoordinates::from_offset_row(col, row),
+            })
+            .id();
+        take_up(app, PlayerAction::EditBuildings);
+        tap_on(app, tile);
+        take_up(app, PlayerAction::EditRoads);
+        tile
+    }
+
+    /// Take the building on `tile` off again, with the tool that put it there.
+    fn take_the_building_off(app: &mut App, tile: Entity) {
+        take_up(app, PlayerAction::EditBuildings);
+        {
+            let mut input = app.world_mut().resource_mut::<PlayerInput>();
+            input.secondary_tap = true;
+            input.cursor_tile = Some(tile);
+        }
+        tick(app);
+        {
+            let mut input = app.world_mut().resource_mut::<PlayerInput>();
+            input.secondary_tap = false;
+            input.cursor_tile = None;
+        }
+        take_up(app, PlayerAction::EditRoads);
+    }
+
+    /// Click on `tile` with the tool in hand, and take the frame that reads the click.
+    fn tap_on(app: &mut App, tile: Entity) {
+        {
+            let mut input = app.world_mut().resource_mut::<PlayerInput>();
+            input.tap = true;
+            input.cursor_tile = Some(tile);
+        }
+        tick(app);
+        {
+            let mut input = app.world_mut().resource_mut::<PlayerInput>();
+            input.tap = false;
+            input.cursor_tile = None;
+        }
+    }
+
+    #[test]
+    fn an_arc_drawn_across_a_tile_a_building_stands_on_is_not_laid() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        put_a_building_on(&mut app, IN_THE_WAY);
+        let across = nodes(&ACROSS_THE_TILES);
+
+        click_at(&mut app, across[0]);
+        click_at(&mut app, across[1]);
+        finish_the_road(&mut app);
+
+        assert_eq!(roads_in_the_world(&mut app), 0);
+    }
+
+    #[test]
+    fn the_arcs_placed_before_the_building_are_kept() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        put_a_building_on(&mut app, IN_THE_WAY);
+        let reached = [ACROSS_THE_TILES[0], (1, 0)];
+
+        for &node in &nodes(&reached) {
+            click_at(&mut app, node);
+        }
+        click_at(&mut app, nodes(&ACROSS_THE_TILES)[1]);
+        finish_the_road(&mut app);
+
+        assert!(a_road_runs_through(&mut app, &reached));
+    }
+
+    #[test]
+    fn an_arc_that_passes_beside_a_building_is_laid() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        put_a_building_on(&mut app, OFF_TO_THE_SIDE);
+
+        place_road(&mut app, &nodes(&ACROSS_THE_TILES));
+
+        let road = road_through(&mut app, &ACROSS_THE_TILES);
+        let beside = HexCoordinates::from_offset_row(OFF_TO_THE_SIDE.0, OFF_TO_THE_SIDE.1);
+        let occupied = occupied_tiles(&app, road);
+        assert!(!occupied.contains(&beside), "{occupied:?}");
+        assert!(
+            occupied.iter().any(|&tile| are_neighbours(tile, beside)),
+            "{occupied:?} runs nowhere near the building"
+        );
+    }
+
+    #[test]
+    fn a_road_cannot_be_begun_on_a_tile_a_building_stands_on() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        put_a_building_on(&mut app, ACROSS_THE_TILES[0]);
+
+        click_at(&mut app, nodes(&ACROSS_THE_TILES)[0]);
+
+        assert_eq!(placing(&mut app), 0);
+    }
+
+    #[test]
+    fn a_route_a_building_blocked_is_drawable_once_it_is_taken_away() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        let tile = put_a_building_on(&mut app, IN_THE_WAY);
+        take_the_building_off(&mut app, tile);
+
+        place_road(&mut app, &nodes(&ACROSS_THE_TILES));
+
+        assert!(a_road_runs_through(&mut app, &ACROSS_THE_TILES));
     }
 
     #[test]
