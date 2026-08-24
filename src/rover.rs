@@ -3,7 +3,8 @@ use crate::common::initialize::{initialize_system, Initialize, NeedsInitializati
 use crate::diagnostics::DebugGizmos;
 use crate::map::MAP_TILE_SIZE;
 use crate::road::{
-    EndsAtJunction, JunctionLegs, JunctionPolicy, NextSegment, RoadSegment, SegmentCut,
+    EndsAtJunction, JunctionLegs, JunctionPolicy, NextSegment, RoadEndpoint, RoadSegment,
+    SegmentCut,
 };
 use crate::simulation::{Simulation, Ticks};
 use bevy::ecs::system::SystemParam;
@@ -42,6 +43,15 @@ const HELD_MARK: f32 = 1.5;
 
 /// How far along the way out of a junction the arrow onto it reaches, in world units.
 const WAY_OUT_REACH: f32 = 1.;
+
+/// The colour the way to a rover's destination is drawn in
+const ROUTE_COLOUR: Color = Color::srgb(0.4, 0.85, 0.6);
+
+/// The colour a rover that cannot drive the route it holds is marked in
+const STRANDED_COLOUR: Color = Color::srgb(0.95, 0.25, 0.6);
+
+/// How tall the mark over a rover that cannot drive the route it holds stands.
+const STRANDED_MARK: f32 = 2.;
 
 /// The rovers on the map, and where on the road each of them stands.
 ///
@@ -93,13 +103,12 @@ pub struct Cargo {
 ///
 /// The ways out are the whole of the route, because the lane decides everything else: a rover
 /// follows the segments ahead of it until one runs into a junction, and only there is there
-/// anything to choose. What is left of the list is what it has yet to take, so a route is spent as
-/// it is driven and a road with no junction on it is driven on an empty one.
+/// anything to choose. What is left of the list is what it has yet to take, so a road with no
+/// junction on it is driven on an empty route.
 ///
-/// They are segments rather than turns because a segment is what survives the road being built
-/// across: a cut leaves the stretch before it holding the entity and the distance it started at,
-/// so a route laid over stays the route it was (invariant 6). Finding one is #6's; this is only
-/// carrying one out.
+/// They are segments rather than turns because a segment is what survives a road built across it:
+/// the cut leaves the stretch before it holding the entity and the distance it started at, so a
+/// route stays the route it was (invariant 6).
 #[derive(Component)]
 pub struct Route {
     /// The endpoint the rover drives to, stops at, and leaves its load at.
@@ -132,7 +141,11 @@ impl Plugin for RoverPlugin {
             .add_systems(PreUpdate, initialize_system::<Rover, RoverInitializeParams>)
             .add_systems(
                 FixedUpdate,
-                (let_the_rovers_through, drive_the_rovers)
+                (
+                    let_the_rovers_through,
+                    drive_the_rovers,
+                    hand_the_load_to_the_endpoint_it_was_driven_to,
+                )
                     .chain()
                     .in_set(Simulation),
             )
@@ -140,7 +153,12 @@ impl Plugin for RoverPlugin {
                 Update,
                 (
                     stand_the_rovers_on_their_segments,
-                    (draw_the_rovers, draw_the_rovers_a_junction_holds),
+                    (
+                        draw_the_rovers,
+                        draw_the_rovers_a_junction_holds,
+                        draw_where_the_rovers_are_going,
+                        draw_the_loads_standing_at_the_endpoints,
+                    ),
                 )
                     .chain(),
             );
@@ -171,20 +189,26 @@ impl Initialize<RoverInitializeParams<'_, '_>> for Rover {
 ///
 /// One a tick, so a junction is a place where traffic has to take its turn rather than a point
 /// rovers pass through together. Which leg goes is the policy's answer and the tick's rotation,
-/// never the order the world stores its rovers in (invariant 2); which way out it takes is the
-/// junction's to say. The ones not let through keep their place and their arrival, so the longest
-/// wait on a leg is served first when its turn comes.
+/// never the order the world stores its rovers in (invariant 2); which ways out are open is the
+/// junction's to say and which is taken is the route's. The ones not let through keep their place
+/// and their arrival, so the longest wait on a leg is served first when its turn comes.
+///
+/// A rover already stranded is not offered a turn: it is going nowhere either way, and a leg whose
+/// turn is spent every tick on the same rover is a leg no other rover ever leaves by.
 fn let_the_rovers_through(
     mut commands: Commands,
     ticks: Res<Ticks>,
     junctions: Query<(&JunctionLegs, &JunctionPolicy)>,
     segments: Query<(&RoadSegment, Option<&EndsAtJunction>)>,
-    mut rovers: Query<(Entity, &mut Rover, &WaitingAtJunction)>,
+    mut rovers: Query<
+        (Entity, &mut Rover, &WaitingAtJunction, Option<&mut Route>),
+        Without<Stranded>,
+    >,
     mut held: Local<Vec<(Entity, usize, u64, Entity)>>,
     mut legs_waiting: Local<Vec<usize>>,
 ) {
     held.clear();
-    for (entity, rover, wait) in &rovers {
+    for (entity, rover, wait, _) in &rovers {
         let Ok(ends) = segments.get(rover.segment).map(|(_, ends)| ends) else {
             continue;
         };
@@ -216,20 +240,39 @@ fn let_the_rovers_through(
         let Some(&(.., rover)) = queue.iter().find(|&&(_, waiting, ..)| waiting == leg) else {
             continue;
         };
-        let Some(&out) = legs.exits_from(leg).first() else {
+        let open = legs.exits_from(leg);
+        let Ok((_, mut let_through, _, route)) = rovers.get_mut(rover) else {
+            continue;
+        };
+        let Some(out) = the_way_out_taken(route, &open) else {
+            commands.entity(rover).insert_if_new(Stranded);
             continue;
         };
 
         let Ok((exit, _)) = segments.get(out) else {
             continue;
         };
-        let starts_at = exit.starts_at();
-        if let Ok((_, mut let_through, _)) = rovers.get_mut(rover) {
-            let_through.segment = out;
-            let_through.along = starts_at;
-        }
+        let_through.segment = out;
+        let_through.along = exit.starts_at();
         commands.entity(rover).remove::<WaitingAtJunction>();
     }
+}
+
+/// Which of the ways `open` to a rover it leaves the junction by, spending its route if it has one.
+///
+/// A route names every junction it passes, so one with nothing left to say at a junction is as
+/// undrivable as one naming a turn the junction refuses, and neither is a route to carry on down.
+fn the_way_out_taken(route: Option<Mut<Route>>, open: &[Entity]) -> Option<Entity> {
+    let Some(mut route) = route else {
+        return open.first().copied();
+    };
+    let taken = route
+        .ways_out
+        .first()
+        .copied()
+        .filter(|way| open.contains(way))?;
+    route.ways_out.remove(0);
+    Some(taken)
 }
 
 /// Hand every rover standing past a cut onto the stretch of road beyond it.
@@ -276,34 +319,56 @@ fn take_the_rovers_off_a_removed_segment(
 /// Drive every rover along its lane, at whatever each segment it crosses allows.
 ///
 /// A tick buys a rover an amount of time rather than an amount of ground, and it is spent segment
-/// by segment: what is left of the tick when a rover reaches the end of one is carried onto the
-/// next and spent at the next one's speed limit, so a rover joining a curve slows down on the
-/// curve rather than a tick early. A rover that runs out of road stops at the end of it, which is
-/// what a rover whose road ahead was removed under it does.
+/// by segment: what is left when it reaches the end of one is carried onto the next and spent at
+/// that one's speed limit, so a rover joining a curve slows down on the curve, not a tick early.
 ///
-/// A segment ending at a junction is where the driving stops too: the way on is the junction's to
-/// give rather than the lane's, so the rover stands at the end and waits to be let through.
+/// Four things stop it short of the road ahead: the lane running out, which is where a rover whose
+/// road was removed stands; a junction, whose way on is its own to give; its destination, where
+/// the route it still holds parks it; and a route it cannot drive, which strands it where it is.
 fn drive_the_rovers(
     mut commands: Commands,
     ticks: Res<Ticks>,
-    mut rovers: Query<(Entity, &mut Rover)>,
+    mut rovers: Query<(Entity, &mut Rover, Option<&Route>), Without<Stranded>>,
     segments: Query<(&RoadSegment, Option<&NextSegment>, Option<&EndsAtJunction>)>,
+    endpoints: Query<&RoadEndpoint>,
 ) {
-    for (entity, mut rover) in &mut rovers {
+    for (entity, mut rover, route) in &mut rovers {
+        let stops_at = match route {
+            None => None,
+            Some(route) => {
+                let bound_for = endpoints
+                    .get(route.destination)
+                    .ok()
+                    .and_then(RoadEndpoint::served_by);
+                let Some(served) = bound_for else {
+                    commands.entity(entity).insert_if_new(Stranded);
+                    continue;
+                };
+                Some(served)
+            }
+        };
+
         let mut left = 1.;
         for _ in 0..HANDOVERS_PER_TICK {
             let Ok((segment, next, junction)) = segments.get(rover.segment) else {
                 break;
             };
-            let crossing = (segment.ends_at() - rover.along) / segment.speed_limit();
+            let arriving = stops_at
+                .filter(|served| served.segment == rover.segment && served.along >= rover.along)
+                .map(|served| served.along);
+            let ends_at = arriving.unwrap_or_else(|| segment.ends_at());
+            let crossing = (ends_at - rover.along) / segment.speed_limit();
             if crossing > left {
                 rover.along += left * segment.speed_limit();
                 break;
             }
 
             left -= crossing;
+            rover.along = ends_at;
+            if arriving.is_some() {
+                break;
+            }
             if junction.is_some() {
-                rover.along = segment.ends_at();
                 commands
                     .entity(entity)
                     .insert_if_new(WaitingAtJunction { since: ticks.0 });
@@ -315,11 +380,47 @@ fn drive_the_rovers(
                     rover.along = from;
                 }
                 None => {
-                    rover.along = segment.ends_at();
+                    if stops_at.is_some() {
+                        commands.entity(entity).insert_if_new(Stranded);
+                    }
                     break;
                 }
             }
         }
+    }
+}
+
+/// Hand the load of every rover standing at its destination to whatever is built there.
+///
+/// This is invariant 1 coming due: what a building receives it receives because a rover drove a
+/// road to it, and here is where the load stops being the rover's. It is instant, and it happens
+/// once — the whole load goes, so a rover parked at the endpoint it delivered to is carrying
+/// nothing and has nothing left to hand over. Holding it there for a number of ticks nothing in
+/// the game measures would be a balance claim with no measurement behind it (2.3).
+fn hand_the_load_to_the_endpoint_it_was_driven_to(
+    mut commands: Commands,
+    rovers: Query<(Entity, &Rover, &Route, &Cargo)>,
+    endpoints: Query<&RoadEndpoint>,
+) {
+    for (entity, standing, route, load) in &rovers {
+        let arrived = endpoints
+            .get(route.destination)
+            .ok()
+            .and_then(RoadEndpoint::served_by)
+            .is_some_and(|served| {
+                served.segment == standing.segment && served.along == standing.along
+            });
+        if !arrived {
+            continue;
+        }
+
+        let quantity = load.quantity;
+        commands
+            .entity(route.destination)
+            .entry::<Cargo>()
+            .and_modify(move |mut held| held.quantity += quantity)
+            .or_insert(Cargo { quantity });
+        commands.entity(entity).remove::<Cargo>();
     }
 }
 
@@ -412,6 +513,77 @@ fn draw_the_rovers_a_junction_holds(
             HELD_COLOUR,
         );
     }
+}
+
+/// Draw where every rover on a route is bound, and mark the ones that will not get there.
+///
+/// A rover carrying out a delivery looks like a rover driving about, and a stranded one looks like
+/// a rover that has merely stopped. The arrow says what it was sent to do and its colour says
+/// whether it still can (invariant 5).
+fn draw_where_the_rovers_are_going(
+    mut gizmos: Gizmos<DebugGizmos>,
+    rovers: Query<(&Rover, &Route, Option<&Stranded>)>,
+    endpoints: Query<&RoadEndpoint>,
+    segments: Query<&RoadSegment>,
+) {
+    for (rover, route, stranded) in &rovers {
+        let Ok(segment) = segments.get(rover.segment) else {
+            continue;
+        };
+        let standing = segment.world_position(rover.along) + GIZMO_LIFT;
+        let Some(bound_for) = endpoints
+            .get(route.destination)
+            .ok()
+            .and_then(RoadEndpoint::served_by)
+            .and_then(|served| standing_place(served.segment, served.along, &segments))
+        else {
+            gizmos.line(
+                standing,
+                standing + Vec3::Y * STRANDED_MARK,
+                STRANDED_COLOUR,
+            );
+            continue;
+        };
+
+        let colour = if stranded.is_some() {
+            STRANDED_COLOUR
+        } else {
+            ROUTE_COLOUR
+        };
+        gizmos.arrow(standing, bound_for + GIZMO_LIFT, colour);
+    }
+}
+
+/// Draw what is standing at each endpoint, waiting to be taken or just delivered.
+///
+/// A load that changed hands is otherwise invisible: what it was left at looks the same holding a
+/// hundred as holding none, and a delivery landing is the one thing a road full of rovers is for
+/// (invariant 5).
+fn draw_the_loads_standing_at_the_endpoints(
+    mut gizmos: Gizmos<DebugGizmos>,
+    endpoints: Query<(&RoadEndpoint, &Cargo)>,
+    segments: Query<&RoadSegment>,
+) {
+    for (endpoint, load) in &endpoints {
+        let Some(standing) = endpoint
+            .served_by()
+            .and_then(|served| standing_place(served.segment, served.along, &segments))
+        else {
+            continue;
+        };
+
+        let standing = standing + GIZMO_LIFT;
+        gizmos.line(
+            standing,
+            standing + Vec3::Y * LOAD_MARK * load.quantity as f32,
+            LOAD_COLOUR,
+        );
+    }
+}
+
+/// Where on the ground a distance along a segment puts whatever holds it.
+fn standing_place(segment: Entity, along: f32, segments: &Query<&RoadSegment>) -> Option<Vec3> {
+    Some(segments.get(segment).ok()?.world_position(along))
 }
 
 #[cfg(test)]
