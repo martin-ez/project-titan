@@ -234,6 +234,7 @@ mod tests {
             .spawn(Road {
                 nodes,
                 leaving: None,
+                one_way: false,
             })
             .id();
         tick(app);
