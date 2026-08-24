@@ -78,16 +78,44 @@ struct WaitingAtJunction {
     since: u64,
 }
 
-/// What a rover is carrying, which is a quantity of nothing in particular.
+/// A load, on the rover carrying it or standing at the endpoint it was left at.
 ///
 /// Goods and recipes are #26's, and they come after traffic. Until then a load is opaque: enough
 /// for something to change hands and for a jam to be worth watching, and not enough for a
-/// production chain to be built on top of it. A rover carrying nothing has no `Cargo` at all.
+/// production chain to be built on top of it. Whatever holds nothing has no `Cargo` at all.
 #[derive(Component)]
 pub struct Cargo {
     /// How much of it there is.
     pub quantity: u32,
 }
+
+/// A delivery a rover was handed: where it takes its load, and how it gets there.
+///
+/// The ways out are the whole of the route, because the lane decides everything else: a rover
+/// follows the segments ahead of it until one runs into a junction, and only there is there
+/// anything to choose. What is left of the list is what it has yet to take, so a route is spent as
+/// it is driven and a road with no junction on it is driven on an empty one.
+///
+/// They are segments rather than turns because a segment is what survives the road being built
+/// across: a cut leaves the stretch before it holding the entity and the distance it started at,
+/// so a route laid over stays the route it was (invariant 6). Finding one is #6's; this is only
+/// carrying one out.
+#[derive(Component)]
+pub struct Route {
+    /// The endpoint the rover drives to, stops at, and leaves its load at.
+    pub destination: Entity,
+    /// The segments it has yet to leave a junction by, in the order it reaches them.
+    pub ways_out: Vec<Entity>,
+}
+
+/// A rover holding a route it cannot drive, standing wherever the route ran out under it.
+///
+/// A destination no road reaches, a junction that refuses the turn the route names, and a lane
+/// that stops short of the destination are the three ways that happens, and the alternatives to
+/// saying so are a rover driving off down whatever road it can reach and one quietly forgetting
+/// where it was going. Both look like a delivery still under way to anything waiting on it.
+#[derive(Component)]
+pub struct Stranded;
 
 #[derive(SystemParam)]
 struct RoverInitializeParams<'w, 's> {
@@ -394,7 +422,7 @@ mod tests {
     use crate::diagnostics::DebugGizmosPlugin;
     use crate::input::{PlayerAction, PlayerInput};
     use crate::map::{HexCoordinates, LatticeNode, MAP_TILE_INRADIUS};
-    use crate::road::{EndsAtJunction, JunctionLegs, Road, RoadEndpoint, RoadPlugin};
+    use crate::road::{EndsAtJunction, JunctionLegs, Road, RoadEndpoint, RoadPlugin, ServedBy};
     use crate::simulation::{SimulationPlugin, Ticks};
     use crate::testing::{advance, headless_app, tick};
     use std::time::Duration;
@@ -465,6 +493,30 @@ mod tests {
     /// More than the two segments between it and the gap take to cross, so a rover still holding a
     /// route through the gap has had every chance to drive into it.
     const TICKS_PAST_THE_GAP: u32 = 128;
+
+    /// The tile a delivery sets off from, in offset-row coordinates.
+    const COLLECTION: (i32, i32) = (0, 0);
+
+    /// The tile a delivery straight down one road is bound for, in offset-row coordinates.
+    const DELIVERY: (i32, i32) = (0, 6);
+
+    /// The tile the road crossing that one sets off from, in offset-row coordinates.
+    const ACROSS_FROM: (i32, i32) = (-2, 3);
+
+    /// The tile a delivery has to turn at the junction to reach, in offset-row coordinates.
+    const ACROSS: (i32, i32) = (2, 3);
+
+    /// A tile far enough from either road that nothing serves it, in offset-row coordinates.
+    const OFF_THE_NETWORK: (i32, i32) = (8, 8);
+
+    /// How much a rover carries on a delivery under test.
+    const LOAD: u32 = 3;
+
+    /// How many ticks a delivery is given to land before the test gives up on it.
+    const TICKS_TO_DELIVER: u32 = 4096;
+
+    /// How many ticks a rover that will not arrive is driven for before it is asked where it got to.
+    const TICKS_GOING_NOWHERE: u32 = 256;
 
     fn rover_app() -> App {
         let mut app = headless_app();
@@ -1440,5 +1492,278 @@ mod tests {
             standing.distance(corner.world_position()) < TOLERANCE,
             "the rover stands at {standing}, not on the node {corner:?} serving the endpoint"
         );
+    }
+
+    /// The tile at `offset` of an offset-row layout.
+    fn tile(offset: (i32, i32)) -> HexCoordinates {
+        HexCoordinates::from_offset_row(offset.0, offset.1)
+    }
+
+    /// Lay a road between the corner of each of two tiles that faces the other.
+    ///
+    /// A road drawn through tile middles serves no tile at all, a middle never being a corner, so
+    /// every road a delivery is tested on runs corner to corner and puts both tiles on the
+    /// network.
+    fn lay_road_between(app: &mut App, from: (i32, i32), to: (i32, i32)) {
+        let (from, to) = (tile(from), tile(to));
+        app.world_mut().spawn(Road {
+            nodes: vec![
+                LatticeNode::nearest_on(from, to.world_position()),
+                LatticeNode::nearest_on(to, from.world_position()),
+            ],
+            leaving: None,
+            one_way: false,
+        });
+    }
+
+    /// An endpoint on `offset`'s tile, standing in for whatever is built there.
+    fn endpoint_on(app: &mut App, offset: (i32, i32)) -> Entity {
+        app.world_mut().spawn(RoadEndpoint::on(tile(offset))).id()
+    }
+
+    /// One road, and an endpoint at either end of it.
+    fn a_road_between_endpoints() -> (App, Entity, Entity) {
+        let mut app = rover_app();
+        lay_road_between(&mut app, COLLECTION, DELIVERY);
+        let collection = endpoint_on(&mut app, COLLECTION);
+        let delivery = endpoint_on(&mut app, DELIVERY);
+        tick(&mut app);
+        (app, collection, delivery)
+    }
+
+    /// That road, crossed in its middle by a road to a third endpoint.
+    fn a_crossroads_between_endpoints() -> (App, Entity, Entity) {
+        let mut app = rover_app();
+        lay_road_between(&mut app, COLLECTION, DELIVERY);
+        lay_road_between(&mut app, ACROSS_FROM, ACROSS);
+        let collection = endpoint_on(&mut app, COLLECTION);
+        let across = endpoint_on(&mut app, ACROSS);
+        tick(&mut app);
+        (app, collection, across)
+    }
+
+    /// Where on the road `endpoint` is served, which is where a rover bound for it stops.
+    fn served_place(app: &App, endpoint: Entity) -> ServedBy {
+        app.world()
+            .entity(endpoint)
+            .get::<RoadEndpoint>()
+            .and_then(RoadEndpoint::served_by)
+            .expect("the endpoint is served")
+    }
+
+    /// Put a loaded rover where `collection` is served, routed to `delivery`.
+    fn set_off_from(
+        app: &mut App,
+        collection: Entity,
+        delivery: Entity,
+        ways_out: Vec<Entity>,
+    ) -> Entity {
+        let from = served_place(app, collection);
+        app.world_mut()
+            .spawn((
+                Rover {
+                    segment: from.segment,
+                    along: from.along,
+                },
+                Cargo { quantity: LOAD },
+                Route {
+                    destination: delivery,
+                    ways_out,
+                },
+            ))
+            .id()
+    }
+
+    /// How much `entity` is carrying or holding, which is nothing while it holds no load at all.
+    fn load_of(app: &App, entity: Entity) -> u32 {
+        app.world()
+            .entity(entity)
+            .get::<Cargo>()
+            .map_or(0, |cargo| cargo.quantity)
+    }
+
+    /// The tick a load reached `endpoint` on, or nothing if none ever did.
+    fn tick_delivered_on(app: &mut App, endpoint: Entity) -> Option<u64> {
+        for _ in 0..TICKS_TO_DELIVER {
+            tick(app);
+            if load_of(app, endpoint) > 0 {
+                return Some(app.world().resource::<Ticks>().0);
+            }
+        }
+        None
+    }
+
+    fn is_stranded(app: &App, rover: Entity) -> bool {
+        app.world().entity(rover).contains::<Stranded>()
+    }
+
+    /// Where the far end of `segment` stands.
+    fn reach_of(app: &App, segment: Entity) -> Vec3 {
+        let segment = app
+            .world()
+            .entity(segment)
+            .get::<RoadSegment>()
+            .expect("the segment is still there");
+        segment.world_position(segment.ends_at())
+    }
+
+    /// The way out of the junction `arriving` reaches that sets off towards `towards`.
+    fn way_out_towards(app: &App, arriving: Entity, towards: (i32, i32)) -> Entity {
+        let wanted = tile(towards).world_position();
+        ways_out_of(app, arriving)
+            .into_iter()
+            .min_by(|one, other| {
+                reach_of(app, *one)
+                    .distance(wanted)
+                    .total_cmp(&reach_of(app, *other).distance(wanted))
+            })
+            .expect("the junction has a way out")
+    }
+
+    #[test]
+    fn a_rover_on_a_route_stops_where_its_destination_endpoint_stands() {
+        let (mut app, collection, delivery) = a_road_between_endpoints();
+        let rover = set_off_from(&mut app, collection, delivery, Vec::new());
+        let stops = served_place(&app, delivery);
+
+        tick_delivered_on(&mut app, delivery).expect("the delivery lands");
+        for _ in 0..TICKS_GOING_NOWHERE {
+            tick(&mut app);
+        }
+
+        assert_eq!(place_of(&app, rover), (stops.segment, stops.along));
+    }
+
+    #[test]
+    fn a_rover_leaves_its_load_at_the_endpoint_it_was_routed_to() {
+        let (mut app, collection, delivery) = a_road_between_endpoints();
+        set_off_from(&mut app, collection, delivery, Vec::new());
+
+        tick_delivered_on(&mut app, delivery).expect("the delivery lands");
+
+        assert_eq!(load_of(&app, delivery), LOAD);
+    }
+
+    #[test]
+    fn a_rover_that_has_delivered_carries_nothing_on() {
+        let (mut app, collection, delivery) = a_road_between_endpoints();
+        let rover = set_off_from(&mut app, collection, delivery, Vec::new());
+
+        tick_delivered_on(&mut app, delivery).expect("the delivery lands");
+
+        assert_eq!(load_of(&app, rover), 0);
+    }
+
+    #[test]
+    fn a_delivery_does_not_advance_on_frames_that_carry_no_tick() {
+        let (mut app, collection, delivery) = a_road_between_endpoints();
+        let rover = set_off_from(&mut app, collection, delivery, Vec::new());
+        let set_off = place_of(&app, rover);
+
+        for _ in 0..FRAMES_WITHOUT_A_TICK {
+            advance(&mut app, SHORT_FRAME);
+        }
+
+        assert_eq!(place_of(&app, rover), set_off);
+        assert_eq!(load_of(&app, delivery), 0);
+    }
+
+    #[test]
+    fn a_rover_routed_through_a_junction_delivers_down_the_road_its_route_names() {
+        let (mut app, collection, across) = a_crossroads_between_endpoints();
+        let arriving = arriving_from(&mut app, COLLECTION);
+        let turn = way_out_towards(&app, arriving, ACROSS);
+        set_off_from(&mut app, collection, across, vec![turn]);
+
+        tick_delivered_on(&mut app, across).expect("the delivery lands");
+
+        assert_eq!(load_of(&app, across), LOAD);
+    }
+
+    #[test]
+    fn a_rover_whose_route_names_a_way_out_the_junction_refuses_is_stranded() {
+        let (mut app, collection, across) = a_crossroads_between_endpoints();
+        let arriving = arriving_from(&mut app, COLLECTION);
+        let rover = set_off_from(&mut app, collection, across, vec![arriving]);
+
+        for _ in 0..TICKS_GOING_NOWHERE {
+            tick(&mut app);
+        }
+
+        assert!(
+            is_stranded(&app, rover),
+            "a rover the junction let take a turn it does not allow"
+        );
+        assert_eq!(load_of(&app, across), 0);
+    }
+
+    #[test]
+    fn a_rover_routed_to_an_endpoint_no_road_reaches_is_stranded() {
+        let (mut app, collection, _) = a_road_between_endpoints();
+        let nowhere = endpoint_on(&mut app, OFF_THE_NETWORK);
+        let rover = set_off_from(&mut app, collection, nowhere, Vec::new());
+        let set_off = place_of(&app, rover);
+
+        for _ in 0..TICKS_GOING_NOWHERE {
+            tick(&mut app);
+        }
+
+        assert!(is_stranded(&app, rover));
+        assert_eq!(
+            place_of(&app, rover),
+            set_off,
+            "a rover that set off down a route it has not got"
+        );
+    }
+
+    #[test]
+    fn a_rover_whose_road_runs_out_before_its_destination_is_stranded() {
+        let (mut app, collection, delivery) = a_road_between_endpoints();
+        let rover = set_off_from(&mut app, collection, delivery, Vec::new());
+        let (setting_off, _) = place_of(&app, rover);
+        let onward = next_of(&app, setting_off).expect("the lane runs on");
+        let beyond = next_of(&app, onward).expect("the lane runs on");
+
+        app.world_mut().entity_mut(beyond).despawn();
+        for _ in 0..TICKS_PAST_THE_GAP {
+            tick(&mut app);
+        }
+
+        assert!(is_stranded(&app, rover));
+        assert_eq!(load_of(&app, delivery), 0);
+    }
+
+    #[test]
+    fn the_same_delivery_arrives_on_the_same_tick_twice() {
+        let (mut once, from, to) = a_road_between_endpoints();
+        set_off_from(&mut once, from, to, Vec::new());
+        let first = tick_delivered_on(&mut once, to).expect("the delivery lands");
+
+        let (mut again, from, to) = a_road_between_endpoints();
+        set_off_from(&mut again, from, to, Vec::new());
+        let second = tick_delivered_on(&mut again, to).expect("the delivery lands");
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_delivery_arrives_on_the_same_tick_at_half_the_frame_rate() {
+        let (mut steady, from, to) = a_road_between_endpoints();
+        set_off_from(&mut steady, from, to, Vec::new());
+        let on_the_tick = tick_delivered_on(&mut steady, to).expect("the delivery lands");
+
+        let (mut halved, from, to) = a_road_between_endpoints();
+        set_off_from(&mut halved, from, to, Vec::new());
+        let half_a_tick = halved.world().resource::<Time<Fixed>>().timestep() / 2;
+        let mut delivered = None;
+        for _ in 0..TICKS_TO_DELIVER * 2 {
+            advance(&mut halved, half_a_tick);
+            if load_of(&halved, to) > 0 {
+                delivered = Some(halved.world().resource::<Ticks>().0);
+                break;
+            }
+        }
+
+        assert_eq!(delivered, Some(on_the_tick));
     }
 }
