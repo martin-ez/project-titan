@@ -793,6 +793,15 @@ mod tests {
         app
     }
 
+    /// A straight road and a road across it, laid on one frame, so neither gives way to the other.
+    fn a_crossroads_taking_turns() -> App {
+        let mut app = rover_app();
+        lay_road(&mut app, &STRAIGHT);
+        lay_road(&mut app, &CROSSING);
+        tick(&mut app);
+        app
+    }
+
     /// A straight road, and a road ending on it a frame later.
     fn a_road_ending_on_another() -> App {
         let mut app = rover_app();
@@ -1007,10 +1016,7 @@ mod tests {
 
     #[test]
     fn two_roads_laid_at_once_take_turns_at_the_junction_they_make() {
-        let mut app = rover_app();
-        lay_road(&mut app, &STRAIGHT);
-        lay_road(&mut app, &CROSSING);
-        tick(&mut app);
+        let mut app = a_crossroads_taking_turns();
         let along = arriving_from(&mut app, STRAIGHT[0]);
         let across = arriving_from(&mut app, CROSSING[0]);
         let (one, other) = (waiting_on(&mut app, along), waiting_on(&mut app, across));
@@ -1030,6 +1036,38 @@ mod tests {
             along,
             "a leg the tick did not ask went first"
         );
+    }
+
+    #[test]
+    fn which_rover_crosses_first_does_not_depend_on_which_was_spawned_first() {
+        assert_eq!(first_leg_through(true), first_leg_through(false));
+    }
+
+    /// Which leg of a crossroads is let through first, the rover along the road spawned first or
+    /// second according to `along_first`.
+    ///
+    /// The junction takes turns rather than giving way, because a leg with priority is served
+    /// first whatever order the rovers reached the world in and would say nothing about this.
+    fn first_leg_through(along_first: bool) -> usize {
+        let mut app = a_crossroads_taking_turns();
+        let along = arriving_from(&mut app, STRAIGHT[0]);
+        let across = arriving_from(&mut app, CROSSING[0]);
+        let (first, second) = if along_first {
+            (along, across)
+        } else {
+            (across, along)
+        };
+        assert_ne!(along, across, "the two legs are the same segment");
+        let (one, other) = (waiting_on(&mut app, first), waiting_on(&mut app, second));
+
+        tick(&mut app);
+        tick(&mut app);
+
+        let (_, crossed) = [(one, first), (other, second)]
+            .into_iter()
+            .find(|&(rover, segment)| place_of(&app, rover).0 != segment)
+            .expect("a rover crossed");
+        leg_of(&app, crossed)
     }
 
     #[test]
