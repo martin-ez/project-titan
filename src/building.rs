@@ -1,14 +1,24 @@
 use crate::common::cleanup::Destroy;
 use crate::common::cursor::CursorSurface;
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
+use crate::diagnostics::DebugGizmos;
 use crate::input::{PlayerAction, PlayerInput};
-use crate::map::{HexCoordinates, MapTile, MAP_TILE_SIZE};
-use crate::road::RoadEndpoint;
+use crate::map::{HexCoordinates, MapTile, MAP_TILE_INRADIUS, MAP_TILE_SIZE};
+use crate::road::{RoadEndpoint, RoadTiles};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
 const BUILDING_HEIGHT: f32 = 4.;
 const BUILDING_WIDTH: f32 = MAP_TILE_SIZE / 2.;
+
+/// How far the debug view lifts the mark on a tile, so it does not fight the tile it lies on.
+const GIZMO_LIFT: Vec3 = Vec3::new(0., 0.1, 0.);
+
+/// The colour a tile that will not take a building is crossed out in
+const REFUSED_COLOUR: Color = Color::srgb(0.95, 0.3, 0.3);
+
+/// How far the cross on a refused tile reaches, as a share of the tile's inradius.
+const REFUSED_MARK: f32 = 0.5;
 
 pub struct BuildingPlugin;
 
@@ -55,19 +65,33 @@ impl Plugin for BuildingPlugin {
         )
         .add_systems(
             Update,
-            (place_building_system, remove_building_system).chain(),
+            (
+                (place_building_system, remove_building_system).chain(),
+                draw_the_refused_tile,
+            ),
         );
     }
+}
+
+/// Whether `tile` will take a building, which is the whole of the rule and is asked in one place.
+///
+/// A road is read off the tile it runs over rather than measured out of its arcs, so the answer
+/// costs a lookup however many roads are on the map.
+fn takes_a_building(tile: HexCoordinates, occupied: bool, roads: &RoadTiles) -> bool {
+    !occupied && roads.roads_over(tile).is_empty()
 }
 
 /// Put a building on the tile the cursor is over, when the player taps holding the building tool.
 ///
 /// A tile takes one building and then refuses, so a tap on a tile that is already built on does
-/// nothing rather than stacking a second on top of the first.
+/// nothing rather than stacking a second on top of the first. A road running over the tile refuses
+/// it the same way, whether the road stops there or only crosses it on the way somewhere else:
+/// there is no room for a building on ground a rover drives over (invariant 1).
 fn place_building_system(
     mut commands: Commands,
     player_input: Res<PlayerInput>,
     action: Res<State<PlayerAction>>,
+    roads: Res<RoadTiles>,
     tiles: Query<(&MapTile, Has<Occupied>)>,
 ) {
     if !player_input.tap || *action.get() != PlayerAction::EditBuildings {
@@ -79,7 +103,7 @@ fn place_building_system(
     let Ok((tile, occupied)) = tiles.get(entity) else {
         return;
     };
-    if occupied {
+    if !takes_a_building(tile.coordinates, occupied, &roads) {
         return;
     }
 
@@ -120,6 +144,38 @@ fn remove_building_system(
     commands.entity(entity).remove::<Occupied>();
 }
 
+/// Cross out the tile under the cursor when it will not take a building.
+///
+/// A refused tap is otherwise a click that does nothing, which reads as a game that missed it
+/// rather than a tile that is taken. Marking it while the tool is held says so before the player
+/// clicks, and says it the same way whether a building or a road is what is in the way.
+fn draw_the_refused_tile(
+    mut gizmos: Gizmos<DebugGizmos>,
+    player_input: Res<PlayerInput>,
+    action: Res<State<PlayerAction>>,
+    roads: Res<RoadTiles>,
+    tiles: Query<(&MapTile, Has<Occupied>)>,
+) {
+    if *action.get() != PlayerAction::EditBuildings {
+        return;
+    }
+    let Some((tile, occupied)) = player_input
+        .cursor_tile
+        .and_then(|entity| tiles.get(entity).ok())
+    else {
+        return;
+    };
+    if takes_a_building(tile.coordinates, occupied, &roads) {
+        return;
+    }
+
+    let centre = tile.coordinates.world_position() + GIZMO_LIFT;
+    let reach = MAP_TILE_INRADIUS * REFUSED_MARK;
+    for across in [Vec3::new(reach, 0., reach), Vec3::new(reach, 0., -reach)] {
+        gizmos.line(centre - across, centre + across, REFUSED_COLOUR);
+    }
+}
+
 impl Initialize<BuildingInitializeParams<'_, '_>> for Building {
     fn initialize(&mut self, entity: &Entity, params: &mut BuildingInitializeParams) -> Result {
         let (mut transform, mut visibility) = params.query.get_mut(*entity)?;
@@ -146,14 +202,44 @@ mod tests {
     use super::*;
     use crate::common::cleanup::CleanupPlugin;
     use crate::common::initialize::InitializationFailed;
+    use crate::diagnostics::DebugGizmosPlugin;
+    use crate::map::LatticeNode;
+    use crate::road::{Road, RoadPlugin};
     use crate::testing::{headless_app, tick};
+
+    /// A run of tiles whose nodes are neighbours, so the road takes those tiles and no others.
+    const NEIGHBOURING: [(i32, i32); 3] = [(0, 0), (1, 0), (2, 0)];
+
+    /// Two nodes far enough apart that the road runs over the tiles between them.
+    ///
+    /// A road drawn between neighbouring tile centres never leaves the tiles its nodes stand on,
+    /// so a rule tested only against one of those is a rule tested only at the nodes.
+    const SPANNING: [(i32, i32); 2] = [(0, 0), (5, 0)];
 
     fn building_app(action: PlayerAction) -> App {
         let mut app = headless_app();
         app.insert_state(action)
             .insert_resource(PlayerInput::default())
-            .add_plugins((BuildingPlugin, CleanupPlugin));
+            .add_plugins((BuildingPlugin, CleanupPlugin, DebugGizmosPlugin, RoadPlugin));
         app
+    }
+
+    /// Lay a road through `offsets` and let it take its tiles.
+    fn spawn_road(app: &mut App, offsets: &[(i32, i32)]) -> Entity {
+        let nodes = offsets
+            .iter()
+            .map(|&(col, row)| LatticeNode::from_tile(HexCoordinates::from_offset_row(col, row)))
+            .collect();
+        let road = app
+            .world_mut()
+            .spawn(Road {
+                nodes,
+                leaving: None,
+                one_way: false,
+            })
+            .id();
+        tick(app);
+        road
     }
 
     fn spawn_tile(app: &mut App, col: i32, row: i32) -> Entity {
@@ -441,5 +527,50 @@ mod tests {
                 .map(|s| s.height),
             Some(BUILDING_HEIGHT)
         );
+    }
+
+    #[test]
+    fn a_tap_on_a_tile_a_road_stands_on_puts_nothing_down() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        spawn_road(&mut app, &NEIGHBOURING);
+        let tile = spawn_tile(&mut app, 1, 0);
+
+        tap_on(&mut app, Some(tile));
+
+        assert!(buildings(&mut app).is_empty());
+    }
+
+    #[test]
+    fn a_tap_on_a_tile_a_road_only_crosses_puts_nothing_down() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        spawn_road(&mut app, &SPANNING);
+        let tile = spawn_tile(&mut app, 3, 0);
+
+        tap_on(&mut app, Some(tile));
+
+        assert!(buildings(&mut app).is_empty());
+    }
+
+    #[test]
+    fn a_tap_on_a_tile_beside_a_road_still_places_a_building() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        spawn_road(&mut app, &NEIGHBOURING);
+        let tile = spawn_tile(&mut app, 1, 1);
+
+        tap_on(&mut app, Some(tile));
+
+        assert_eq!(buildings(&mut app), [HexCoordinates::from_offset_row(1, 1)]);
+    }
+
+    #[test]
+    fn a_tile_whose_road_was_taken_away_takes_a_building() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        let road = spawn_road(&mut app, &NEIGHBOURING);
+        let tile = spawn_tile(&mut app, 1, 0);
+        app.world_mut().entity_mut(road).despawn();
+
+        tap_on(&mut app, Some(tile));
+
+        assert_eq!(buildings(&mut app), [HexCoordinates::from_offset_row(1, 0)]);
     }
 }
