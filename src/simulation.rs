@@ -69,7 +69,7 @@ impl Plugin for SimulationPlugin {
             .init_resource::<TicksSinceMeasured>()
             .register_diagnostic(Diagnostic::new(TICKS_PER_SECOND).with_suffix(" ticks/s"))
             .configure_sets(FixedUpdate, Simulation)
-            .add_systems(FixedUpdate, count_the_tick)
+            .add_systems(FixedUpdate, count_the_tick.before(Simulation))
             .add_systems(
                 PreUpdate,
                 (step_the_warp, apply_the_warp).chain().after(InputSystems),
@@ -101,6 +101,7 @@ fn apply_the_warp(warp: Res<TimeWarp>, mut time: ResMut<Time<Virtual>>) {
     }
 }
 
+/// Count the tick before the world runs on it, so every system on it reads the same number.
 fn count_the_tick(mut run: ResMut<Ticks>, mut ticks: ResMut<TicksSinceMeasured>) {
     run.0 += 1;
     ticks.0 += 1;

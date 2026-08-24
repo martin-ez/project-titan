@@ -501,7 +501,8 @@ impl RoadSegment {
 
     /// Which way a rover `along` of the way down this segment is pointing.
     fn heading_at(&self, along: f32) -> Vec3 {
-        self.arc.tangent_at(self.from + (self.to - self.from) * along.clamp(0., 1.))
+        self.arc
+            .tangent_at(self.from + (self.to - self.from) * along.clamp(0., 1.))
     }
 
     /// How long the stretch of arc this segment covers is, in world units.
@@ -544,7 +545,9 @@ impl JunctionLegs {
             straightness(arrived.heading, other.heading)
                 .total_cmp(&straightness(arrived.heading, one.heading))
         });
-        out.into_iter().flat_map(|leg| leg.leaving.iter().copied()).collect()
+        out.into_iter()
+            .flat_map(|leg| leg.leaving.iter().copied())
+            .collect()
     }
 
     fn road_of(&self, leg: usize) -> Option<Entity> {
@@ -563,7 +566,12 @@ impl JunctionPolicy {
     /// The rotation the tick names is what keeps two rovers arriving at once from being served in
     /// whatever order the world holds them, and it is what stops a leg being passed over forever
     /// once the legs before it are empty.
-    pub fn who_goes_next(&self, legs: &JunctionLegs, waiting: &[usize], tick: u64) -> Option<usize> {
+    pub fn who_goes_next(
+        &self,
+        legs: &JunctionLegs,
+        waiting: &[usize],
+        tick: u64,
+    ) -> Option<usize> {
         let count = legs.0.len();
         if count == 0 {
             return None;
@@ -949,10 +957,14 @@ fn legs_of(
                 continue;
             };
             if segment.world_position(1.).distance(junction.at) <= CROSSING_TOLERANCE {
-                arm_of(&mut legs, road, -segment.heading_at(1.)).arriving.push(piece);
+                arm_of(&mut legs, road, -segment.heading_at(1.))
+                    .arriving
+                    .push(piece);
             }
             if segment.world_position(0.).distance(junction.at) <= CROSSING_TOLERANCE {
-                arm_of(&mut legs, road, segment.heading_at(0.)).leaving.push(piece);
+                arm_of(&mut legs, road, segment.heading_at(0.))
+                    .leaving
+                    .push(piece);
             }
         }
     }
@@ -972,7 +984,7 @@ fn pieces_of(road: Entity, children: &Query<&Children>) -> Vec<Entity> {
 }
 
 /// The arm of `legs` running `heading` out of the junction, opened where there is not one yet.
-fn arm_of<'a>(legs: &'a mut Vec<JunctionLeg>, road: Entity, heading: Vec3) -> &'a mut JunctionLeg {
+fn arm_of(legs: &mut Vec<JunctionLeg>, road: Entity, heading: Vec3) -> &mut JunctionLeg {
     let found = legs
         .iter()
         .position(|leg| leg.road == road && leg.heading.dot(heading) >= LEG_TOLERANCE);
@@ -1269,17 +1281,42 @@ fn ring_around(centre: Vec3, radius: f32) -> impl Iterator<Item = Vec3> {
     })
 }
 
-/// Mark every junction, which two lanes drawn across each other do not say is there.
+/// Mark every junction, its legs, and which of them the policy in force lets go first.
 ///
 /// A crossing is a point on both roads rather than anything either of them stores, so a road
-/// drawn over another looks exactly like a road drawn beside it until the junction is drawn.
-fn draw_the_junctions(mut gizmos: Gizmos<DebugGizmos>, junctions: Query<&Junction>) {
-    for junction in &junctions {
+/// drawn over another looks exactly like a road drawn beside it until the junction is drawn. Nor
+/// does anything on the ground say which arms it gathered into one leg, or which of them a rover
+/// will be made to wait on, so the arrows say both.
+fn draw_the_junctions(
+    mut gizmos: Gizmos<DebugGizmos>,
+    junctions: Query<(&Junction, Option<&JunctionLegs>, Option<&JunctionPolicy>)>,
+) {
+    for (junction, legs, policy) in &junctions {
         gizmos.circle(
             Isometry3d::new(junction.at + GIZMO_LIFT, Quat::from_rotation_x(FRAC_PI_2)),
             MAP_TILE_INRADIUS * JUNCTION_MARK,
             JUNCTION_COLOUR,
         );
+
+        let Some(legs) = legs else {
+            continue;
+        };
+        for leg in &legs.0 {
+            gizmos.arrow(
+                junction.at + GIZMO_LIFT,
+                junction.at + GIZMO_LIFT + leg.heading * MAP_TILE_INRADIUS * LEG_MARK,
+                colour_of(leg, policy),
+            );
+        }
+    }
+}
+
+/// The colour a leg is marked in, which says whether the policy makes it give way or go first.
+fn colour_of(leg: &JunctionLeg, policy: Option<&JunctionPolicy>) -> Color {
+    match policy {
+        Some(JunctionPolicy::GiveWayTo(road)) if *road == leg.road => PRIORITY_COLOUR,
+        Some(JunctionPolicy::GiveWayTo(_)) => GIVING_WAY_COLOUR,
+        _ => JUNCTION_COLOUR,
     }
 }
 
@@ -2667,7 +2704,10 @@ mod tests {
             }
             let out = exits_from(&mut app, index);
             let first = out.first().expect("a way out");
-            assert!(straight_on.contains(first), "a turn taken before the straight");
+            assert!(
+                straight_on.contains(first),
+                "a turn taken before the straight"
+            );
         }
     }
 

@@ -1,8 +1,8 @@
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use crate::diagnostics::DebugGizmos;
 use crate::map::MAP_TILE_SIZE;
-use crate::road::{NextSegment, RoadSegment};
-use crate::simulation::Simulation;
+use crate::road::{EndsAtJunction, JunctionLegs, JunctionPolicy, NextSegment, RoadSegment};
+use crate::simulation::{Simulation, Ticks};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
@@ -31,6 +31,15 @@ const PROGRESS_COLOUR: Color = Color::srgb(0.95, 0.55, 0.35);
 /// The colour the load a rover is carrying is drawn in
 const LOAD_COLOUR: Color = Color::srgb(0.9, 0.9, 0.4);
 
+/// The colour a rover a junction is holding is marked in
+const HELD_COLOUR: Color = Color::srgb(0.95, 0.3, 0.3);
+
+/// How tall the mark over a rover a junction is holding stands.
+const HELD_MARK: f32 = 1.5;
+
+/// How far into the way out of a junction the arrow onto it reaches.
+const WAY_OUT_REACH: f32 = 0.1;
+
 /// The rovers on the map, and where on the road each of them stands.
 ///
 /// A rover is where the road stops being scenery: everything a building receives arrives on one
@@ -51,6 +60,17 @@ pub struct Rover {
     pub segment: Entity,
     /// How far along that segment it has got, from `0` at the start to `1` at the end.
     pub along: f32,
+}
+
+/// A rover a junction is holding at the end of its segment until its policy lets it through.
+///
+/// Standing still at a junction is a fact about the rover rather than one the junction stores, so
+/// the tick finds the few rovers waiting by the component they carry rather than by reading every
+/// rover on the map.
+#[derive(Component)]
+struct WaitingAtJunction {
+    /// The tick the rover reached the junction on.
+    since: u64,
 }
 
 /// What a rover is carrying, which is a quantity of nothing in particular.
@@ -75,10 +95,19 @@ struct RoverInitializeParams<'w, 's> {
 impl Plugin for RoverPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(PreUpdate, initialize_system::<Rover, RoverInitializeParams>)
-            .add_systems(FixedUpdate, drive_the_rovers.in_set(Simulation))
+            .add_systems(
+                FixedUpdate,
+                (let_the_rovers_through, drive_the_rovers)
+                    .chain()
+                    .in_set(Simulation),
+            )
             .add_systems(
                 Update,
-                (stand_the_rovers_on_their_segments, draw_the_rovers).chain(),
+                (
+                    stand_the_rovers_on_their_segments,
+                    (draw_the_rovers, draw_the_rovers_a_junction_holds),
+                )
+                    .chain(),
             );
     }
 }
@@ -103,6 +132,64 @@ impl Initialize<RoverInitializeParams<'_, '_>> for Rover {
     }
 }
 
+/// Let one rover through each junction that has any waiting, by the policy the junction holds.
+///
+/// One a tick, so a junction is a place where traffic has to take its turn rather than a point
+/// rovers pass through together. Which leg goes is the policy's answer and the tick's rotation,
+/// never the order the world stores its rovers in (invariant 2); which way out it takes is the
+/// junction's to say. The ones not let through keep their place and their arrival, so the longest
+/// wait on a leg is served first when its turn comes.
+fn let_the_rovers_through(
+    mut commands: Commands,
+    ticks: Res<Ticks>,
+    junctions: Query<(&JunctionLegs, &JunctionPolicy)>,
+    arriving: Query<&EndsAtJunction>,
+    mut rovers: Query<(Entity, &mut Rover, &WaitingAtJunction)>,
+    mut held: Local<Vec<(Entity, usize, u64, Entity)>>,
+    mut legs_waiting: Local<Vec<usize>>,
+) {
+    held.clear();
+    for (entity, rover, wait) in &rovers {
+        let Ok(ends) = arriving.get(rover.segment) else {
+            commands.entity(entity).remove::<WaitingAtJunction>();
+            continue;
+        };
+        held.push((ends.junction, ends.leg, wait.since, entity));
+    }
+    held.sort_unstable();
+
+    let mut from = 0;
+    while from < held.len() {
+        let junction = held[from].0;
+        let queue = held[from..].partition_point(|waiting| waiting.0 == junction);
+        let queue = &held[from..from + queue];
+        from += queue.len();
+
+        let Ok((legs, policy)) = junctions.get(junction) else {
+            continue;
+        };
+        legs_waiting.clear();
+        legs_waiting.extend(queue.iter().map(|&(_, leg, ..)| leg));
+        legs_waiting.dedup();
+
+        let Some(leg) = policy.who_goes_next(legs, &legs_waiting, ticks.0) else {
+            continue;
+        };
+        let Some(&(.., rover)) = queue.iter().find(|&&(_, waiting, ..)| waiting == leg) else {
+            continue;
+        };
+        let Some(&out) = legs.exits_from(leg).first() else {
+            continue;
+        };
+
+        if let Ok((_, mut let_through, _)) = rovers.get_mut(rover) {
+            let_through.segment = out;
+            let_through.along = 0.;
+        }
+        commands.entity(rover).remove::<WaitingAtJunction>();
+    }
+}
+
 /// Drive every rover along its lane, at whatever each segment it crosses allows.
 ///
 /// A tick buys a rover an amount of time rather than an amount of ground, and it is spent segment
@@ -110,14 +197,19 @@ impl Initialize<RoverInitializeParams<'_, '_>> for Rover {
 /// next and spent at the next one's speed limit, so a rover joining a curve slows down on the
 /// curve rather than a tick early. A rover that runs out of road stops at the end of it, and one
 /// whose segment is gone is left where it is — what should become of that one is #102's.
+///
+/// A segment ending at a junction is where the driving stops: the way on is the junction's to
+/// give, not the lane's, so the rover stands at the end of it and waits to be let through.
 fn drive_the_rovers(
-    mut rovers: Query<&mut Rover>,
-    segments: Query<(&RoadSegment, Option<&NextSegment>)>,
+    mut commands: Commands,
+    ticks: Res<Ticks>,
+    mut rovers: Query<(Entity, &mut Rover)>,
+    segments: Query<(&RoadSegment, Option<&NextSegment>, Option<&EndsAtJunction>)>,
 ) {
-    for mut rover in &mut rovers {
+    for (entity, mut rover) in &mut rovers {
         let mut left = 1.;
         for _ in 0..HANDOVERS_PER_TICK {
-            let Ok((segment, next)) = segments.get(rover.segment) else {
+            let Ok((segment, next, junction)) = segments.get(rover.segment) else {
                 break;
             };
             let length = segment.length();
@@ -128,6 +220,13 @@ fn drive_the_rovers(
             }
 
             left -= crossing;
+            if junction.is_some() {
+                rover.along = 1.;
+                commands
+                    .entity(entity)
+                    .insert_if_new(WaitingAtJunction { since: ticks.0 });
+                break;
+            }
             match next {
                 Some(next) => {
                     rover.segment = next.0;
@@ -191,6 +290,47 @@ fn draw_the_rovers(
     }
 }
 
+/// Mark every rover a junction is holding, and the way out it is waiting to be let onto.
+///
+/// A rover stopped at a junction and one crawling towards it stand the same way round in the same
+/// place, and nothing about a box on a lane says which leg it is bound for. The mark says it is
+/// being held and the arrow says which way it goes when it is let through.
+fn draw_the_rovers_a_junction_holds(
+    mut gizmos: Gizmos<DebugGizmos>,
+    held: Query<&Rover, With<WaitingAtJunction>>,
+    arriving: Query<&EndsAtJunction>,
+    junctions: Query<&JunctionLegs>,
+    segments: Query<&RoadSegment>,
+) {
+    for rover in &held {
+        let Ok(segment) = segments.get(rover.segment) else {
+            continue;
+        };
+        let standing = segment.world_position(rover.along) + GIZMO_LIFT;
+        gizmos.line(standing, standing + Vec3::Y * HELD_MARK, HELD_COLOUR);
+
+        let Some(out) = arriving
+            .get(rover.segment)
+            .ok()
+            .and_then(|ends| {
+                junctions
+                    .get(ends.junction)
+                    .ok()
+                    .map(|legs| (legs, ends.leg))
+            })
+            .and_then(|(legs, leg)| legs.exits_from(leg).first().copied())
+            .and_then(|out| segments.get(out).ok())
+        else {
+            continue;
+        };
+        gizmos.arrow(
+            standing,
+            out.world_position(WAY_OUT_REACH) + GIZMO_LIFT,
+            HELD_COLOUR,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,8 +338,8 @@ mod tests {
     use crate::diagnostics::DebugGizmosPlugin;
     use crate::input::{PlayerAction, PlayerInput};
     use crate::map::{HexCoordinates, LatticeNode};
-    use crate::road::{Road, RoadPlugin};
-    use crate::simulation::SimulationPlugin;
+    use crate::road::{EndsAtJunction, JunctionLegs, Road, RoadPlugin};
+    use crate::simulation::{SimulationPlugin, Ticks};
     use crate::testing::{advance, headless_app, tick};
     use std::time::Duration;
 
@@ -217,6 +357,18 @@ mod tests {
     /// The same number of tiles as `STRAIGHT` and the same distance between each, so a rover has
     /// as much road ahead of it here as there and only the curves tell the two apart.
     const WINDING: [(i32, i32); 4] = [(1, 6), (2, 6), (1, 7), (2, 7)];
+
+    /// A run of tiles crossing `STRAIGHT` at its second tile, in offset-row coordinates.
+    const CROSSING: [(i32, i32); 3] = [(2, -1), (2, 0), (2, 1)];
+
+    /// A run of tiles ending on `STRAIGHT`'s second tile, in offset-row coordinates.
+    const SPUR: [(i32, i32); 2] = [(2, 1), (2, 0)];
+
+    /// How many legs two two-way roads crossing each other make.
+    const LEGS_OF_A_CROSSROADS: usize = 4;
+
+    /// How far along a segment a rover has to stand to reach the end of it in one tick.
+    const ABOUT_TO_ARRIVE: f32 = 0.99;
 
     /// A frame far too short to carry a tick of the fixed clock.
     const SHORT_FRAME: Duration = Duration::from_micros(100);
@@ -629,6 +781,294 @@ mod tests {
         ticks_to_cross(&mut app, rover);
 
         assert_eq!(place_of(&app, rover).0, onward);
+    }
+
+    /// A straight road, and a road laid across the middle of it a frame later.
+    fn a_crossed_road() -> App {
+        let mut app = rover_app();
+        lay_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+        lay_road(&mut app, &CROSSING);
+        tick(&mut app);
+        app
+    }
+
+    /// A straight road, and a road ending on it a frame later.
+    fn a_road_ending_on_another() -> App {
+        let mut app = rover_app();
+        lay_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+        lay_road(&mut app, &SPUR);
+        tick(&mut app);
+        app
+    }
+
+    /// The segment that reaches the junction from `tile`, of which there is one.
+    fn arriving_from(app: &mut App, offset: (i32, i32)) -> Entity {
+        let from = HexCoordinates::from_offset_row(offset.0, offset.1).world_position();
+        app.world_mut()
+            .query::<(Entity, &RoadSegment, &EndsAtJunction)>()
+            .iter(app.world())
+            .min_by(|(_, one, _), (_, other, _)| {
+                one.world_position(0.)
+                    .distance(from)
+                    .total_cmp(&other.world_position(0.).distance(from))
+            })
+            .map(|(entity, ..)| entity)
+            .expect("a segment reaching the junction")
+    }
+
+    /// Which leg of its junction `segment` arrives on.
+    fn leg_of(app: &App, segment: Entity) -> usize {
+        app.world()
+            .entity(segment)
+            .get::<EndsAtJunction>()
+            .expect("the segment reaches a junction")
+            .leg
+    }
+
+    /// The ways out of the junction `segment` reaches, for a rover arriving down it.
+    fn ways_out_of(app: &App, segment: Entity) -> Vec<Entity> {
+        let ends = app
+            .world()
+            .entity(segment)
+            .get::<EndsAtJunction>()
+            .expect("the segment reaches a junction");
+        app.world()
+            .entity(ends.junction)
+            .get::<JunctionLegs>()
+            .expect("the junction has legs")
+            .exits_from(ends.leg)
+    }
+
+    /// Put a rover at the far end of `segment`, a tick short of the junction it reaches.
+    fn waiting_on(app: &mut App, segment: Entity) -> Entity {
+        spawn_rover(app, segment, ABOUT_TO_ARRIVE)
+    }
+
+    /// Every segment of the road laid through `offsets`, on either of its lanes.
+    fn segments_of(app: &mut App, offsets: &[(i32, i32)]) -> Vec<Entity> {
+        let wanted = tiles(offsets)[0].world_position();
+        let roads: Vec<Vec<Entity>> = app
+            .world_mut()
+            .query_filtered::<&Children, With<Road>>()
+            .iter(app.world())
+            .map(|lanes| lanes.iter().collect())
+            .collect();
+        let pieces: Vec<Vec<Entity>> = roads
+            .into_iter()
+            .map(|lanes| {
+                lanes
+                    .into_iter()
+                    .flat_map(|lane| children_of(app, lane))
+                    .collect()
+            })
+            .collect();
+
+        pieces
+            .into_iter()
+            .min_by(|one, other| {
+                nearest_of(app, one, wanted).total_cmp(&nearest_of(app, other, wanted))
+            })
+            .expect("a road was laid")
+    }
+
+    fn children_of(app: &App, entity: Entity) -> Vec<Entity> {
+        app.world()
+            .entity(entity)
+            .get::<Children>()
+            .map(|children| children.iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// How close to `wanted` the nearest of `pieces` sets off from.
+    fn nearest_of(app: &App, pieces: &[Entity], wanted: Vec3) -> f32 {
+        pieces
+            .iter()
+            .filter_map(|&piece| app.world().entity(piece).get::<RoadSegment>())
+            .map(|segment| segment.world_position(0.).distance(wanted))
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    /// Set the world's tick so that the next one asks `leg` of a junction of `legs` first.
+    fn ask_first(app: &mut App, leg: usize, legs: usize) {
+        let wanted = (leg + legs - 1) % legs;
+        app.world_mut().resource_mut::<Ticks>().0 = wanted as u64;
+    }
+
+    #[test]
+    fn a_rover_reaching_a_junction_waits_a_tick_before_it_crosses() {
+        let mut app = a_crossed_road();
+        let arriving = arriving_from(&mut app, STRAIGHT[0]);
+        let rover = waiting_on(&mut app, arriving);
+
+        tick(&mut app);
+
+        assert_eq!(place_of(&app, rover), (arriving, 1.));
+    }
+
+    #[test]
+    fn a_rover_let_through_a_junction_leaves_by_a_way_out_it_allows() {
+        let mut app = a_crossed_road();
+        let arriving = arriving_from(&mut app, STRAIGHT[0]);
+        let out = ways_out_of(&app, arriving);
+        let rover = waiting_on(&mut app, arriving);
+
+        tick(&mut app);
+        tick(&mut app);
+
+        let (standing, _) = place_of(&app, rover);
+        assert!(
+            out.contains(&standing),
+            "a way out the junction does not allow"
+        );
+    }
+
+    #[test]
+    fn a_rover_on_a_road_that_ends_on_another_turns_onto_it_rather_than_back() {
+        let mut app = a_road_ending_on_another();
+        let arriving = arriving_from(&mut app, SPUR[0]);
+        let spur = segments_of(&mut app, &SPUR);
+        let rover = waiting_on(&mut app, arriving);
+
+        tick(&mut app);
+        tick(&mut app);
+
+        let (standing, _) = place_of(&app, rover);
+        assert!(
+            !spur.contains(&standing),
+            "a rover that turned back down its own road"
+        );
+    }
+
+    #[test]
+    fn two_rovers_reaching_a_junction_at_once_cross_on_different_ticks() {
+        let mut app = a_crossed_road();
+        let along = arriving_from(&mut app, STRAIGHT[0]);
+        let across = arriving_from(&mut app, CROSSING[0]);
+        let (one, other) = (waiting_on(&mut app, along), waiting_on(&mut app, across));
+
+        tick(&mut app);
+        tick(&mut app);
+
+        assert_eq!(crossed(&app, &[(one, along), (other, across)]), 1);
+        tick(&mut app);
+        assert_eq!(crossed(&app, &[(one, along), (other, across)]), 2);
+    }
+
+    /// How many of the rovers have left the segment they were waiting on.
+    fn crossed(app: &App, waiting: &[(Entity, Entity)]) -> usize {
+        waiting
+            .iter()
+            .filter(|&&(rover, segment)| place_of(app, rover).0 != segment)
+            .count()
+    }
+
+    #[test]
+    fn a_rover_a_junction_holds_stays_at_the_end_of_its_segment() {
+        let mut app = a_crossed_road();
+        let along = arriving_from(&mut app, STRAIGHT[0]);
+        let across = arriving_from(&mut app, CROSSING[0]);
+        let (one, other) = (waiting_on(&mut app, along), waiting_on(&mut app, across));
+
+        tick(&mut app);
+        tick(&mut app);
+
+        let held = [(one, along), (other, across)]
+            .into_iter()
+            .find(|&(rover, segment)| place_of(&app, rover).0 == segment)
+            .expect("a rover was held");
+        assert_eq!(place_of(&app, held.0), (held.1, 1.));
+    }
+
+    #[test]
+    fn a_rover_gives_way_to_the_road_that_was_there_before_its_own() {
+        let mut app = a_crossed_road();
+        let along = arriving_from(&mut app, STRAIGHT[0]);
+        let across = arriving_from(&mut app, CROSSING[0]);
+        let (one, other) = (waiting_on(&mut app, along), waiting_on(&mut app, across));
+        tick(&mut app);
+        let asked = leg_of(&app, across);
+        ask_first(&mut app, asked, LEGS_OF_A_CROSSROADS);
+
+        tick(&mut app);
+
+        assert_ne!(
+            place_of(&app, one).0,
+            along,
+            "the road already there waited"
+        );
+        assert_eq!(
+            place_of(&app, other).0,
+            across,
+            "the road drawn across went first"
+        );
+    }
+
+    #[test]
+    fn two_roads_laid_at_once_take_turns_at_the_junction_they_make() {
+        let mut app = rover_app();
+        lay_road(&mut app, &STRAIGHT);
+        lay_road(&mut app, &CROSSING);
+        tick(&mut app);
+        let along = arriving_from(&mut app, STRAIGHT[0]);
+        let across = arriving_from(&mut app, CROSSING[0]);
+        let (one, other) = (waiting_on(&mut app, along), waiting_on(&mut app, across));
+        tick(&mut app);
+        let asked = leg_of(&app, across);
+        ask_first(&mut app, asked, LEGS_OF_A_CROSSROADS);
+
+        tick(&mut app);
+
+        assert_ne!(
+            place_of(&app, other).0,
+            across,
+            "the leg the tick asked waited"
+        );
+        assert_eq!(
+            place_of(&app, one).0,
+            along,
+            "a leg the tick did not ask went first"
+        );
+    }
+
+    #[test]
+    fn a_rover_held_at_a_junction_that_is_taken_away_drives_on() {
+        let mut app = a_crossed_road();
+        let arriving = arriving_from(&mut app, STRAIGHT[0]);
+        let rover = waiting_on(&mut app, arriving);
+        let across = crossing_road(&mut app);
+        tick(&mut app);
+
+        app.world_mut().entity_mut(across).despawn();
+        tick(&mut app);
+        tick(&mut app);
+
+        assert_ne!(place_of(&app, rover).0, arriving, "a rover held at nothing");
+    }
+
+    /// The road laid across `STRAIGHT`, of which there is one.
+    fn crossing_road(app: &mut App) -> Entity {
+        let wanted = tiles(&CROSSING)[0].world_position();
+        let roads: Vec<(Entity, Vec<Entity>)> = app
+            .world_mut()
+            .query_filtered::<(Entity, &Children), With<Road>>()
+            .iter(app.world())
+            .map(|(entity, lanes)| (entity, lanes.iter().collect()))
+            .collect();
+
+        roads
+            .into_iter()
+            .map(|(road, lanes)| {
+                let pieces: Vec<Entity> = lanes
+                    .into_iter()
+                    .flat_map(|lane| children_of(app, lane))
+                    .collect();
+                (road, nearest_of(app, &pieces, wanted))
+            })
+            .min_by(|(_, one), (_, other)| one.total_cmp(other))
+            .map(|(road, _)| road)
+            .expect("a road was laid")
     }
 
     #[test]
