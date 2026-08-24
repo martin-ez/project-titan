@@ -96,6 +96,22 @@ const TAKEN_COLOUR: Color = Color::srgb(0.95, 0.25, 0.2);
 /// How wide the mark on an occupied tile is drawn, as a share of the tile's inradius.
 const OCCUPIED_MARK: f32 = 0.35;
 
+/// How closely two arms of a junction have to point the same way to be one leg.
+///
+/// A road crossed in its middle reaches the crossing on one lane and leaves it on the other, and
+/// the two are the same arm of the junction read in opposite directions, so what pairs them is
+/// that they point the same way rather than that they belong to one road.
+const LEG_TOLERANCE: f32 = 0.999;
+
+/// How far out from a junction its legs are marked, as a share of the tile's inradius.
+const LEG_MARK: f32 = 0.6;
+
+/// The colour a leg that gives way is marked in
+const GIVING_WAY_COLOUR: Color = Color::srgb(0.9, 0.7, 0.25);
+
+/// The colour a leg with priority over the others is marked in
+const PRIORITY_COLOUR: Color = Color::srgb(0.35, 0.85, 0.45);
+
 /// The colour the link from a tile to the road serving it is drawn in
 const SERVED_COLOUR: Color = Color::srgb(0.4, 0.95, 0.7);
 
@@ -239,6 +255,52 @@ pub struct Crossing {
     pub along: f32,
 }
 
+/// One arm of a junction: the segments that reach it down that arm and the ones that set off.
+///
+/// A road crossed in its middle has an arm either side of the crossing and a road that ends on
+/// one has a single arm, so three roads meeting and a road ending on another are the same
+/// structure counted differently rather than two kinds of junction.
+#[derive(Clone, Debug)]
+struct JunctionLeg {
+    road: Entity,
+    heading: Vec3,
+    arriving: Vec<Entity>,
+    leaving: Vec<Entity>,
+}
+
+/// The arms of a junction, and which of them a rover arriving on one may leave by.
+///
+/// Derived from where the segments of the crossing roads begin and end rather than stored when
+/// the crossing was found, because cutting a road again moves which segment reaches a junction
+/// already on it. It is rebuilt whenever any junction changes, so no leg outlives its segments.
+#[derive(Component, Default)]
+pub struct JunctionLegs(Vec<JunctionLeg>);
+
+/// The junction a segment reaches at its end, and which of that junction's legs it arrives on.
+///
+/// A rover finds the junction ahead of it by the segment it is driving rather than by looking
+/// through every junction on the map, which is what keeps the tick's cost off the fleet.
+#[derive(Component, Clone, Copy)]
+pub struct EndsAtJunction {
+    /// The junction the segment ends at.
+    pub junction: Entity,
+    /// Which of its legs the segment arrives on.
+    pub leg: usize,
+}
+
+/// How a junction chooses which of the rovers waiting on its legs goes through next.
+///
+/// The junction holds the answer rather than the handover deciding it, so a signal or a
+/// roundabout is another policy at the same point rather than another kind of junction. Which
+/// leg it names is decided by the tick, never by the order the world stores its rovers in.
+#[derive(Component, Clone, Debug, PartialEq)]
+pub enum JunctionPolicy {
+    /// Every leg in turn, the tick saying which of them is asked first.
+    TakeTurns,
+    /// Traffic on one road goes first, and every other leg gives way to it.
+    GiveWayTo(Entity),
+}
+
 /// A road that has been measured against the roads already laid for the places it crosses them.
 #[derive(Component)]
 struct Crossed;
@@ -306,6 +368,7 @@ impl Plugin for RoadPlugin {
                 (
                     initialize_system::<Road, RoadInitializeParams>,
                     cut_the_roads_where_they_cross,
+                    join_the_legs_at_the_junctions,
                 )
                     .chain(),
             )
@@ -505,6 +568,11 @@ impl RoadSegment {
         self.to
     }
 
+    /// Which way a rover standing `along` this segment's arc is pointing.
+    fn heading_at(&self, along: f32) -> Vec3 {
+        self.arc.tangent_at(along.clamp(self.from, self.to))
+    }
+
     /// How long the stretch of arc this segment covers is, in world units.
     pub fn length(&self) -> f32 {
         self.to - self.from
@@ -520,6 +588,75 @@ impl RoadSegment {
     pub fn speed_limit(&self) -> f32 {
         let radius = self.arc.curvature.abs().recip();
         STRAIGHT_SPEED_LIMIT * (radius / COMFORTABLE_RADIUS).sqrt().min(1.)
+    }
+}
+
+impl JunctionLegs {
+    /// The segments a rover arriving on `leg` may leave the junction by, straightest way first.
+    ///
+    /// Every leg but the one it arrived on: a junction is not a place to turn round, and a road
+    /// that dead-ends elsewhere is where that is done. The order is how far the rover has to turn
+    /// to take each, so carrying on down the road it is already on comes first wherever it can.
+    pub fn exits_from(&self, leg: usize) -> Vec<Entity> {
+        let Some(arrived) = self.0.get(leg) else {
+            return Vec::new();
+        };
+
+        let mut out: Vec<&JunctionLeg> = self
+            .0
+            .iter()
+            .enumerate()
+            .filter(|&(index, _)| index != leg)
+            .map(|(_, other)| other)
+            .collect();
+        out.sort_by(|one, other| {
+            straightness(arrived.heading, other.heading)
+                .total_cmp(&straightness(arrived.heading, one.heading))
+        });
+        out.into_iter()
+            .flat_map(|leg| leg.leaving.iter().copied())
+            .collect()
+    }
+
+    fn road_of(&self, leg: usize) -> Option<Entity> {
+        self.0.get(leg).map(|leg| leg.road)
+    }
+}
+
+/// How little a rover arriving down the arm heading `arrived` turns to leave down the one at `out`.
+fn straightness(arrived: Vec3, out: Vec3) -> f32 {
+    -arrived.dot(out)
+}
+
+impl JunctionPolicy {
+    /// Which of the legs a rover is waiting on the junction lets through on `tick`.
+    ///
+    /// The rotation the tick names is what keeps two rovers arriving at once from being served in
+    /// whatever order the world holds them, and it is what stops a leg being passed over forever
+    /// once the legs before it are empty.
+    pub fn who_goes_next(
+        &self,
+        legs: &JunctionLegs,
+        waiting: &[usize],
+        tick: u64,
+    ) -> Option<usize> {
+        let count = legs.0.len();
+        if count == 0 {
+            return None;
+        }
+
+        let favoured = match self {
+            Self::TakeTurns => None,
+            Self::GiveWayTo(road) => Some(*road)
+                .filter(|road| waiting.iter().any(|&leg| legs.road_of(leg) == Some(*road))),
+        };
+        let asked = (tick % count as u64) as usize;
+
+        waiting
+            .iter()
+            .copied()
+            .filter(|&leg| favoured.is_none_or(|road| legs.road_of(leg) == Some(road)))
+            .min_by_key(|&leg| (leg + count - asked) % count)
     }
 }
 
@@ -819,7 +956,7 @@ fn cut_the_roads_where_they_cross(
     roads: Query<(Entity, &Road, Has<Crossed>), Without<NeedsInitialization>>,
     children: Query<&Children>,
     mut segments: Query<(&mut RoadSegment, Option<&NextSegment>)>,
-    mut junctions: Query<&mut Junction>,
+    mut junctions: Query<(Entity, &mut Junction)>,
 ) {
     let laid: Vec<(Entity, Vec<Arc>, bool)> = roads
         .iter()
@@ -843,23 +980,144 @@ fn cut_the_roads_where_they_cross(
     }
 
     for (at, across) in found {
-        for road in roads_crossing(&across) {
+        let standing = roads_crossing(&across);
+        for &road in &standing {
             cut_the_segments_of(road, at, &children, &mut segments, &mut commands);
         }
         match junctions
             .iter_mut()
-            .find(|junction| junction.at.distance(at) <= CROSSING_TOLERANCE)
+            .find(|(_, junction)| junction.at.distance(at) <= CROSSING_TOLERANCE)
         {
-            Some(mut junction) => {
+            Some((entity, mut junction)) => {
                 for crossing in across {
                     note(&mut junction.across, crossing);
                 }
+                commands.entity(entity).remove::<JunctionLegs>();
             }
             None => {
-                commands.spawn(Junction { at, across });
+                let policy = gives_way_at(&standing, &laid);
+                commands.spawn((Junction { at, across }, policy));
             }
         }
     }
+}
+
+/// Who has right of way where the roads in `standing` cross, before the player has said.
+///
+/// A road drawn across one that was already there gives way to it, which makes the network the
+/// player has built the one that keeps running and the road they are adding the one that waits.
+/// Two roads laid on the same frame have no such order between them, so they take turns.
+fn gives_way_at(standing: &[Entity], laid: &[(Entity, Vec<Arc>, bool)]) -> JunctionPolicy {
+    let mut older = standing.iter().filter(|road| {
+        laid.iter()
+            .any(|(entity, _, fresh)| entity == *road && !fresh)
+    });
+    match (older.next(), older.next()) {
+        (Some(&road), None) => JunctionPolicy::GiveWayTo(road),
+        _ => JunctionPolicy::TakeTurns,
+    }
+}
+
+/// Work out the arms of every junction, and tell each segment which one it runs into.
+///
+/// Rebuilt for every junction rather than for the ones just found, because cutting a road again
+/// splits the segment that used to reach a junction further along it and hands the far half to a
+/// new entity. Nothing here derives a curve: a leg is the segments whose ends already stand at
+/// the crossing, gathered by the way they point (invariant 3).
+fn join_the_legs_at_the_junctions(
+    mut commands: Commands,
+    mut removed: RemovedComponents<Junction>,
+    changed: Query<(), Changed<Junction>>,
+    junctions: Query<(Entity, &Junction)>,
+    joined: Query<Entity, With<EndsAtJunction>>,
+    children: Query<&Children>,
+    segments: Query<&RoadSegment>,
+) {
+    let gone = removed.read().count() > 0;
+    if !gone && changed.is_empty() {
+        return;
+    }
+
+    for segment in &joined {
+        commands.entity(segment).remove::<EndsAtJunction>();
+    }
+
+    for (entity, junction) in &junctions {
+        let legs = legs_of(junction, &children, &segments);
+        for (index, leg) in legs.iter().enumerate() {
+            for &arriving in &leg.arriving {
+                commands.entity(arriving).insert(EndsAtJunction {
+                    junction: entity,
+                    leg: index,
+                });
+            }
+        }
+        commands.entity(entity).insert(JunctionLegs(legs));
+    }
+}
+
+/// The arms of `junction`, as the segments of its roads that begin or end where it stands.
+fn legs_of(
+    junction: &Junction,
+    children: &Query<&Children>,
+    segments: &Query<&RoadSegment>,
+) -> Vec<JunctionLeg> {
+    let mut legs: Vec<JunctionLeg> = Vec::new();
+    for road in roads_crossing(&junction.across) {
+        for piece in pieces_of(road, children) {
+            let Ok(segment) = segments.get(piece) else {
+                continue;
+            };
+            if segment
+                .world_position(segment.ends_at())
+                .distance(junction.at)
+                <= CROSSING_TOLERANCE
+            {
+                arm_of(&mut legs, road, -segment.heading_at(segment.ends_at()))
+                    .arriving
+                    .push(piece);
+            }
+            if segment
+                .world_position(segment.starts_at())
+                .distance(junction.at)
+                <= CROSSING_TOLERANCE
+            {
+                arm_of(&mut legs, road, segment.heading_at(segment.starts_at()))
+                    .leaving
+                    .push(piece);
+            }
+        }
+    }
+    legs
+}
+
+/// Every segment of `road`, on either of its lanes.
+fn pieces_of(road: Entity, children: &Query<&Children>) -> Vec<Entity> {
+    let Ok(lanes) = children.get(road) else {
+        return Vec::new();
+    };
+    lanes
+        .iter()
+        .filter_map(|lane| children.get(lane).ok())
+        .flat_map(|pieces| pieces.iter())
+        .collect()
+}
+
+/// The arm of `legs` running `heading` out of the junction, opened where there is not one yet.
+fn arm_of(legs: &mut Vec<JunctionLeg>, road: Entity, heading: Vec3) -> &mut JunctionLeg {
+    let found = legs
+        .iter()
+        .position(|leg| leg.road == road && leg.heading.dot(heading) >= LEG_TOLERANCE);
+    let at = found.unwrap_or_else(|| {
+        legs.push(JunctionLeg {
+            road,
+            heading,
+            arriving: Vec::new(),
+            leaving: Vec::new(),
+        });
+        legs.len() - 1
+    });
+    &mut legs[at]
 }
 
 /// The roads a crossing stands on, each once however many of its arcs reach the point.
@@ -1148,17 +1406,42 @@ fn ring_around(centre: Vec3, radius: f32) -> impl Iterator<Item = Vec3> {
     })
 }
 
-/// Mark every junction, which two lanes drawn across each other do not say is there.
+/// Mark every junction, its legs, and which of them the policy in force lets go first.
 ///
 /// A crossing is a point on both roads rather than anything either of them stores, so a road
-/// drawn over another looks exactly like a road drawn beside it until the junction is drawn.
-fn draw_the_junctions(mut gizmos: Gizmos<DebugGizmos>, junctions: Query<&Junction>) {
-    for junction in &junctions {
+/// drawn over another looks exactly like a road drawn beside it until the junction is drawn. Nor
+/// does anything on the ground say which arms it gathered into one leg, or which of them a rover
+/// will be made to wait on, so the arrows say both.
+fn draw_the_junctions(
+    mut gizmos: Gizmos<DebugGizmos>,
+    junctions: Query<(&Junction, Option<&JunctionLegs>, Option<&JunctionPolicy>)>,
+) {
+    for (junction, legs, policy) in &junctions {
         gizmos.circle(
             Isometry3d::new(junction.at + GIZMO_LIFT, Quat::from_rotation_x(FRAC_PI_2)),
             MAP_TILE_INRADIUS * JUNCTION_MARK,
             JUNCTION_COLOUR,
         );
+
+        let Some(legs) = legs else {
+            continue;
+        };
+        for leg in &legs.0 {
+            gizmos.arrow(
+                junction.at + GIZMO_LIFT,
+                junction.at + GIZMO_LIFT + leg.heading * MAP_TILE_INRADIUS * LEG_MARK,
+                colour_of(leg, policy),
+            );
+        }
+    }
+}
+
+/// The colour a leg is marked in, which says whether the policy makes it give way or go first.
+fn colour_of(leg: &JunctionLeg, policy: Option<&JunctionPolicy>) -> Color {
+    match policy {
+        Some(JunctionPolicy::GiveWayTo(road)) if *road == leg.road => PRIORITY_COLOUR,
+        Some(JunctionPolicy::GiveWayTo(_)) => GIVING_WAY_COLOUR,
+        _ => JUNCTION_COLOUR,
     }
 }
 
@@ -2743,6 +3026,156 @@ mod tests {
         tick(&mut app);
 
         assert!(junctions(&mut app).is_empty());
+    }
+
+    /// The one junction in the world, as the entity it is.
+    fn the_junction_entity(app: &mut App) -> Entity {
+        let mut found: Vec<Entity> = app
+            .world_mut()
+            .query_filtered::<Entity, With<Junction>>()
+            .iter(app.world())
+            .collect();
+        let one = found.pop();
+        assert!(found.is_empty(), "more than one junction");
+        one.expect("a junction")
+    }
+
+    /// The legs of the one junction in the world.
+    fn the_legs(app: &mut App) -> Vec<JunctionLeg> {
+        let junction = the_junction_entity(app);
+        component_of::<JunctionLegs>(app, junction)
+            .map(|legs| legs.0.clone())
+            .expect("the junction has legs")
+    }
+
+    /// The policy the one junction in the world holds.
+    fn the_policy(app: &mut App) -> JunctionPolicy {
+        let junction = the_junction_entity(app);
+        component_of::<JunctionPolicy>(app, junction)
+            .cloned()
+            .expect("the junction has a policy")
+    }
+
+    /// The ways out of the one junction in the world, for a rover arriving on `leg`.
+    fn exits_from(app: &mut App, leg: usize) -> Vec<Entity> {
+        let junction = the_junction_entity(app);
+        component_of::<JunctionLegs>(app, junction)
+            .map(|legs| legs.exits_from(leg))
+            .expect("the junction has legs")
+    }
+
+    #[test]
+    fn a_road_ending_on_another_meets_it_at_a_junction_of_three_legs() {
+        let mut app = a_road_placed_onto_another();
+
+        assert_eq!(the_legs(&mut app).len(), 3);
+    }
+
+    #[test]
+    fn a_crossroads_has_a_leg_for_each_way_out_of_it() {
+        let (mut app, ..) = a_crossed_road();
+
+        assert_eq!(the_legs(&mut app).len(), 4);
+    }
+
+    #[test]
+    fn a_leg_of_a_two_way_crossroads_is_both_arrived_on_and_left_by() {
+        let (mut app, ..) = a_crossed_road();
+
+        for leg in the_legs(&mut app) {
+            assert!(!leg.arriving.is_empty(), "a leg nothing arrives on");
+            assert!(!leg.leaving.is_empty(), "a leg nothing leaves by");
+        }
+    }
+
+    #[test]
+    fn every_segment_a_leg_names_reaches_the_junction() {
+        let (mut app, ..) = a_crossed_road();
+        let (at, _) = the_junction(&mut app);
+
+        for leg in the_legs(&mut app) {
+            for segment in leg.arriving {
+                assert!(position(&app, segment, 1.).distance(at) < TOLERANCE);
+            }
+            for segment in leg.leaving {
+                assert!(position(&app, segment, 0.).distance(at) < TOLERANCE);
+            }
+        }
+    }
+
+    #[test]
+    fn a_junction_offers_no_way_out_down_the_leg_it_was_arrived_on() {
+        let (mut app, ..) = a_crossed_road();
+
+        for (index, leg) in the_legs(&mut app).into_iter().enumerate() {
+            let out = exits_from(&mut app, index);
+            for back in leg.leaving {
+                assert!(!out.contains(&back), "a way back out of the leg arrived on");
+            }
+        }
+    }
+
+    #[test]
+    fn the_first_way_out_of_a_crossroads_carries_on_down_the_road_arrived_on() {
+        let (mut app, crossed, _) = a_crossed_road();
+        let straight_on = segments_under(&app, crossed);
+
+        for (index, leg) in the_legs(&mut app).into_iter().enumerate() {
+            if leg.road != crossed {
+                continue;
+            }
+            let out = exits_from(&mut app, index);
+            let first = out.first().expect("a way out");
+            assert!(
+                straight_on.contains(first),
+                "a turn taken before the straight"
+            );
+        }
+    }
+
+    #[test]
+    fn a_road_drawn_across_one_already_standing_gives_way_to_it() {
+        let (mut app, crossed, _) = a_crossed_road();
+
+        assert_eq!(the_policy(&mut app), JunctionPolicy::GiveWayTo(crossed));
+    }
+
+    #[test]
+    fn two_roads_laid_on_one_frame_take_turns_where_they_cross() {
+        let mut app = road_app();
+        spawn_road(&mut app, &STRAIGHT);
+        spawn_road_through(&mut app, &crossing_arm(STRAIGHT[1]));
+        tick(&mut app);
+
+        assert_eq!(the_policy(&mut app), JunctionPolicy::TakeTurns);
+    }
+
+    #[test]
+    fn a_road_crossed_again_still_names_the_segments_that_reach_its_first_junction() {
+        let mut app = road_app();
+        spawn_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+        spawn_road_through(&mut app, &crossing_arm(STRAIGHT[1]));
+        tick(&mut app);
+        spawn_road_through(&mut app, &crossing_arm(STRAIGHT[2]));
+        tick(&mut app);
+
+        for (junction, legs) in legs_in_the_world(&mut app) {
+            for leg in legs {
+                for segment in leg.arriving {
+                    assert!(position(&app, segment, 1.).distance(junction) < TOLERANCE);
+                }
+            }
+        }
+    }
+
+    /// Every junction in the world, as where it stands and the legs it has.
+    fn legs_in_the_world(app: &mut App) -> Vec<(Vec3, Vec<JunctionLeg>)> {
+        app.world_mut()
+            .query::<(&Junction, &JunctionLegs)>()
+            .iter(app.world())
+            .map(|(junction, legs)| (junction.at, legs.0.clone()))
+            .collect()
     }
 
     fn occupied_tiles(app: &App, road: Entity) -> Vec<HexCoordinates> {

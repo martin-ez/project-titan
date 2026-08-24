@@ -45,6 +45,15 @@ pub struct SimulationPlugin;
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Simulation;
 
+/// The ticks of game time the world has run since it was started.
+///
+/// Counted rather than measured off a clock, so it is the same number on every machine at the
+/// same point in a game. That is what lets a decision be made by the tick — which of two rovers
+/// arriving at a junction at once goes first — rather than by the order the world happens to
+/// store them in (invariant 2).
+#[derive(Resource, Default)]
+pub struct Ticks(pub u64);
+
 /// How fast the player has asked the world to run, as a rung of `WARP_LADDER`.
 #[derive(Resource)]
 struct TimeWarp(usize);
@@ -57,6 +66,8 @@ impl Plugin for SimulationPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(Time::<Fixed>::from_hz(TICK_RATE_HZ))
             .insert_resource(TimeWarp(NORMAL_WARP))
+            .init_resource::<Ticks>()
+            .init_resource::<TicksSinceMeasured>()
             .declare_bindings([
                 Binding {
                     input: BindingInput::Key(WARP_FASTER_KEY),
@@ -69,10 +80,9 @@ impl Plugin for SimulationPlugin {
                     context: BindingContext::Always,
                 },
             ])
-            .init_resource::<TicksSinceMeasured>()
             .register_diagnostic(Diagnostic::new(TICKS_PER_SECOND).with_suffix(" ticks/s"))
             .configure_sets(FixedUpdate, Simulation)
-            .add_systems(FixedUpdate, count_the_tick)
+            .add_systems(FixedUpdate, count_the_tick.before(Simulation))
             .add_systems(
                 PreUpdate,
                 (step_the_warp, apply_the_warp).chain().after(InputSystems),
@@ -104,7 +114,9 @@ fn apply_the_warp(warp: Res<TimeWarp>, mut time: ResMut<Time<Virtual>>) {
     }
 }
 
-fn count_the_tick(mut ticks: ResMut<TicksSinceMeasured>) {
+/// Count the tick before the world runs on it, so every system on it reads the same number.
+fn count_the_tick(mut run: ResMut<Ticks>, mut ticks: ResMut<TicksSinceMeasured>) {
+    run.0 += 1;
     ticks.0 += 1;
 }
 
@@ -340,5 +352,26 @@ mod tests {
         press_warp(&mut app, WARP_SLOWER_KEY, 1);
 
         assert_eq!(ticks_a_second(&app), Some(0.0));
+    }
+
+    #[test]
+    fn the_world_counts_every_tick_it_has_run() {
+        let mut app = simulation_app();
+        let before = app.world().resource::<Ticks>().0;
+
+        ticks_over(&mut app, 4);
+
+        assert_eq!(app.world().resource::<Ticks>().0, before + 4);
+    }
+
+    #[test]
+    fn a_stopped_world_counts_no_tick() {
+        let mut app = simulation_app();
+        press_warp(&mut app, WARP_SLOWER_KEY, 1);
+        let before = app.world().resource::<Ticks>().0;
+
+        ticks_over(&mut app, 4);
+
+        assert_eq!(app.world().resource::<Ticks>().0, before);
     }
 }
