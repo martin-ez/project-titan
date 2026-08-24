@@ -348,10 +348,7 @@ mod tests {
             .query::<(Entity, &RoadSegment)>()
             .iter(app.world())
             .find(|(_, segment)| {
-                segment
-                    .world_position(segment.starts_at())
-                    .distance(target)
-                    < TOLERANCE
+                segment.world_position(segment.starts_at()).distance(target) < TOLERANCE
             })
             .map(|(entity, _)| entity)
             .expect("the road has a segment setting off from the tile")
@@ -700,8 +697,15 @@ mod tests {
             tick(&mut app);
         }
 
-        assert_eq!(place_of(&app, rover), (onward, place_along(&app, onward, 1.)));
-        assert_eq!(next_of(&app, onward), None, "a lane still runs into the gap");
+        assert_eq!(
+            place_of(&app, rover),
+            (onward, place_along(&app, onward, 1.))
+        );
+        assert_eq!(
+            next_of(&app, onward),
+            None,
+            "a lane still runs into the gap"
+        );
     }
 
     #[test]

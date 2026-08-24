@@ -1150,7 +1150,8 @@ fn draw_the_lanes(
             continue;
         };
         gizmos.arrow(
-            segment.world_position(segment.ends_at() - HANDOVER_REACH * segment.length()) + GIZMO_LIFT,
+            segment.world_position(segment.ends_at() - HANDOVER_REACH * segment.length())
+                + GIZMO_LIFT,
             next.world_position(next.starts_at() + HANDOVER_REACH * next.length()) + GIZMO_LIFT,
             HANDOVER_COLOUR,
         );
@@ -2018,7 +2019,10 @@ mod tests {
             };
 
             assert_eq!(piece.arc.curvature, arc.curvature);
-            assert_eq!(piece.world_position(piece.starts_at()), arc.position(opened));
+            assert_eq!(
+                piece.world_position(piece.starts_at()),
+                arc.position(opened)
+            );
             assert_eq!(piece.world_position(piece.ends_at()), arc.position(closed));
             opened = closed;
         }
