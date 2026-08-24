@@ -3,6 +3,7 @@ use crate::common::cursor::CursorSurface;
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use crate::diagnostics::DebugGizmos;
 use crate::input::{PlayerAction, PlayerInput};
+use crate::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
 use crate::map::{HexCoordinates, MapTile, MAP_TILE_INRADIUS, MAP_TILE_SIZE};
 use crate::road::{RoadEndpoint, RoadTiles};
 use bevy::ecs::system::SystemParam;
@@ -80,6 +81,18 @@ impl BuildingTiles {
 impl Plugin for BuildingPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<BuildingTiles>()
+            .declare_bindings([
+                Binding {
+                    input: BindingInput::Mouse(MouseButton::Left),
+                    action: "Put a building on the tile",
+                    context: BindingContext::Tool(PlayerAction::EditBuildings),
+                },
+                Binding {
+                    input: BindingInput::Mouse(MouseButton::Right),
+                    action: "Take the building off the tile",
+                    context: BindingContext::Tool(PlayerAction::EditBuildings),
+                },
+            ])
             .add_observer(release_the_tile_of_a_removed_building)
             .add_systems(
                 PreUpdate,
