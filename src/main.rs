@@ -4,6 +4,7 @@ mod camera;
 mod common;
 mod diagnostics;
 mod input;
+mod legend;
 mod map;
 mod road;
 mod rover;
@@ -20,6 +21,7 @@ fn main() {
         .add_plugins(diagnostics::DebugGizmosPlugin)
         .add_plugins(diagnostics::DiagnosticsPlugin)
         .add_plugins(input::PlayerInputPlugin)
+        .add_plugins(legend::LegendPlugin)
         .add_plugins(map::MapPlugin)
         .add_plugins(road::RoadPlugin)
         .add_plugins(rover::RoverPlugin)

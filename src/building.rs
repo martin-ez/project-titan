@@ -2,6 +2,7 @@ use crate::common::cleanup::Destroy;
 use crate::common::cursor::CursorSurface;
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use crate::input::{PlayerAction, PlayerInput};
+use crate::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
 use crate::map::{HexCoordinates, MapTile, MAP_TILE_SIZE};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -48,7 +49,19 @@ struct BuildingInitializeParams<'w, 's> {
 
 impl Plugin for BuildingPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(
+        app.declare_bindings([
+            Binding {
+                input: BindingInput::Mouse(MouseButton::Left),
+                action: "Put a building on the tile",
+                context: BindingContext::Tool(PlayerAction::EditBuildings),
+            },
+            Binding {
+                input: BindingInput::Mouse(MouseButton::Right),
+                action: "Take the building off the tile",
+                context: BindingContext::Tool(PlayerAction::EditBuildings),
+            },
+        ])
+        .add_systems(
             PreUpdate,
             initialize_system::<Building, BuildingInitializeParams>,
         )

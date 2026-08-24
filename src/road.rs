@@ -2,6 +2,7 @@ use crate::common::cleanup::DestroyOnStateChange;
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use crate::diagnostics::DebugGizmos;
 use crate::input::{PlayerAction, PlayerInput};
+use crate::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
 use crate::map::{HexCoordinates, LatticeNode, MapTile, MAP_TILE_INRADIUS, MAP_TILE_SIZE};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -232,6 +233,18 @@ struct RoadInitializeParams<'w, 's> {
 impl Plugin for RoadPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<RoadTiles>()
+            .declare_bindings([
+                Binding {
+                    input: BindingInput::Mouse(MouseButton::Left),
+                    action: "Place a road node, or finish on a road already there",
+                    context: BindingContext::Tool(PlayerAction::EditRoads),
+                },
+                Binding {
+                    input: BindingInput::Mouse(MouseButton::Right),
+                    action: "Finish the road",
+                    context: BindingContext::Tool(PlayerAction::EditRoads),
+                },
+            ])
             .add_observer(release_the_tiles_of_a_removed_road)
             .add_observer(forget_a_removed_road_at_the_junctions_on_it)
             .add_systems(

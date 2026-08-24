@@ -1,3 +1,4 @@
+use crate::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
 use crate::simulation::TICKS_PER_SECOND;
 use bevy::dev_tools::diagnostics_overlay::{DiagnosticsOverlay, DiagnosticsOverlayPlugin};
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
@@ -23,6 +24,11 @@ impl Plugin for DiagnosticsPlugin {
             FrameTimeDiagnosticsPlugin::default(),
             DiagnosticsOverlayPlugin,
         ))
+        .declare_bindings([Binding {
+            input: BindingInput::Key(DIAGNOSTICS_OVERLAY_KEY),
+            action: "Show or hide the frame and tick rates",
+            context: BindingContext::Always,
+        }])
         .add_systems(Update, toggle_overlay);
     }
 }
@@ -78,6 +84,11 @@ impl Plugin for DebugGizmosPlugin {
                 ..default()
             },
         )
+        .declare_bindings([Binding {
+            input: BindingInput::Key(DEBUG_GIZMOS_KEY),
+            action: "Show or hide the debug gizmos",
+            context: BindingContext::Always,
+        }])
         .add_systems(Update, toggle_debug_gizmos);
     }
 }
