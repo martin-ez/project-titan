@@ -420,6 +420,39 @@ mod tests {
     /// A run of tiles ending on `STRAIGHT`'s second tile, in offset-row coordinates.
     const SPUR: [(i32, i32); 2] = [(2, 1), (2, 0)];
 
+    /// A run of tiles reaching the tile another road crosses, in offset-row coordinates.
+    const APPROACH: [(i32, i32); 4] = [(0, 0), (1, 0), (2, 0), (3, 0)];
+
+    /// A straight run of tiles crossing `APPROACH`'s last one, in offset-row coordinates.
+    ///
+    /// A rover reaching the junction may leave by either arm and takes the straighter of the two,
+    /// which is the arm turning sixty degrees rather than the one turning a hundred and twenty.
+    const ACROSS: [(i32, i32); 3] = [(2, 1), (3, 0), (3, -1)];
+
+    /// `APPROACH` and the arm of `ACROSS` beyond it, laid as one road, in offset-row coordinates.
+    ///
+    /// The same five nodes, so the two routes run between the same tiles over the same four steps
+    /// of the lattice and differ only in whether the corner is an arc or a junction.
+    const CURVING: [(i32, i32); 5] = [(0, 0), (1, 0), (2, 0), (3, 0), (3, -1)];
+
+    /// The same four steps of the lattice with no turn in them, in offset-row coordinates.
+    const STRAIGHT_ON: [(i32, i32); 5] = [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)];
+
+    /// Where both routes through the corner come out, in offset-row coordinates.
+    const PAST_THE_TURN: (i32, i32) = (3, -1);
+
+    /// Where the route with no turn in it comes out, in offset-row coordinates.
+    const PAST_THE_STRAIGHT: (i32, i32) = (4, 0);
+
+    /// How many ticks a junction may cost a rover that nothing else is holding up.
+    ///
+    /// The handover is one tick and the tick it lands on is where the rounding goes, so a rover
+    /// let straight through has lost this much of its journey and no more.
+    const TICKS_LOST_AT_A_JUNCTION: u32 = 2;
+
+    /// How near the middle of its last tile a rover has to stand to have arrived there.
+    const ARRIVED_WITHIN: f32 = 0.3;
+
     /// How many legs two two-way roads crossing each other make.
     const LEGS_OF_A_CROSSROADS: usize = 4;
 
@@ -591,6 +624,29 @@ mod tests {
         for taken in 1..=TICKS_ALLOWED {
             tick(app);
             if place_of(app, rover).0 != setting_off {
+                return taken;
+            }
+        }
+        TICKS_ALLOWED
+    }
+
+    /// How many ticks a rover takes to drive from the start of the road through `from` to `to`.
+    ///
+    /// The `roads` are laid in an app of their own, so no other traffic is contending for a
+    /// junction on the way and the count is the route's own rather than the map's.
+    fn ticks_along(roads: &[&[(i32, i32)]], from: &[(i32, i32)], to: (i32, i32)) -> u32 {
+        let mut app = rover_app();
+        for road in roads {
+            lay_road(&mut app, road);
+        }
+        tick(&mut app);
+        tick(&mut app);
+
+        let arrived = tiles(&[to])[0].world_position();
+        let (rover, _) = set_off_along(&mut app, from);
+        for taken in 1..=TICKS_ALLOWED {
+            tick(&mut app);
+            if standing_at(&app, rover).distance(arrived) < ARRIVED_WITHIN {
                 return taken;
             }
         }
@@ -1393,6 +1449,28 @@ mod tests {
         assert!(
             quick > slow,
             "{quick} covered on the straight against {slow} round the bends"
+        );
+    }
+
+    #[test]
+    fn a_turn_through_a_junction_costs_the_tick_it_waits_and_nothing_more() {
+        let turning = ticks_along(&[&APPROACH, &ACROSS], &APPROACH, PAST_THE_TURN);
+        let straight_on = ticks_along(&[&STRAIGHT_ON], &STRAIGHT_ON, PAST_THE_STRAIGHT);
+
+        assert!(
+            turning <= straight_on + TICKS_LOST_AT_A_JUNCTION,
+            "{turning} ticks round the turn against {straight_on} straight on, over the same steps"
+        );
+    }
+
+    #[test]
+    fn a_junction_turn_beats_the_curve_that_makes_the_same_turn() {
+        let turning = ticks_along(&[&APPROACH, &ACROSS], &APPROACH, PAST_THE_TURN);
+        let curving = ticks_along(&[&CURVING], &CURVING, PAST_THE_TURN);
+
+        assert!(
+            turning < curving,
+            "{turning} ticks turning at the junction against {curving} curving through the corner"
         );
     }
 
