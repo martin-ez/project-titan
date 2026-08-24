@@ -1,3 +1,4 @@
+use crate::building::BuildingTiles;
 use crate::common::cleanup::DestroyOnStateChange;
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use crate::diagnostics::DebugGizmos;
@@ -65,6 +66,12 @@ const COMFORTABLE_RADIUS: f32 = 4. * MAP_TILE_SIZE;
 /// the way across a tile: too little for anything to stand on.
 const TILE_SAMPLE_STEP: f32 = MAP_TILE_INRADIUS / 4.;
 
+/// How far along a segment its start is, which is where the lane of a one-way road begins.
+const SEGMENT_START: f32 = 0.;
+
+/// How far along a segment its end is, which is where the road node a rover stops at stands.
+const SEGMENT_END: f32 = 1.;
+
 /// How far the debug view lifts a lane off the ground, so it does not fight the tiles it lies on.
 const GIZMO_LIFT: Vec3 = Vec3::new(0., 0.1, 0.);
 
@@ -95,6 +102,15 @@ const TAKEN_COLOUR: Color = Color::srgb(0.95, 0.25, 0.2);
 /// How wide the mark on an occupied tile is drawn, as a share of the tile's inradius.
 const OCCUPIED_MARK: f32 = 0.35;
 
+/// The colour the link from a tile to the road serving it is drawn in
+const SERVED_COLOUR: Color = Color::srgb(0.4, 0.95, 0.7);
+
+/// The colour a tile no road reaches is marked in
+const UNSERVED_COLOUR: Color = Color::srgb(0.95, 0.4, 0.6);
+
+/// How wide the mark on a tile no road reaches is drawn, as a share of the tile's inradius.
+const UNSERVED_MARK: f32 = 0.45;
+
 /// The colour a junction is marked in
 const JUNCTION_COLOUR: Color = Color::srgb(0.9, 0.5, 0.95);
 
@@ -108,14 +124,15 @@ const JUNCTION_MARK: f32 = 0.25;
 /// each. It is also what says a point is on an arc at all rather than beside it.
 const CROSSING_TOLERANCE: f32 = 1e-3;
 
-/// The roads on the map, and the lanes a rover drives on them.
+/// The roads on the map, the lanes a rover drives on them, and where a building meets them.
 ///
-/// A road carries one lane in each direction, built together and removed together, and the two
-/// join at each end so a dead-end spur is drivable. Nothing overtakes anywhere in the network:
-/// there is no lane to move into, so a slow rover is everyone's problem and one badly placed
-/// building is a queue you can watch form. One lane shared both ways was cheaper and made traffic
-/// a decoration; several each way bought overtaking and spent it softening the jams the game is
-/// for; making the player draw the return leg charged the saving to the first thing they build.
+/// A road carries a lane in each direction unless it was built one-way, and the pair is built,
+/// joined at each end and removed together, so a dead-end spur is drivable. Nothing overtakes
+/// anywhere in the network: there is no lane to move into, so a slow rover is everyone's problem
+/// and one badly placed building is a queue you can watch form. One lane shared both ways was
+/// cheaper and made traffic a decoration; several each way bought overtaking and spent it
+/// softening the jams the game is for; making the player draw the return leg charged the saving
+/// to the first thing they build.
 pub struct RoadPlugin;
 
 /// A road the player placed: the nodes it runs through, in the order they were clicked.
@@ -130,6 +147,11 @@ pub struct Road {
     pub nodes: Vec<LatticeNode>,
     /// The direction the road sets off in, which it has where it was begun on another road's end.
     pub leaving: Option<Vec3>,
+    /// Whether the road carries only the lane running the way it was placed.
+    ///
+    /// A one-way road has no lane back and no join at either end, so its far end is a dead end
+    /// rather than a place to turn round, and nothing routes onto it against its direction.
+    pub one_way: bool,
 }
 
 /// The road the player is part way through clicking out, as far as they have taken it.
@@ -224,6 +246,29 @@ pub struct RoadTiles {
     under: HashMap<Entity, Vec<HexCoordinates>>,
 }
 
+/// Where whatever stands on a tile meets the road network.
+///
+/// A road serves a tile when one of its nodes stands on one of that tile's six corners: integer
+/// equality on the lattice rather than a distance, so what serves a building is a fact of the grid
+/// and answers the same however the arcs curve over it (invariant 3). It is a segment and a place
+/// along it and nothing else — a rover has arrived when it reaches that place, and nothing docks.
+/// An endpoint no road reaches carries none, which is what something offering it a delivery has to
+/// ask before it makes one: a building off the network is useless rather than illegal.
+#[derive(Component)]
+pub struct RoadEndpoint {
+    tile: HexCoordinates,
+    served: Option<ServedBy>,
+}
+
+/// The segment serving an endpoint, and how far along it a rover stops.
+#[derive(Clone, Copy, Debug)]
+pub struct ServedBy {
+    /// The segment a rover arrives on.
+    pub segment: Entity,
+    /// How far along it the endpoint stands, from `0` at its start to `1` at its end.
+    pub along: f32,
+}
+
 #[derive(SystemParam)]
 struct RoadInitializeParams<'w, 's> {
     commands: Commands<'w, 's>,
@@ -259,11 +304,12 @@ impl Plugin for RoadPlugin {
                 Update,
                 (
                     (place_a_node, lay_the_road).chain(),
+                    (connect_the_endpoints, draw_the_endpoints).chain(),
                     draw_the_lanes,
                     draw_the_junctions,
                     draw_the_road_being_placed,
                     draw_the_occupied_tiles,
-                    draw_the_road_under_the_cursor,
+                    draw_the_taken_tile_under_the_cursor,
                 ),
             );
     }
@@ -461,6 +507,18 @@ impl RoadSegment {
     }
 }
 
+impl RoadEndpoint {
+    /// An endpoint for whatever stands on `tile`, which nothing serves until a road reaches it.
+    pub fn on(tile: HexCoordinates) -> Self {
+        Self { tile, served: None }
+    }
+
+    /// The segment serving it and where along it, or nothing while no road reaches its tile.
+    pub fn served_by(&self) -> Option<ServedBy> {
+        self.served
+    }
+}
+
 impl Initialize<RoadInitializeParams<'_, '_>> for Road {
     fn initialize(&mut self, entity: &Entity, params: &mut RoadInitializeParams) -> Result {
         let along = arcs_through(&self.nodes, self.leaving);
@@ -468,19 +526,22 @@ impl Initialize<RoadInitializeParams<'_, '_>> for Road {
             return Err("a road of no arcs".into());
         }
         params.occupied.claim(*entity, tiles_walked_by(&along));
-        let back: Vec<Arc> = along.iter().rev().map(Arc::reversed).collect();
+        let forth = spawn_lane(&mut params.commands, *entity, &along)?;
+        if self.one_way {
+            return Ok(());
+        }
 
-        let along = spawn_lane(&mut params.commands, *entity, &along)?;
+        let back: Vec<Arc> = along.iter().rev().map(Arc::reversed).collect();
         let back = spawn_lane(&mut params.commands, *entity, &back)?;
 
         params
             .commands
-            .entity(along.last)
+            .entity(forth.last)
             .insert(NextSegment(back.first));
         params
             .commands
             .entity(back.last)
-            .insert(NextSegment(along.first));
+            .insert(NextSegment(forth.first));
         Ok(())
     }
 }
@@ -603,11 +664,13 @@ fn stretches_of(arc: &Arc) -> Vec<(f32, f32)> {
 /// The first click lays nothing: it says where the road begins, and it inherits the direction of
 /// the road it began on where there is one, so a road joined onto another leaves it without a
 /// kink. Every click after it aims the one arc that leaves the node before along the direction the
-/// road arrived on, and a target that arc cannot turn tightly enough to reach is refused.
+/// road arrived on, and a target that arc cannot turn tightly enough to reach is refused, as is
+/// one whose arc would run over ground a building stands on.
 fn place_a_node(
     mut commands: Commands,
     player_input: Res<PlayerInput>,
     action: Res<State<PlayerAction>>,
+    buildings: Res<BuildingTiles>,
     roads: Query<&Road>,
     mut placing: Query<&mut DrawnRoad>,
 ) {
@@ -619,6 +682,9 @@ fn place_a_node(
     };
 
     let Some(mut placing) = placing.iter_mut().next() else {
+        if stands_on_a_building(target.world_position(), &buildings) {
+            return;
+        }
         commands.spawn(DrawnRoad {
             nodes: vec![target],
             leaving: direction_leaving(target, &roads),
@@ -626,14 +692,23 @@ fn place_a_node(
         return;
     };
 
-    if placing.nodes.last() == Some(&target) || proposed_arc(&placing, target).is_none() {
+    if placing.nodes.last() == Some(&target) || proposed_arc(&placing, target, &buildings).is_none()
+    {
         return;
     }
     placing.nodes.push(target);
 }
 
-/// The arc a click on `target` would lay, or nothing where no arc can turn tightly enough.
-fn proposed_arc(placing: &DrawnRoad, target: LatticeNode) -> Option<Arc> {
+/// The arc a click on `target` would lay, or nothing where the road tool refuses it.
+///
+/// It refuses a target no arc can turn tightly enough to reach, and one whose arc would run over a
+/// tile a building stands on. Both answers come from here, so the tool says no in one voice and
+/// draws the refusal the same way whichever of them it is.
+fn proposed_arc(
+    placing: &DrawnRoad,
+    target: LatticeNode,
+    buildings: &BuildingTiles,
+) -> Option<Arc> {
     let standing = placing.nodes.last()?.world_position();
     let target = target.world_position();
     let arcs = arcs_through(&placing.nodes, placing.leaving);
@@ -645,7 +720,25 @@ fn proposed_arc(placing: &DrawnRoad, target: LatticeNode) -> Option<Arc> {
     };
 
     let arc = Arc::through(standing, tangent, target);
-    (arc.curvature.abs() * MIN_TURN_RADIUS <= 1.).then_some(arc)
+    (arc.curvature.abs() * MIN_TURN_RADIUS <= 1. && nothing_stands_under(&arc, buildings))
+        .then_some(arc)
+}
+
+/// Whether the tiles `arc` would take are clear of buildings.
+///
+/// The arc is walked the way the tiles it claims are walked once it is laid, so what the road tool
+/// refuses and what the road would occupy are the same tiles rather than two measurements of it.
+/// It is asked of an arc that does not exist yet, which is why it walks one rather than reading a
+/// road's claim back.
+fn nothing_stands_under(arc: &Arc, buildings: &BuildingTiles) -> bool {
+    !walk_of(arc).any(|at| stands_on_a_building(arc.position(at), buildings))
+}
+
+/// Whether a building stands on the tile `position` falls on.
+fn stands_on_a_building(position: Vec3, buildings: &BuildingTiles) -> bool {
+    buildings
+        .building_on(HexCoordinates::from_world_position(position))
+        .is_some()
 }
 
 /// The direction a road already at `node` sets off from it, where `node` is an end of one.
@@ -686,6 +779,7 @@ fn lay_the_road(
         commands.spawn(Road {
             nodes: placed.nodes.clone(),
             leaving: placed.leaving,
+            one_way: false,
         });
     }
 }
@@ -975,6 +1069,7 @@ fn forget_a_removed_road_at_the_junctions_on_it(
 fn draw_the_road_being_placed(
     mut gizmos: Gizmos<DebugGizmos>,
     player_input: Res<PlayerInput>,
+    buildings: Res<BuildingTiles>,
     placing: Query<&DrawnRoad>,
 ) {
     for placed in &placing {
@@ -999,7 +1094,7 @@ fn draw_the_road_being_placed(
         let Some(target) = player_input.cursor_node else {
             continue;
         };
-        match proposed_arc(placed, target) {
+        match proposed_arc(placed, target, &buildings) {
             Some(arc) => gizmos.linestrip(sampled(&arc), PROPOSAL_COLOUR),
             None => gizmos.line(
                 standing + GIZMO_LIFT,
@@ -1071,13 +1166,16 @@ fn draw_the_occupied_tiles(
     }
 }
 
-/// Mark the tile under the cursor when a road already runs over it.
+/// Mark the tile under the cursor when something already stands on it.
 ///
-/// This is the tile question asked from the other end, and the one #98 refuses a building with.
-/// Reading it off a road would mean reading every road, which is what the tile is keyed for.
-fn draw_the_road_under_the_cursor(
+/// A road running over it is the tile question building placement refuses a building with; a
+/// building on it is the same question the other way round, and is what the road tool refuses a
+/// first click with — which lays no arc and so has no proposal to draw red. Reading either off the
+/// things themselves would mean reading every one of them, which is what the tile is keyed for.
+fn draw_the_taken_tile_under_the_cursor(
     mut gizmos: Gizmos<DebugGizmos>,
     occupied: Res<RoadTiles>,
+    buildings: Res<BuildingTiles>,
     player_input: Res<PlayerInput>,
     tiles: Query<&MapTile>,
 ) {
@@ -1088,7 +1186,7 @@ fn draw_the_road_under_the_cursor(
     else {
         return;
     };
-    if occupied.roads_over(tile).is_empty() {
+    if occupied.roads_over(tile).is_empty() && buildings.building_on(tile).is_none() {
         return;
     }
 
@@ -1100,6 +1198,121 @@ fn draw_the_road_under_the_cursor(
         MAP_TILE_INRADIUS,
         TAKEN_COLOUR,
     );
+}
+
+/// Give every endpoint nothing serves the segment of a road that does.
+///
+/// One that is already served keeps what it has, so a road laid later does not take a building
+/// that is already on the network. One whose segment has gone looks again, which is what a road
+/// cut in two leaves behind it.
+fn connect_the_endpoints(
+    mut endpoints: Query<&mut RoadEndpoint>,
+    occupied: Res<RoadTiles>,
+    roads: Query<&Road>,
+    children: Query<&Children>,
+    segments: Query<&RoadSegment>,
+) {
+    for mut endpoint in &mut endpoints {
+        if endpoint
+            .served
+            .is_some_and(|served| segments.contains(served.segment))
+        {
+            continue;
+        }
+
+        let tile = endpoint.tile;
+        endpoint.served = the_road_serving(tile, &occupied, &roads, &children, &segments);
+    }
+}
+
+/// The place on the network serving `tile`: the first of its corners a road stands on.
+///
+/// Only the roads over the tile and the six around it are read. A road standing on a corner runs
+/// over one of the three tiles sharing that corner, all of which are in that set, so nothing
+/// outside it can serve the tile and no road beyond the neighbours is measured.
+fn the_road_serving(
+    tile: HexCoordinates,
+    occupied: &RoadTiles,
+    roads: &Query<&Road>,
+    children: &Query<&Children>,
+    segments: &Query<&RoadSegment>,
+) -> Option<ServedBy> {
+    LatticeNode::corners_of(tile)
+        .into_iter()
+        .find_map(|corner| {
+            std::iter::once(tile)
+                .chain(tile.neighbours())
+                .flat_map(|near| occupied.roads_over(near))
+                .copied()
+                .find(|&road| {
+                    roads
+                        .get(road)
+                        .is_ok_and(|standing| standing.nodes.contains(&corner))
+                })
+                .and_then(|road| segment_standing_on(corner, road, children, segments))
+        })
+}
+
+/// The place on `road` standing on `node`, which is where a rover arriving there stops.
+///
+/// Every node of a road ends one of its segments or starts the next, so the nearest of those
+/// places to the node is the node itself. A segment's end answers before its start, a rover
+/// reaching a node having driven to the end of something — but the single lane of a one-way road
+/// may only set off from that node, and then its start is the place.
+fn segment_standing_on(
+    node: LatticeNode,
+    road: Entity,
+    children: &Query<&Children>,
+    segments: &Query<&RoadSegment>,
+) -> Option<ServedBy> {
+    let standing = node.world_position();
+    children
+        .get(road)
+        .ok()?
+        .iter()
+        .filter_map(|lane| children.get(lane).ok())
+        .flat_map(|lane| lane.iter())
+        .filter_map(|segment| segments.get(segment).ok().map(|piece| (segment, piece)))
+        .flat_map(|(segment, piece)| {
+            [SEGMENT_END, SEGMENT_START]
+                .map(|along| (ServedBy { segment, along }, piece.world_position(along)))
+        })
+        .min_by(|(_, place), (_, other)| {
+            place
+                .distance_squared(standing)
+                .total_cmp(&other.distance_squared(standing))
+        })
+        .map(|(served, _)| served)
+}
+
+/// Draw what serves each endpoint, and mark the tiles nothing does.
+///
+/// Whether a building is on the network is otherwise invisible: it stands on its tile looking the
+/// same either way, and a road running past it looks like a road serving it (invariant 5).
+fn draw_the_endpoints(
+    mut gizmos: Gizmos<DebugGizmos>,
+    endpoints: Query<&RoadEndpoint>,
+    segments: Query<&RoadSegment>,
+) {
+    for endpoint in &endpoints {
+        let standing = endpoint.tile.world_position() + GIZMO_LIFT;
+        let served = endpoint.served_by().and_then(|served| {
+            segments
+                .get(served.segment)
+                .ok()
+                .map(|segment| segment.world_position(served.along))
+        });
+
+        let Some(place) = served else {
+            gizmos.circle(
+                Isometry3d::new(standing, Quat::from_rotation_x(FRAC_PI_2)),
+                MAP_TILE_INRADIUS * UNSERVED_MARK,
+                UNSERVED_COLOUR,
+            );
+            continue;
+        };
+        gizmos.line(standing, place + GIZMO_LIFT, SERVED_COLOUR);
+    }
 }
 
 /// Draw every lane, the order a rover drives its segments in, and how fast each of them allows.
@@ -1135,9 +1348,11 @@ fn draw_the_lanes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::building::BuildingPlugin;
     use crate::common::cleanup::CleanupPlugin;
     use crate::common::initialize::InitializationFailed;
     use crate::diagnostics::DebugGizmosPlugin;
+    use crate::map::MAP_TILE_SIZE;
     use crate::testing::{headless_app, tick};
     use std::collections::HashSet;
 
@@ -1183,6 +1398,15 @@ mod tests {
         [(0, 0), (-6, -1)],
     ];
 
+    /// A run whose arc crosses tiles its two nodes do not stand on, in offset-row coordinates.
+    const ACROSS_THE_TILES: [(i32, i32); 2] = SPANNING[0];
+
+    /// A tile the run of `ACROSS_THE_TILES` crosses on its way, in offset-row coordinates.
+    const IN_THE_WAY: (i32, i32) = (3, 0);
+
+    /// A tile the run of `ACROSS_THE_TILES` passes beside, in offset-row coordinates.
+    const OFF_TO_THE_SIDE: (i32, i32) = (3, 1);
+
     /// A run of tiles setting off from the last tile of `STRAIGHT`, in offset-row coordinates.
     const ONWARD: [(i32, i32); 2] = [(3, 0), (3, 1)];
 
@@ -1204,7 +1428,7 @@ mod tests {
         let mut app = headless_app();
         app.insert_state(tool)
             .insert_resource(PlayerInput::default())
-            .add_plugins((DebugGizmosPlugin, CleanupPlugin, RoadPlugin));
+            .add_plugins((DebugGizmosPlugin, CleanupPlugin, RoadPlugin, BuildingPlugin));
         app
     }
 
@@ -1212,18 +1436,20 @@ mod tests {
         app_holding(PlayerAction::Select)
     }
 
+    fn tile(offset: (i32, i32)) -> HexCoordinates {
+        HexCoordinates::from_offset_row(offset.0, offset.1)
+    }
+
     fn tiles(offsets: &[(i32, i32)]) -> Vec<HexCoordinates> {
-        offsets
-            .iter()
-            .map(|&(col, row)| HexCoordinates::from_offset_row(col, row))
-            .collect()
+        offsets.iter().copied().map(tile).collect()
+    }
+
+    fn centre_of(offset: (i32, i32)) -> LatticeNode {
+        LatticeNode::from_tile(tile(offset))
     }
 
     fn nodes(offsets: &[(i32, i32)]) -> Vec<LatticeNode> {
-        tiles(offsets)
-            .into_iter()
-            .map(LatticeNode::from_tile)
-            .collect()
+        offsets.iter().copied().map(centre_of).collect()
     }
 
     /// How far it is along the straight runs between the nodes of `offsets`.
@@ -1243,6 +1469,7 @@ mod tests {
             .spawn(Road {
                 nodes: path.to_vec(),
                 leaving: None,
+                one_way: false,
             })
             .id()
     }
@@ -1250,6 +1477,28 @@ mod tests {
     fn built_road(offsets: &[(i32, i32)]) -> (App, Entity) {
         let mut app = road_app();
         let road = spawn_road(&mut app, offsets);
+        tick(&mut app);
+        (app, road)
+    }
+
+    fn spawn_one_way_road(app: &mut App, offsets: &[(i32, i32)]) -> Entity {
+        spawn_one_way_road_through(app, &nodes(offsets))
+    }
+
+    fn spawn_one_way_road_through(app: &mut App, path: &[LatticeNode]) -> Entity {
+        app.world_mut()
+            .spawn(Road {
+                nodes: path.to_vec(),
+                leaving: None,
+                one_way: true,
+            })
+            .id()
+    }
+
+    /// An app holding a one-way road through `offsets`, laid and cut into segments.
+    fn built_one_way_road(offsets: &[(i32, i32)]) -> (App, Entity) {
+        let mut app = road_app();
+        let road = spawn_one_way_road(&mut app, offsets);
         tick(&mut app);
         (app, road)
     }
@@ -1462,6 +1711,83 @@ mod tests {
     }
 
     #[test]
+    fn a_one_way_road_gets_a_single_lane() {
+        let (app, road) = built_one_way_road(&STRAIGHT);
+
+        assert_eq!(lanes(&app, road).len(), 1);
+    }
+
+    #[test]
+    fn the_lane_of_a_one_way_road_runs_the_way_it_was_drawn() {
+        let path = tiles(&STRAIGHT);
+        let (app, road) = built_one_way_road(&STRAIGHT);
+
+        let lane = lane_from(&app, road, path[0]);
+
+        let end = position(&app, *lane.last().expect("the lane has segments"), 1.);
+        assert!(end.distance(path[STRAIGHT.len() - 1].world_position()) < TOLERANCE);
+    }
+
+    #[test]
+    fn no_lane_of_a_one_way_road_sets_off_from_its_far_end() {
+        let path = tiles(&STRAIGHT);
+        let (app, road) = built_one_way_road(&STRAIGHT);
+
+        assert!(lane_from(&app, road, path[STRAIGHT.len() - 1]).is_empty());
+    }
+
+    #[test]
+    fn the_segments_of_a_one_way_road_cover_the_whole_road_once() {
+        let (app, road) = built_one_way_road(&STRAIGHT);
+        let drawn = run_through(&STRAIGHT);
+
+        let driven: f32 = lanes(&app, road)
+            .into_iter()
+            .flat_map(|lane| children_of(&app, lane))
+            .map(|segment| length_of(&app, segment))
+            .sum();
+
+        assert!(
+            (driven - drawn).abs() < drawn * TOLERANCE,
+            "{driven} driven against {drawn} drawn"
+        );
+    }
+
+    #[test]
+    fn a_one_way_road_ends_rather_than_turning_round() {
+        for offsets in [STRAIGHT.as_slice(), TURNING.as_slice()] {
+            let (mut app, road) = built_one_way_road(offsets);
+            let lane = lane_from(&app, road, tiles(offsets)[0]);
+
+            let mut driven = vec![*lane.first().expect("the lane has segments")];
+            while let Some(next) = next_of(&app, *driven.last().expect("the drive has a segment")) {
+                assert!(!driven.contains(&next), "the drive came back on itself");
+                driven.push(next);
+            }
+
+            assert_eq!(driven.len(), segments_in_the_world(&mut app));
+        }
+    }
+
+    #[test]
+    fn no_segment_of_a_one_way_road_runs_against_it() {
+        let path = tiles(&STRAIGHT);
+        let (app, road) = built_one_way_road(&STRAIGHT);
+        let drawn = path[STRAIGHT.len() - 1].world_position() - path[0].world_position();
+
+        for segment in lanes(&app, road)
+            .into_iter()
+            .flat_map(|lane| children_of(&app, lane))
+        {
+            let heading = position(&app, segment, 1.) - position(&app, segment, 0.);
+            assert!(
+                heading.dot(drawn) > 0.,
+                "a segment runs back along the road"
+            );
+        }
+    }
+
+    #[test]
     fn despawning_a_road_takes_both_lanes_and_every_segment_with_it() {
         let (mut app, road) = built_road(&STRAIGHT);
         assert!(segments_in_the_world(&mut app) > 0);
@@ -1627,8 +1953,7 @@ mod tests {
 
     /// The node of the tile at `offset` that lies `towards` from the middle of it.
     fn corner_of(offset: (i32, i32), towards: Vec3) -> LatticeNode {
-        let tile = HexCoordinates::from_offset_row(offset.0, offset.1);
-        LatticeNode::nearest_on(tile, tile.world_position() + towards)
+        LatticeNode::nearest_on(tile(offset), tile(offset).world_position() + towards)
     }
 
     /// The road running through `offsets`, of which there is one once it has been laid.
@@ -1664,6 +1989,130 @@ mod tests {
         finish_the_road(&mut app);
 
         assert!(a_road_runs_through(&mut app, &STRAIGHT[..2]));
+    }
+
+    /// Pick up `tool`, and take the frame the change lands on.
+    fn take_up(app: &mut App, tool: PlayerAction) {
+        app.world_mut()
+            .resource_mut::<NextState<PlayerAction>>()
+            .set(tool);
+        tick(app);
+    }
+
+    /// Put a building on the tile at `offset`, and give the road tool back.
+    ///
+    /// The building tool is what places one, so the test picks it up the way a player does rather
+    /// than writing the building into the world behind the rule that refuses it.
+    fn put_a_building_on(app: &mut App, offset: (i32, i32)) -> Entity {
+        let (col, row) = offset;
+        let tile = app
+            .world_mut()
+            .spawn(MapTile {
+                coordinates: HexCoordinates::from_offset_row(col, row),
+            })
+            .id();
+        take_up(app, PlayerAction::EditBuildings);
+        tap_on(app, tile);
+        take_up(app, PlayerAction::EditRoads);
+        tile
+    }
+
+    /// Take the building on `tile` off again, with the tool that put it there.
+    fn take_the_building_off(app: &mut App, tile: Entity) {
+        take_up(app, PlayerAction::EditBuildings);
+        {
+            let mut input = app.world_mut().resource_mut::<PlayerInput>();
+            input.secondary_tap = true;
+            input.cursor_tile = Some(tile);
+        }
+        tick(app);
+        {
+            let mut input = app.world_mut().resource_mut::<PlayerInput>();
+            input.secondary_tap = false;
+            input.cursor_tile = None;
+        }
+        take_up(app, PlayerAction::EditRoads);
+    }
+
+    /// Click on `tile` with the tool in hand, and take the frame that reads the click.
+    fn tap_on(app: &mut App, tile: Entity) {
+        {
+            let mut input = app.world_mut().resource_mut::<PlayerInput>();
+            input.tap = true;
+            input.cursor_tile = Some(tile);
+        }
+        tick(app);
+        {
+            let mut input = app.world_mut().resource_mut::<PlayerInput>();
+            input.tap = false;
+            input.cursor_tile = None;
+        }
+    }
+
+    #[test]
+    fn an_arc_drawn_across_a_tile_a_building_stands_on_is_not_laid() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        put_a_building_on(&mut app, IN_THE_WAY);
+        let across = nodes(&ACROSS_THE_TILES);
+
+        click_at(&mut app, across[0]);
+        click_at(&mut app, across[1]);
+        finish_the_road(&mut app);
+
+        assert_eq!(roads_in_the_world(&mut app), 0);
+    }
+
+    #[test]
+    fn the_arcs_placed_before_the_building_are_kept() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        put_a_building_on(&mut app, IN_THE_WAY);
+        let reached = [ACROSS_THE_TILES[0], (1, 0)];
+
+        for &node in &nodes(&reached) {
+            click_at(&mut app, node);
+        }
+        click_at(&mut app, nodes(&ACROSS_THE_TILES)[1]);
+        finish_the_road(&mut app);
+
+        assert!(a_road_runs_through(&mut app, &reached));
+    }
+
+    #[test]
+    fn an_arc_that_passes_beside_a_building_is_laid() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        put_a_building_on(&mut app, OFF_TO_THE_SIDE);
+
+        place_road(&mut app, &nodes(&ACROSS_THE_TILES));
+
+        let road = road_through(&mut app, &ACROSS_THE_TILES);
+        let beside = HexCoordinates::from_offset_row(OFF_TO_THE_SIDE.0, OFF_TO_THE_SIDE.1);
+        let occupied = occupied_tiles(&app, road);
+        assert!(!occupied.contains(&beside), "{occupied:?}");
+        assert!(
+            occupied.iter().any(|&tile| are_neighbours(tile, beside)),
+            "{occupied:?} runs nowhere near the building"
+        );
+    }
+
+    #[test]
+    fn a_road_cannot_be_begun_on_a_tile_a_building_stands_on() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        put_a_building_on(&mut app, ACROSS_THE_TILES[0]);
+
+        click_at(&mut app, nodes(&ACROSS_THE_TILES)[0]);
+
+        assert_eq!(placing(&mut app), 0);
+    }
+
+    #[test]
+    fn a_route_a_building_blocked_is_drawable_once_it_is_taken_away() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        let tile = put_a_building_on(&mut app, IN_THE_WAY);
+        take_the_building_off(&mut app, tile);
+
+        place_road(&mut app, &nodes(&ACROSS_THE_TILES));
+
+        assert!(a_road_runs_through(&mut app, &ACROSS_THE_TILES));
     }
 
     #[test]
@@ -2000,6 +2449,29 @@ mod tests {
     }
 
     #[test]
+    fn cutting_a_one_way_road_at_a_junction_leaves_it_one_way() {
+        let path = tiles(&STRAIGHT);
+        let mut app = road_app();
+        let crossed = spawn_one_way_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+        spawn_road_through(&mut app, &crossing_arm(STRAIGHT[1]));
+        tick(&mut app);
+
+        let placed = path[STRAIGHT.len() - 1].world_position() - path[0].world_position();
+        assert_eq!(lanes(&app, crossed).len(), 1);
+        for segment in lanes(&app, crossed)
+            .into_iter()
+            .flat_map(|lane| children_of(&app, lane))
+        {
+            let heading = position(&app, segment, 1.) - position(&app, segment, 0.);
+            assert!(
+                heading.dot(placed) > 0.,
+                "a segment runs back along the road"
+            );
+        }
+    }
+
+    #[test]
     fn a_junction_names_both_the_roads_that_cross_at_it() {
         let (mut app, crossed, crossing) = a_crossed_road();
 
@@ -2262,6 +2734,17 @@ mod tests {
     }
 
     #[test]
+    fn a_one_way_road_occupies_the_same_tiles_as_a_two_way_one() {
+        let (both_ways, two_way) = built_road(&TURNING);
+        let (one_way, single) = built_one_way_road(&TURNING);
+
+        assert_eq!(
+            occupied_tiles(&one_way, single),
+            occupied_tiles(&both_ways, two_way)
+        );
+    }
+
+    #[test]
     fn every_tile_a_road_occupies_has_the_road_running_over_it() {
         /// How many places along each segment the road is looked for, far more closely spaced than
         /// the walk that worked the tiles out.
@@ -2459,5 +2942,162 @@ mod tests {
         for (there, back) in there.iter().zip(&back) {
             assert!((there - back).abs() < TOLERANCE, "{there} against {back}");
         }
+    }
+
+    /// The tile the endpoint under test stands on, in offset-row coordinates.
+    const BUILT_ON: (i32, i32) = (0, 0);
+
+    /// The tile sharing the northern corner of `BUILT_ON`, in offset-row coordinates.
+    const BESIDE: (i32, i32) = (0, 1);
+
+    /// The tile east of `BUILT_ON`, which shares two of its corners, in offset-row coordinates.
+    const NEXT_DOOR: (i32, i32) = (1, 0);
+
+    /// A tile sharing no corner with `BUILT_ON`, in offset-row coordinates.
+    const AWAY: (i32, i32) = (2, 0);
+
+    /// The tile the road that gets cut sets off from, in offset-row coordinates. It stands in line
+    /// with `BESIDE` and the corner they serve, so the road it makes runs straight.
+    const ALONG: (i32, i32) = (2, 2);
+
+    /// The tile the road doing the cutting sets off from, in offset-row coordinates.
+    const ACROSS: (i32, i32) = (1, 1);
+
+    /// The corner of `BUILT_ON` the roads in these tests reach it on.
+    fn served_corner() -> LatticeNode {
+        corner_of(BUILT_ON, Vec3::Z * MAP_TILE_SIZE)
+    }
+
+    fn spawn_endpoint(app: &mut App, offset: (i32, i32)) -> Entity {
+        app.world_mut().spawn(RoadEndpoint::on(tile(offset))).id()
+    }
+
+    fn served_by(app: &App, endpoint: Entity) -> Option<ServedBy> {
+        component_of::<RoadEndpoint>(app, endpoint).and_then(RoadEndpoint::served_by)
+    }
+
+    /// Where on the ground the road serving `endpoint` stops for it.
+    fn served_at(app: &App, endpoint: Entity) -> Option<Vec3> {
+        let served = served_by(app, endpoint)?;
+        Some(position(app, served.segment, served.along))
+    }
+
+    /// An app holding an endpoint on `BUILT_ON` and a road ending on the corner that serves it.
+    fn served_app() -> (App, Entity) {
+        let mut app = road_app();
+        let endpoint = spawn_endpoint(&mut app, BUILT_ON);
+        spawn_road_through(&mut app, &[centre_of(BESIDE), served_corner()]);
+        tick(&mut app);
+        (app, endpoint)
+    }
+
+    #[test]
+    fn an_endpoint_is_served_by_a_road_standing_on_a_corner_of_its_tile() {
+        let (app, endpoint) = served_app();
+
+        assert!(served_by(&app, endpoint).is_some());
+    }
+
+    #[test]
+    fn an_endpoint_is_served_where_the_road_stands_on_its_tile_s_corner() {
+        let (app, endpoint) = served_app();
+
+        let standing = served_at(&app, endpoint).expect("the endpoint is served");
+        let corner = served_corner().world_position();
+
+        assert!(
+            standing.distance(corner) < TOLERANCE,
+            "served at {standing}, not at the corner {corner}"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_no_road_reaches_is_served_by_nothing() {
+        let mut app = road_app();
+        let endpoint = spawn_endpoint(&mut app, BUILT_ON);
+        spawn_road(&mut app, &[NEXT_DOOR, AWAY]);
+
+        tick(&mut app);
+
+        assert!(served_by(&app, endpoint).is_none());
+    }
+
+    #[test]
+    fn a_road_through_the_middle_of_a_tile_does_not_serve_what_stands_on_it() {
+        let mut app = road_app();
+        let endpoint = spawn_endpoint(&mut app, BUILT_ON);
+        spawn_road(&mut app, &[BUILT_ON, NEXT_DOOR]);
+
+        tick(&mut app);
+
+        assert!(served_by(&app, endpoint).is_none());
+    }
+
+    #[test]
+    fn an_endpoint_is_served_by_a_road_laid_after_it() {
+        let mut app = road_app();
+        let endpoint = spawn_endpoint(&mut app, BUILT_ON);
+
+        tick(&mut app);
+        assert!(
+            served_by(&app, endpoint).is_none(),
+            "served before any road was laid"
+        );
+
+        spawn_road_through(&mut app, &[centre_of(BESIDE), served_corner()]);
+        tick(&mut app);
+
+        assert!(served_by(&app, endpoint).is_some());
+    }
+
+    #[test]
+    fn an_endpoint_whose_road_is_removed_reports_that_nothing_serves_it() {
+        let mut app = road_app();
+        let endpoint = spawn_endpoint(&mut app, BUILT_ON);
+        let road = spawn_road_through(&mut app, &[centre_of(BESIDE), served_corner()]);
+        tick(&mut app);
+
+        app.world_mut().entity_mut(road).despawn();
+        tick(&mut app);
+
+        assert!(served_by(&app, endpoint).is_none());
+    }
+
+    #[test]
+    fn cutting_the_road_leaves_the_endpoint_served_in_the_same_place() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        let endpoint = spawn_endpoint(&mut app, BUILT_ON);
+        spawn_road_through(
+            &mut app,
+            &[centre_of(ALONG), centre_of(BESIDE), served_corner()],
+        );
+        tick(&mut app);
+        let before = served_at(&app, endpoint).expect("the endpoint is served");
+
+        click_at(&mut app, centre_of(ACROSS));
+        click_at(&mut app, centre_of(BESIDE));
+        tick(&mut app);
+
+        let after = served_at(&app, endpoint).expect("the endpoint is served after the cut");
+        assert!(
+            after.distance(before) < TOLERANCE,
+            "served at {after} after the cut, having been served at {before}"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_is_served_by_a_one_way_road_setting_off_from_its_corner() {
+        let mut app = road_app();
+        let endpoint = spawn_endpoint(&mut app, BUILT_ON);
+        spawn_one_way_road_through(&mut app, &[served_corner(), centre_of(BESIDE)]);
+
+        tick(&mut app);
+
+        let standing = served_at(&app, endpoint).expect("the endpoint is served");
+        let corner = served_corner().world_position();
+        assert!(
+            standing.distance(corner) < TOLERANCE,
+            "served at {standing}, not at the corner {corner} the lane sets off from"
+        );
     }
 }
