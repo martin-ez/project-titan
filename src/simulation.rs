@@ -1,3 +1,4 @@
+use crate::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
 use bevy::diagnostic::{Diagnostic, DiagnosticPath, Diagnostics, RegisterDiagnostic};
 use bevy::input::InputSystems;
 use bevy::prelude::*;
@@ -67,6 +68,18 @@ impl Plugin for SimulationPlugin {
             .insert_resource(TimeWarp(NORMAL_WARP))
             .init_resource::<Ticks>()
             .init_resource::<TicksSinceMeasured>()
+            .declare_bindings([
+                Binding {
+                    input: BindingInput::Key(WARP_FASTER_KEY),
+                    action: "Run the world faster",
+                    context: BindingContext::Always,
+                },
+                Binding {
+                    input: BindingInput::Key(WARP_SLOWER_KEY),
+                    action: "Run the world slower, down to stopped",
+                    context: BindingContext::Always,
+                },
+            ])
             .register_diagnostic(Diagnostic::new(TICKS_PER_SECOND).with_suffix(" ticks/s"))
             .configure_sets(FixedUpdate, Simulation)
             .add_systems(FixedUpdate, count_the_tick.before(Simulation))

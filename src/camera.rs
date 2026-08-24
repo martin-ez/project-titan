@@ -1,4 +1,5 @@
 use crate::input::{CameraMovement, PlayerInput};
+use crate::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use std::f32::consts::{PI, TAU};
@@ -45,18 +46,23 @@ struct PanOrbitCamera {
 
 impl Plugin for CameraPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_camera)
-            .add_systems(
-                Update,
-                (
-                    scroll_zoom,
-                    pan,
-                    translate.run_if(not(in_state(CameraMovement::Pan))),
-                    orbit.run_if(in_state(CameraMovement::Orbit)),
-                    mouse_zoom.run_if(in_state(CameraMovement::Zoom)),
-                ),
-            )
-            .add_systems(PostUpdate, smooth_tracking);
+        app.declare_bindings([Binding {
+            input: BindingInput::Scroll,
+            action: "Zoom the camera",
+            context: BindingContext::Always,
+        }])
+        .add_systems(Startup, spawn_camera)
+        .add_systems(
+            Update,
+            (
+                scroll_zoom,
+                pan,
+                translate.run_if(not(in_state(CameraMovement::Pan))),
+                orbit.run_if(in_state(CameraMovement::Orbit)),
+                mouse_zoom.run_if(in_state(CameraMovement::Zoom)),
+            ),
+        )
+        .add_systems(PostUpdate, smooth_tracking);
     }
 }
 

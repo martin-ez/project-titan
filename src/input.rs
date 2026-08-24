@@ -1,42 +1,83 @@
 use crate::common::cursor::{CursorHit, CursorRayCast};
+use crate::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
 use crate::map::{LatticeNode, MapTile};
 use bevy::ecs::system::SystemParam;
 use bevy::input::InputSystems;
 use bevy::prelude::*;
 use bevy::window::{CursorOptions, PrimaryWindow};
 
-/// Key binding for panning the camera
-const CAMERA_PAN_KEY: KeyCode = KeyCode::Space;
-/// Key binding for orbiting the camera
-const CAMERA_ORBIT_KEY: KeyCode = KeyCode::ShiftLeft;
-/// Key binding for orbiting the camera
-const CAMERA_ZOOM_KEY: KeyCode = KeyCode::ControlLeft;
-/// Key binding for holding the select tool
-const SELECT_TOOL_KEY: KeyCode = KeyCode::Digit1;
-/// Key binding for holding the road editing tool
-const ROAD_TOOL_KEY: KeyCode = KeyCode::Digit2;
-/// Key binding for holding the building editing tool
-const BUILDING_TOOL_KEY: KeyCode = KeyCode::Digit3;
+/// The key that picks up each tool, and the tool it picks up
+const TOOL_KEYS: [(KeyCode, PlayerAction); 3] = [
+    (KeyCode::Digit1, PlayerAction::Select),
+    (KeyCode::Digit2, PlayerAction::EditRoads),
+    (KeyCode::Digit3, PlayerAction::EditBuildings),
+];
+
+/// What the player holds to move the camera, most specific first, and the movement it asks for
+const CAMERA_MODIFIERS: [(BindingInput, CameraMovement); 4] = [
+    (BindingInput::Key(KeyCode::ShiftLeft), CameraMovement::Orbit),
+    (
+        BindingInput::Key(KeyCode::ControlLeft),
+        CameraMovement::Zoom,
+    ),
+    (BindingInput::Key(KeyCode::Space), CameraMovement::Pan),
+    (
+        BindingInput::Mouse(MouseButton::Middle),
+        CameraMovement::Pan,
+    ),
+];
+
+/// The keys that drive the camera over the surface, the way each drives it, and what to call that
+const MOVEMENT_KEYS: [(KeyCode, Vec3, &str); 4] = [
+    (KeyCode::KeyW, Vec3::NEG_Z, "Move the camera forward"),
+    (KeyCode::KeyS, Vec3::Z, "Move the camera back"),
+    (KeyCode::KeyA, Vec3::NEG_X, "Move the camera left"),
+    (KeyCode::KeyD, Vec3::X, "Move the camera right"),
+];
+
 /// Key binding for finishing what the player is placing
 const FINISH_KEY: KeyCode = KeyCode::Escape;
 
 pub struct PlayerInputPlugin;
 
 /// The current desired action of the player, controlled by the UI or keyboard shortcuts
-#[derive(States, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(States, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PlayerAction {
     Select,
     EditRoads,
     EditBuildings,
 }
 
+impl PlayerAction {
+    /// What the legend calls this tool.
+    pub fn label(&self) -> &'static str {
+        match self {
+            PlayerAction::Select => "Select tool",
+            PlayerAction::EditRoads => "Road tool",
+            PlayerAction::EditBuildings => "Building tool",
+        }
+    }
+}
+
 /// The current movement type of the camera
-#[derive(States, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(States, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CameraMovement {
     Translate,
     Pan,
     Orbit,
     Zoom,
+}
+
+impl CameraMovement {
+    /// What the legend calls asking the camera for this movement.
+    pub fn label(&self) -> &'static str {
+        match self {
+            CameraMovement::Translate => "Move the camera",
+            CameraMovement::Pan => "Hold and drag to pan the camera",
+            CameraMovement::Orbit => "Hold and drag to orbit the camera",
+            CameraMovement::Zoom => "Hold and drag to zoom the camera",
+        }
+    }
 }
 
 #[derive(Resource, Default)]
@@ -76,6 +117,26 @@ impl Plugin for PlayerInputPlugin {
         app.insert_state(PlayerAction::Select)
             .insert_state(CameraMovement::Translate)
             .insert_resource(PlayerInput::default())
+            .declare_bindings(TOOL_KEYS.map(|(key, tool)| Binding {
+                input: BindingInput::Key(key),
+                action: tool.label(),
+                context: BindingContext::Always,
+            }))
+            .declare_bindings(CAMERA_MODIFIERS.map(|(input, movement)| Binding {
+                input,
+                action: movement.label(),
+                context: BindingContext::Always,
+            }))
+            .declare_bindings(MOVEMENT_KEYS.map(|(key, _, action)| Binding {
+                input: BindingInput::Key(key),
+                action,
+                context: BindingContext::Always,
+            }))
+            .declare_bindings([Binding {
+                input: BindingInput::Key(FINISH_KEY),
+                action: "Finish what you are placing",
+                context: BindingContext::Always,
+            }])
             .add_systems(Startup, (spawn_indicator, hide_the_cursor))
             .add_systems(
                 PreUpdate,
@@ -116,18 +177,25 @@ fn update_camera_movement_type(
     current_state: Res<State<CameraMovement>>,
     mut next_state: ResMut<NextState<CameraMovement>>,
 ) {
-    let wanted = if input.pressed(CAMERA_ORBIT_KEY) {
-        CameraMovement::Orbit
-    } else if input.pressed(CAMERA_ZOOM_KEY) {
-        CameraMovement::Zoom
-    } else if input.pressed(CAMERA_PAN_KEY) || mouse_input.pressed(MouseButton::Middle) {
-        CameraMovement::Pan
-    } else {
-        CameraMovement::Translate
-    };
+    let wanted = CAMERA_MODIFIERS
+        .iter()
+        .find(|(binding, _)| is_held(*binding, &input, &mouse_input))
+        .map_or(CameraMovement::Translate, |(_, movement)| *movement);
 
     if *current_state.get() != wanted {
         next_state.set(wanted);
+    }
+}
+
+fn is_held(
+    binding: BindingInput,
+    input: &ButtonInput<KeyCode>,
+    mouse_input: &ButtonInput<MouseButton>,
+) -> bool {
+    match binding {
+        BindingInput::Key(key) => input.pressed(key),
+        BindingInput::Mouse(button) => mouse_input.pressed(button),
+        BindingInput::Scroll => false,
     }
 }
 
@@ -140,15 +208,10 @@ fn update_player_action(
     current_state: Res<State<PlayerAction>>,
     mut next_state: ResMut<NextState<PlayerAction>>,
 ) {
-    let wanted = if input.just_pressed(SELECT_TOOL_KEY) {
-        PlayerAction::Select
-    } else if input.just_pressed(ROAD_TOOL_KEY) {
-        PlayerAction::EditRoads
-    } else if input.just_pressed(BUILDING_TOOL_KEY) {
-        PlayerAction::EditBuildings
-    } else {
+    let Some((_, wanted)) = TOOL_KEYS.iter().find(|(key, _)| input.just_pressed(*key)) else {
         return;
     };
+    let wanted = *wanted;
 
     if *current_state.get() != wanted {
         next_state.set(wanted);
@@ -225,17 +288,10 @@ fn settled_position(hit: &CursorHit, action: &PlayerAction, node: Option<Lattice
 /// Calculate the movement vector based on the player's input (WASD) and the camera's orientation
 fn get_movement_vector(input: &ButtonInput<KeyCode>, camera_transform: &GlobalTransform) -> Vec3 {
     let mut direction = Vec3::ZERO;
-    if input.pressed(KeyCode::KeyW) {
-        direction -= Vec3::Z;
-    }
-    if input.pressed(KeyCode::KeyS) {
-        direction += Vec3::Z;
-    }
-    if input.pressed(KeyCode::KeyA) {
-        direction -= Vec3::X;
-    }
-    if input.pressed(KeyCode::KeyD) {
-        direction += Vec3::X;
+    for (key, towards, _) in MOVEMENT_KEYS {
+        if input.pressed(key) {
+            direction += towards;
+        }
     }
 
     ground_plane_direction(camera_transform.rotation() * direction)
@@ -395,11 +451,43 @@ mod tests {
             .spawn((Window::default(), PrimaryWindow, CursorOptions::default()));
     }
 
+    #[test]
+    fn every_tool_on_the_table_is_picked_up_by_its_key() {
+        for (key, tool) in TOOL_KEYS {
+            let mut app = input_app();
+            tick(&mut app);
+
+            press_key(&mut app, key);
+            tick(&mut app);
+
+            assert_eq!(
+                *app.world().resource::<State<PlayerAction>>().get(),
+                tool,
+                "{key:?} did not pick up {tool:?}"
+            );
+        }
+    }
+
+    fn tool_key(tool: PlayerAction) -> KeyCode {
+        TOOL_KEYS
+            .iter()
+            .find(|(_, bound)| *bound == tool)
+            .map(|(key, _)| *key)
+            .expect("the tool is on a key")
+    }
+
+    fn camera_key(movement: CameraMovement) -> KeyCode {
+        CAMERA_MODIFIERS
+            .iter()
+            .find_map(|(input, bound)| match input {
+                BindingInput::Key(key) if *bound == movement => Some(*key),
+                _ => None,
+            })
+            .expect("the movement is on a key")
+    }
+
     fn camera_movement(app: &App) -> CameraMovement {
-        app.world()
-            .resource::<State<CameraMovement>>()
-            .get()
-            .clone()
+        *app.world().resource::<State<CameraMovement>>().get()
     }
 
     fn player_input(app: &App) -> &PlayerInput {
@@ -411,7 +499,7 @@ mod tests {
         let mut app = input_app();
         tick(&mut app);
 
-        press_key(&mut app, CAMERA_ORBIT_KEY);
+        press_key(&mut app, camera_key(CameraMovement::Orbit));
         tick(&mut app);
 
         assert_eq!(camera_movement(&app), CameraMovement::Orbit);
@@ -420,10 +508,10 @@ mod tests {
     #[test]
     fn letting_the_orbit_key_go_returns_the_camera_to_translating() {
         let mut app = input_app();
-        press_key(&mut app, CAMERA_ORBIT_KEY);
+        press_key(&mut app, camera_key(CameraMovement::Orbit));
         tick(&mut app);
 
-        release_key(&mut app, CAMERA_ORBIT_KEY);
+        release_key(&mut app, camera_key(CameraMovement::Orbit));
         tick(&mut app);
 
         assert_eq!(camera_movement(&app), CameraMovement::Translate);
@@ -636,7 +724,7 @@ mod tests {
         let mut app = app_looking_down_at_the_origin();
         spawn_tile_at(&mut app, OFF_CENTRE_TILE);
 
-        hold_tool(&mut app, BUILDING_TOOL_KEY);
+        hold_tool(&mut app, tool_key(PlayerAction::EditBuildings));
 
         assert_lands_on(player_input(&app).world_cursor_position, OFF_CENTRE_TILE);
     }
@@ -646,7 +734,7 @@ mod tests {
         let mut app = app_looking_down_at_the_origin();
         spawn_grid_tile_at(&mut app, OFF_CENTRE_TILE, origin_tile());
 
-        hold_tool(&mut app, ROAD_TOOL_KEY);
+        hold_tool(&mut app, tool_key(PlayerAction::EditRoads));
 
         assert_eq!(
             cursor_node(&app),
@@ -659,7 +747,7 @@ mod tests {
         let mut app = app_looking_down_at_the_origin();
         spawn_grid_tile_at(&mut app, OFF_CENTRE_TILE, origin_tile());
 
-        hold_tool(&mut app, ROAD_TOOL_KEY);
+        hold_tool(&mut app, tool_key(PlayerAction::EditRoads));
 
         assert_lands_on(player_input(&app).world_cursor_position, Vec3::ZERO);
     }
@@ -669,7 +757,7 @@ mod tests {
         let mut app = app_looking_down_at_the_origin();
         spawn_grid_tile_at(&mut app, OFF_CENTRE_TILE, origin_tile());
 
-        hold_tool(&mut app, BUILDING_TOOL_KEY);
+        hold_tool(&mut app, tool_key(PlayerAction::EditBuildings));
 
         assert_eq!(cursor_node(&app), None);
         assert_lands_on(player_input(&app).world_cursor_position, OFF_CENTRE_TILE);
@@ -691,7 +779,7 @@ mod tests {
         let mut app = app_looking_down_at_the_origin();
         spawn_surface_at(&mut app, OFF_CENTRE_TILE, 2.);
 
-        hold_tool(&mut app, ROAD_TOOL_KEY);
+        hold_tool(&mut app, tool_key(PlayerAction::EditRoads));
 
         assert_eq!(cursor_node(&app), None);
     }
@@ -712,7 +800,7 @@ mod tests {
         let mut app = app_looking_down_at_the_origin();
         let tile = spawn_tile_at(&mut app, OFF_CENTRE_TILE);
 
-        hold_tool(&mut app, ROAD_TOOL_KEY);
+        hold_tool(&mut app, tool_key(PlayerAction::EditRoads));
 
         assert_eq!(player_input(&app).cursor_tile, Some(tile));
     }
@@ -723,7 +811,7 @@ mod tests {
         spawn_tile_at(&mut app, OFF_CENTRE_TILE);
         spawn_surface_at(&mut app, OFF_CENTRE_TILE, 3.);
 
-        hold_tool(&mut app, BUILDING_TOOL_KEY);
+        hold_tool(&mut app, tool_key(PlayerAction::EditBuildings));
 
         assert_lands_on(
             player_input(&app).world_cursor_position,
@@ -736,7 +824,7 @@ mod tests {
         let mut app = app_looking_down_at_the_origin();
         spawn_surface_at(&mut app, OFF_CENTRE_TILE, 2.);
 
-        hold_tool(&mut app, ROAD_TOOL_KEY);
+        hold_tool(&mut app, tool_key(PlayerAction::EditRoads));
 
         assert_lands_on(
             player_input(&app).world_cursor_position,
@@ -774,7 +862,7 @@ mod tests {
     }
 
     fn player_action(app: &App) -> PlayerAction {
-        app.world().resource::<State<PlayerAction>>().get().clone()
+        *app.world().resource::<State<PlayerAction>>().get()
     }
 
     #[test]
@@ -791,7 +879,7 @@ mod tests {
         let mut app = input_app();
         tick(&mut app);
 
-        press_key(&mut app, ROAD_TOOL_KEY);
+        press_key(&mut app, tool_key(PlayerAction::EditRoads));
         tick(&mut app);
 
         assert_eq!(player_action(&app), PlayerAction::EditRoads);
@@ -802,7 +890,7 @@ mod tests {
         let mut app = input_app();
         tick(&mut app);
 
-        press_key(&mut app, BUILDING_TOOL_KEY);
+        press_key(&mut app, tool_key(PlayerAction::EditBuildings));
         tick(&mut app);
 
         assert_eq!(player_action(&app), PlayerAction::EditBuildings);
@@ -811,10 +899,10 @@ mod tests {
     #[test]
     fn pressing_the_select_key_puts_the_road_tool_down() {
         let mut app = input_app();
-        press_key(&mut app, ROAD_TOOL_KEY);
+        press_key(&mut app, tool_key(PlayerAction::EditRoads));
         tick(&mut app);
 
-        press_key(&mut app, SELECT_TOOL_KEY);
+        press_key(&mut app, tool_key(PlayerAction::Select));
         tick(&mut app);
 
         assert_eq!(player_action(&app), PlayerAction::Select);
@@ -823,10 +911,10 @@ mod tests {
     #[test]
     fn letting_the_road_key_go_keeps_the_road_tool() {
         let mut app = input_app();
-        press_key(&mut app, ROAD_TOOL_KEY);
+        press_key(&mut app, tool_key(PlayerAction::EditRoads));
         tick(&mut app);
 
-        release_key(&mut app, ROAD_TOOL_KEY);
+        release_key(&mut app, tool_key(PlayerAction::EditRoads));
         tick(&mut app);
 
         assert_eq!(player_action(&app), PlayerAction::EditRoads);
