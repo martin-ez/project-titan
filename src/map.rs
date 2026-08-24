@@ -18,6 +18,8 @@ const NODE_BASIS_X: f32 = MAP_TILE_SIZE * SQRT_3 / 4.;
 /// How far it is from the middle of a tile to the middle of any of its six edges.
 pub const MAP_TILE_INRADIUS: f32 = MAP_TILE_WIDTH / 2.;
 
+const NEIGHBOUR_STEPS: [(i32, i32); 6] = [(1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)];
+
 pub struct MapPlugin;
 
 /// Where a tile is: axial hex coordinates, from which a world position is derived.
@@ -126,6 +128,11 @@ impl LatticeNode {
             .unwrap_or(centre)
     }
 
+    /// The six nodes standing on the corners of `tile`.
+    pub fn corners_of(tile: HexCoordinates) -> [Self; 6] {
+        Self::from_tile(tile).corners()
+    }
+
     fn corners(&self) -> [Self; 6] {
         [(1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1)].map(|(di, dj)| Self {
             i: self.i + di,
@@ -174,6 +181,14 @@ impl HexCoordinates {
         }
     }
 
+    /// The six tiles sharing an edge with this one.
+    pub fn neighbours(&self) -> [Self; 6] {
+        NEIGHBOUR_STEPS.map(|(dq, dr)| Self {
+            q: self.q + dq,
+            r: self.r + dr,
+        })
+    }
+
     /// Where on the ground plane these coordinates put the middle of a tile.
     pub fn world_position(&self) -> Vec3 {
         Vec3::new(
@@ -217,8 +232,6 @@ mod tests {
     use crate::common::initialize::InitializationFailed;
     use crate::testing::{headless_app, tick};
     use std::collections::HashSet;
-
-    const NEIGHBOUR_STEPS: [(i32, i32); 6] = [(1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)];
 
     fn map_app() -> App {
         let mut app = headless_app();
@@ -325,27 +338,42 @@ mod tests {
     }
 
     #[test]
-    fn the_six_neighbours_of_a_tile_are_one_step_away_in_integers() {
+    fn the_six_neighbours_of_a_tile_stand_one_tile_width_away() {
         const TOLERANCE: f32 = 1e-3;
 
         let centre = HexCoordinates::from_offset_row(2, 3);
-        let mut neighbours = HashSet::new();
+        let neighbours: HashSet<HexCoordinates> = centre.neighbours().into_iter().collect();
 
-        for (dq, dr) in NEIGHBOUR_STEPS {
-            let neighbour = HexCoordinates {
-                q: centre.q + dq,
-                r: centre.r + dr,
-            };
+        for neighbour in centre.neighbours() {
             let distance = neighbour.world_position().distance(centre.world_position());
 
             assert!(
                 (distance - MAP_TILE_WIDTH).abs() < TOLERANCE,
                 "{neighbour:?} stands {distance} from {centre:?}, not {MAP_TILE_WIDTH}"
             );
-            neighbours.insert(neighbour);
         }
 
         assert_eq!(neighbours.len(), NEIGHBOUR_STEPS.len());
+    }
+
+    #[test]
+    fn the_six_corners_of_a_tile_stand_at_the_corners_of_its_hexagon() {
+        const TOLERANCE: f32 = 1e-3;
+
+        let tile = HexCoordinates::from_offset_row(2, 3);
+        let corners: HashSet<LatticeNode> = LatticeNode::corners_of(tile).into_iter().collect();
+
+        for corner in LatticeNode::corners_of(tile) {
+            let distance = corner.world_position().distance(tile.world_position());
+            let across_corners = MAP_TILE_SIZE / 2.;
+
+            assert!(
+                (distance - across_corners).abs() < TOLERANCE,
+                "{corner:?} stands {distance} from {tile:?}, not {across_corners}"
+            );
+        }
+
+        assert_eq!(corners.len(), 6);
     }
 
     #[test]

@@ -4,9 +4,10 @@ use crate::common::initialize::{initialize_system, Initialize, NeedsInitializati
 use crate::diagnostics::DebugGizmos;
 use crate::input::{PlayerAction, PlayerInput};
 use crate::map::{HexCoordinates, MapTile, MAP_TILE_INRADIUS, MAP_TILE_SIZE};
-use crate::road::RoadTiles;
+use crate::road::{RoadEndpoint, RoadTiles};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
+use std::collections::HashMap;
 
 const BUILDING_HEIGHT: f32 = 4.;
 const BUILDING_WIDTH: f32 = MAP_TILE_SIZE / 2.;
@@ -34,12 +35,16 @@ struct Building {
     coordinates: HexCoordinates,
 }
 
-/// Marks a tile as carrying a building, naming the one that stands on it.
+/// Which building stands on each tile of the map.
 ///
-/// Its presence is what makes a tile refuse another, and the building it names is what a removal
-/// takes off.
-#[derive(Component)]
-struct Occupied(Entity);
+/// Keyed by the tile, because both rules it answers are asked of one: a tile carrying a building
+/// refuses another, and an arc the road tool proposes over that tile is refused too. That second
+/// reader is why the record is a resource rather than a marker on the tile, and it is `RoadTiles`
+/// seen from the other end.
+#[derive(Resource, Default)]
+pub struct BuildingTiles {
+    on: HashMap<HexCoordinates, Entity>,
+}
 
 /// The roof a building offers the cursor, claiming the whole of the tile it stands on.
 fn building_surface() -> CursorSurface {
@@ -57,19 +62,36 @@ struct BuildingInitializeParams<'w, 's> {
     materials: ResMut<'w, Assets<StandardMaterial>>,
 }
 
+impl BuildingTiles {
+    /// The building standing on `tile`, of which there is at most one.
+    pub fn building_on(&self, tile: HexCoordinates) -> Option<Entity> {
+        self.on.get(&tile).copied()
+    }
+
+    fn claim(&mut self, tile: HexCoordinates, building: Entity) {
+        self.on.insert(tile, building);
+    }
+
+    fn release(&mut self, tile: HexCoordinates) {
+        self.on.remove(&tile);
+    }
+}
+
 impl Plugin for BuildingPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(
-            PreUpdate,
-            initialize_system::<Building, BuildingInitializeParams>,
-        )
-        .add_systems(
-            Update,
-            (
-                (place_building_system, remove_building_system).chain(),
-                draw_the_refused_tile,
-            ),
-        );
+        app.init_resource::<BuildingTiles>()
+            .add_observer(release_the_tile_of_a_removed_building)
+            .add_systems(
+                PreUpdate,
+                initialize_system::<Building, BuildingInitializeParams>,
+            )
+            .add_systems(
+                Update,
+                (
+                    (place_building_system, remove_building_system).chain(),
+                    draw_the_refused_tile,
+                ),
+            );
     }
 }
 
@@ -77,8 +99,19 @@ impl Plugin for BuildingPlugin {
 ///
 /// A road is read off the tile it runs over rather than measured out of its arcs, so the answer
 /// costs a lookup however many roads are on the map.
-fn takes_a_building(tile: HexCoordinates, occupied: bool, roads: &RoadTiles) -> bool {
-    !occupied && roads.roads_over(tile).is_empty()
+fn takes_a_building(tile: HexCoordinates, buildings: &BuildingTiles, roads: &RoadTiles) -> bool {
+    buildings.building_on(tile).is_none() && roads.roads_over(tile).is_empty()
+}
+
+/// Give up the tile a building held, whichever way it left the world.
+fn release_the_tile_of_a_removed_building(
+    removed: On<Remove, Building>,
+    buildings: Query<&Building>,
+    mut tiles: ResMut<BuildingTiles>,
+) {
+    if let Ok(building) = buildings.get(removed.entity) {
+        tiles.release(building.coordinates);
+    }
 }
 
 /// Put a building on the tile the cursor is over, when the player taps holding the building tool.
@@ -92,7 +125,8 @@ fn place_building_system(
     player_input: Res<PlayerInput>,
     action: Res<State<PlayerAction>>,
     roads: Res<RoadTiles>,
-    tiles: Query<(&MapTile, Has<Occupied>)>,
+    mut buildings: ResMut<BuildingTiles>,
+    tiles: Query<&MapTile>,
 ) {
     if !player_input.tap || *action.get() != PlayerAction::EditBuildings {
         return;
@@ -100,10 +134,10 @@ fn place_building_system(
     let Some(entity) = player_input.cursor_tile else {
         return;
     };
-    let Ok((tile, occupied)) = tiles.get(entity) else {
+    let Ok(tile) = tiles.get(entity) else {
         return;
     };
-    if !takes_a_building(tile.coordinates, occupied, &roads) {
+    if !takes_a_building(tile.coordinates, &buildings, &roads) {
         return;
     }
 
@@ -112,22 +146,24 @@ fn place_building_system(
             Building {
                 coordinates: tile.coordinates,
             },
+            RoadEndpoint::on(tile.coordinates),
             Visibility::Hidden,
         ))
         .id();
-    commands.entity(entity).insert(Occupied(building));
+    buildings.claim(tile.coordinates, building);
 }
 
 /// Take the building off the tile the cursor is over, when the player clicks the secondary button
 /// holding the building tool.
 ///
-/// The tile is left as placeable as it was before anything stood on it: the marker goes with the
-/// building, so nothing is left behind to refuse the next one.
+/// The tile is left as placeable as it was before anything stood on it: the record of what stands
+/// there goes with the building, so nothing is left behind to refuse the next one.
 fn remove_building_system(
     mut commands: Commands,
     player_input: Res<PlayerInput>,
     action: Res<State<PlayerAction>>,
-    tiles: Query<&Occupied>,
+    buildings: Res<BuildingTiles>,
+    tiles: Query<&MapTile>,
 ) {
     if !player_input.secondary_tap || *action.get() != PlayerAction::EditBuildings {
         return;
@@ -135,12 +171,14 @@ fn remove_building_system(
     let Some(entity) = player_input.cursor_tile else {
         return;
     };
-    let Ok(occupied) = tiles.get(entity) else {
+    let Ok(tile) = tiles.get(entity) else {
+        return;
+    };
+    let Some(building) = buildings.building_on(tile.coordinates) else {
         return;
     };
 
-    commands.entity(occupied.0).insert(Destroy);
-    commands.entity(entity).remove::<Occupied>();
+    commands.entity(building).insert(Destroy);
 }
 
 /// Cross out the tile under the cursor when it will not take a building.
@@ -153,18 +191,19 @@ fn draw_the_refused_tile(
     player_input: Res<PlayerInput>,
     action: Res<State<PlayerAction>>,
     roads: Res<RoadTiles>,
-    tiles: Query<(&MapTile, Has<Occupied>)>,
+    buildings: Res<BuildingTiles>,
+    tiles: Query<&MapTile>,
 ) {
     if *action.get() != PlayerAction::EditBuildings {
         return;
     }
-    let Some((tile, occupied)) = player_input
+    let Some(tile) = player_input
         .cursor_tile
         .and_then(|entity| tiles.get(entity).ok())
     else {
         return;
     };
-    if takes_a_building(tile.coordinates, occupied, &roads) {
+    if takes_a_building(tile.coordinates, &buildings, &roads) {
         return;
     }
 
@@ -296,6 +335,17 @@ mod tests {
         tap_on(&mut app, Some(tile));
 
         assert_eq!(buildings(&mut app), [HexCoordinates::from_offset_row(2, 3)]);
+    }
+
+    #[test]
+    fn a_placed_building_gets_an_endpoint_to_meet_the_road_network_on() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        let tile = spawn_tile(&mut app, 2, 3);
+
+        tap_on(&mut app, Some(tile));
+
+        let building = building_entity(&mut app).expect("the tap placed a building");
+        assert!(app.world().entity(building).contains::<RoadEndpoint>());
     }
 
     #[test]
