@@ -188,6 +188,21 @@ pub struct NextSegment(pub Entity);
 #[relationship_target(relationship = NextSegment)]
 pub struct PreviousSegments(Vec<Entity>);
 
+/// A segment cut in two by a junction, and the stretch of it beyond the cut.
+///
+/// The arc under both halves is the one that was already there and so is every distance along it:
+/// what the cut moved is where one segment stops answering for the road and the next starts. What
+/// was standing further along than the cut is standing on the stretch beyond it and has not moved
+/// (invariant 6), which is what leaves anyone holding a distance somewhere to be handed to.
+#[derive(EntityEvent)]
+pub struct SegmentCut {
+    /// The segment that was cut, which now ends where the junction stands.
+    #[event_target]
+    pub segment: Entity,
+    /// The stretch beyond the cut, a segment of its own on the same arc.
+    pub beyond: Entity,
+}
+
 /// A place two roads cross, and how far along each of them the crossing stands.
 ///
 /// It is a distance along an arc rather than a node of its own, so putting one in cuts the
@@ -424,16 +439,23 @@ fn turned(vector: Vec3, by: f32) -> Vec3 {
 }
 
 impl RoadSegment {
-    /// Where on the ground a rover `along` of the way down this segment stands.
+    /// Where on the ground a rover standing `along` this segment's arc stands.
     ///
-    /// Either end of the stretch is read off the arc exactly rather than interpolated to, so a
-    /// rover leaving a segment stands where the next one starts rather than a rounding away.
+    /// The distance is the arc's own rather than a fraction of the stretch, so cutting the stretch
+    /// shorter leaves every distance on it reading the same point off the same arc. Beyond either
+    /// end the stretch is another segment's to answer for, so the answer stops at the end.
     pub fn world_position(&self, along: f32) -> Vec3 {
-        self.arc.position(match along {
-            along if along <= 0. => self.from,
-            along if along >= 1. => self.to,
-            along => self.from + (self.to - self.from) * along,
-        })
+        self.arc.position(along.clamp(self.from, self.to))
+    }
+
+    /// How far along its arc this segment's stretch begins.
+    pub fn starts_at(&self) -> f32 {
+        self.from
+    }
+
+    /// How far along its arc this segment's stretch ends.
+    pub fn ends_at(&self) -> f32 {
+        self.to
     }
 
     /// How long the stretch of arc this segment covers is, in world units.
@@ -862,6 +884,10 @@ fn cut_the_segments_of(
                 commands.entity(cut).insert(NextSegment(onward));
             }
             commands.entity(piece).insert(NextSegment(cut));
+            commands.trigger(SegmentCut {
+                segment: piece,
+                beyond: cut,
+            });
             if let Ok((mut segment, _)) = segments.get_mut(piece) {
                 segment.to = along;
             }
@@ -1114,7 +1140,8 @@ fn draw_the_lanes(
     for (segment, next) in &segments {
         gizmos.linestrip(
             (0..=SEGMENT_SUBDIVISIONS).map(|step| {
-                segment.world_position(step as f32 / SEGMENT_SUBDIVISIONS as f32) + GIZMO_LIFT
+                let along = step as f32 / SEGMENT_SUBDIVISIONS as f32 * segment.length();
+                segment.world_position(segment.starts_at() + along) + GIZMO_LIFT
             }),
             SLOW_LANE_COLOUR.mix(&LANE_COLOUR, segment.speed_limit() / STRAIGHT_SPEED_LIMIT),
         );
@@ -1123,8 +1150,8 @@ fn draw_the_lanes(
             continue;
         };
         gizmos.arrow(
-            segment.world_position(1. - HANDOVER_REACH) + GIZMO_LIFT,
-            next.world_position(HANDOVER_REACH) + GIZMO_LIFT,
+            segment.world_position(segment.ends_at() - HANDOVER_REACH * segment.length()) + GIZMO_LIFT,
+            next.world_position(next.starts_at() + HANDOVER_REACH * next.length()) + GIZMO_LIFT,
             HANDOVER_COLOUR,
         );
     }
@@ -1302,9 +1329,10 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// Where a rover `along` of the way down `segment` stands, as a fraction of its stretch.
     fn position(app: &App, segment: Entity, along: f32) -> Vec3 {
         component_of::<RoadSegment>(app, segment)
-            .map(|segment| segment.world_position(along))
+            .map(|piece| piece.world_position(piece.starts_at() + along * piece.length()))
             .unwrap_or(Vec3::NAN)
     }
 
@@ -1954,9 +1982,18 @@ mod tests {
 
         assert_eq!(first.arc.curvature, arc.curvature);
         assert_eq!(second.arc.curvature, arc.curvature);
-        assert_eq!(first.world_position(0.), whole.world_position(0.));
-        assert_eq!(second.world_position(1.), whole.world_position(1.));
-        assert_eq!(first.world_position(1.), second.world_position(0.));
+        assert_eq!(
+            first.world_position(first.starts_at()),
+            whole.world_position(whole.starts_at())
+        );
+        assert_eq!(
+            second.world_position(second.ends_at()),
+            whole.world_position(whole.ends_at())
+        );
+        assert_eq!(
+            first.world_position(first.ends_at()),
+            second.world_position(second.starts_at())
+        );
     }
 
     #[test]
@@ -1981,12 +2018,12 @@ mod tests {
             };
 
             assert_eq!(piece.arc.curvature, arc.curvature);
-            assert_eq!(piece.world_position(0.), arc.position(opened));
-            assert_eq!(piece.world_position(1.), arc.position(closed));
+            assert_eq!(piece.world_position(piece.starts_at()), arc.position(opened));
+            assert_eq!(piece.world_position(piece.ends_at()), arc.position(closed));
             opened = closed;
         }
 
-        assert_eq!(arc.position(opened), whole.world_position(1.));
+        assert_eq!(arc.position(opened), whole.world_position(whole.ends_at()));
     }
 
     #[test]
@@ -2091,6 +2128,31 @@ mod tests {
             at.distance(met) < TOLERANCE,
             "a junction at {at}, not {met}"
         );
+    }
+
+    /// Every cut a test heard announced, as the segment cut and the stretch beyond it.
+    #[derive(Resource, Default)]
+    struct Announced(Vec<(Entity, Entity)>);
+
+    #[test]
+    fn cutting_a_road_announces_the_stretch_beyond_the_cut() {
+        let mut app = road_app();
+        app.init_resource::<Announced>();
+        app.add_observer(|cut: On<SegmentCut>, mut heard: ResMut<Announced>| {
+            heard.0.push((cut.segment, cut.beyond));
+        });
+        spawn_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+
+        spawn_road_through(&mut app, &crossing_arm(STRAIGHT[1]));
+        tick(&mut app);
+
+        let heard = app.world().resource::<Announced>().0.clone();
+        assert!(!heard.is_empty(), "a segment was cut and nothing said so");
+        for (segment, beyond) in heard {
+            assert_eq!(next_of(&app, segment), Some(beyond));
+            assert_eq!(position(&app, segment, 1.), position(&app, beyond, 0.));
+        }
     }
 
     #[test]
