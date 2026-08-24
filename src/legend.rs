@@ -399,8 +399,11 @@ mod tests {
         let mut app = headless_app();
         app.add_plugins(bevy::diagnostic::DiagnosticsPlugin)
             .add_plugins(LegendPlugin)
+            .add_plugins(crate::diagnostics::DebugGizmosPlugin)
+            .add_plugins(crate::diagnostics::DiagnosticsPlugin)
             .add_plugins(crate::input::PlayerInputPlugin)
             .add_plugins(crate::simulation::SimulationPlugin)
+            .add_plugins(crate::camera::CameraPlugin)
             .add_plugins(crate::road::RoadPlugin)
             .add_plugins(crate::building::BuildingPlugin);
 
