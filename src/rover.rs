@@ -750,7 +750,7 @@ mod tests {
     /// road, which is the stretch of a journey where the tick has anything to decide.
     const TICKS_TRACED: usize = 400;
 
-    /// Where along its segment a rover waiting at the junction ahead of it stands.
+    /// How much of its segment a rover waiting at the junction ahead of it has covered.
     const AT_THE_JUNCTION: f32 = 1.;
 
     fn rover_app() -> App {
