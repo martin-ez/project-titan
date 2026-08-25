@@ -35,6 +35,30 @@ const SEGMENT_LENGTH: f32 = 5.;
 /// that touch its heading, one either side.
 const MIN_TURN_RADIUS: f32 = MAP_TILE_INRADIUS;
 
+/// How far back from a crossing a junction takes its legs, so a turn through it has room to be an
+/// arc.
+///
+/// Half a lattice step. It is what makes the sixty degree turn between neighbouring tiles come out
+/// at exactly `MIN_TURN_RADIUS`: a junction is the sharpest corner a network has, and this leaves
+/// it no sharper than the tightest arc the road tool will build.
+const JUNCTION_PULLBACK: f32 = MAP_TILE_SIZE / 4.;
+
+/// How much road a junction takes, as the stretch between the way in and the way out on one arm.
+///
+/// Two crossings closer than this have no room between them for either of their turns, so the
+/// second is refused rather than laid over the first.
+const JUNCTION_EXTENT: f32 = 2. * JUNCTION_PULLBACK;
+
+/// How closely a fitted turn has to meet the leg it reaches to be laid as one arc.
+///
+/// Equal pull-backs on two straight legs put the one arc that leaves along the leg it arrives on
+/// exactly along the leg it reaches, so the pair a curved leg needs is the exception rather than
+/// the rule.
+const TURN_TANGENT_REACH: f32 = 1e-3;
+
+/// How many segments a way through a junction may be made of before it is given up on.
+const STEPS_THROUGH_A_JUNCTION: usize = 8;
+
 /// How far off the heading a target may sit and still be aimed at straight.
 ///
 /// A chain of arcs carries its tangent from one arc to the next, so a target that is dead ahead
@@ -126,9 +150,6 @@ const UNSERVED_MARK: f32 = 0.45;
 
 /// The colour a junction is marked in
 const JUNCTION_COLOUR: Color = Color::srgb(0.9, 0.5, 0.95);
-
-/// How wide a junction is marked, as a share of the tile's inradius.
-const JUNCTION_MARK: f32 = 0.25;
 
 /// How far apart two points may stand and still be the same crossing.
 ///
@@ -255,6 +276,14 @@ pub struct SegmentCut {
     pub beyond: Entity,
 }
 
+/// The stretch of a road lying inside a junction, which the junction gives rather than the lane.
+///
+/// It is the arc the road already had over the ground the junction covers: cutting a leg back
+/// moves where one segment stops answering for the road and nothing else, so a road crossed
+/// however often stands where it was drawn (invariant 6). A rover reaches it by being let through.
+#[derive(Component)]
+struct Inside(Entity);
+
 /// A place two roads cross, and how far along each of them the crossing stands.
 ///
 /// It is a distance along an arc rather than a node of its own, so putting one in cuts the
@@ -291,6 +320,7 @@ struct JunctionLeg {
     heading: Vec3,
     arriving: Vec<Entity>,
     leaving: Vec<Entity>,
+    ways: Vec<(usize, Entity)>,
 }
 
 /// The arms of a junction, and which of them a rover arriving on one may leave by.
@@ -393,6 +423,7 @@ impl Plugin for RoadPlugin {
                 (
                     initialize_system::<Road, RoadInitializeParams>,
                     cut_the_roads_where_they_cross,
+                    fit_the_turns_through_the_junctions,
                     join_the_legs_at_the_junctions,
                 )
                     .chain()
@@ -584,6 +615,11 @@ impl RoadSegment {
         self.arc.position(along.clamp(self.from, self.to))
     }
 
+    /// How far along its arc the place on this segment's stretch nearest `at` stands.
+    fn place_of(&self, at: Vec3) -> f32 {
+        self.arc.nearest_to(at).clamp(self.from, self.to)
+    }
+
     /// How far along its arc this segment's stretch begins.
     pub fn starts_at(&self) -> f32 {
         self.from
@@ -638,30 +674,29 @@ impl PlaceOnTheRoad {
 }
 
 impl JunctionLegs {
-    /// The segments a rover arriving on `leg` may leave the junction by, straightest way first.
+    /// The ways through the junction open to a rover arriving on `leg`, straightest way first.
     ///
     /// Every leg but the one it arrived on: a junction is not a place to turn round, and a road
-    /// that dead-ends elsewhere is where that is done. The order is how far the rover has to turn
-    /// to take each, so carrying on down the road it is already on comes first wherever it can.
+    /// that dead-ends elsewhere is where that is done. What each hands back is the arc the rover
+    /// drives to make the turn, so a turn is a stretch of road priced by its curvature like any
+    /// other. The order is how far the rover has to turn to take each, so carrying on down the
+    /// road it is already on comes first wherever it can.
     pub fn exits_from(&self, leg: usize) -> Vec<Entity> {
         let Some(arrived) = self.0.get(leg) else {
             return Vec::new();
         };
 
-        let mut out: Vec<&JunctionLeg> = self
-            .0
+        let mut out: Vec<(usize, Entity)> = arrived
+            .ways
             .iter()
-            .enumerate()
-            .filter(|&(index, _)| index != leg)
-            .map(|(_, other)| other)
+            .copied()
+            .filter(|&(other, _)| other != leg && other < self.0.len())
             .collect();
-        out.sort_by(|one, other| {
-            straightness(arrived.heading, other.heading)
-                .total_cmp(&straightness(arrived.heading, one.heading))
+        out.sort_by(|&(one, _), &(other, _)| {
+            straightness(arrived.heading, self.0[other].heading)
+                .total_cmp(&straightness(arrived.heading, self.0[one].heading))
         });
-        out.into_iter()
-            .flat_map(|leg| leg.leaving.iter().copied())
-            .collect()
+        out.into_iter().map(|(_, way)| way).collect()
     }
 
     fn road_of(&self, leg: usize) -> Option<Entity> {
@@ -871,6 +906,7 @@ fn place_a_node(
     action: Res<State<PlayerAction>>,
     buildings: Res<BuildingTiles>,
     roads: Query<&Road>,
+    junctions: Query<&Junction>,
     mut placing: Query<&mut DrawnRoad>,
 ) {
     if !player_input.tap || *action.get() != PlayerAction::EditRoads {
@@ -891,22 +927,69 @@ fn place_a_node(
         return;
     };
 
-    if placing.nodes.last() == Some(&target) || proposed_arc(&placing, target, &buildings).is_none()
+    let (laid, crossings) = the_network_standing(&roads, &junctions);
+    if placing.nodes.last() == Some(&target)
+        || proposed_arc(&placing, target, &buildings, &laid, &crossings).is_none()
     {
         return;
     }
     placing.nodes.push(target);
 }
 
+/// The arcs already laid and the crossings already on them, which a click is measured against.
+fn the_network_standing(
+    roads: &Query<&Road>,
+    junctions: &Query<&Junction>,
+) -> (Vec<Arc>, Vec<Vec3>) {
+    (
+        roads
+            .iter()
+            .flat_map(|road| arcs_through(&road.nodes, road.leaving))
+            .collect(),
+        junctions.iter().map(|junction| junction.at).collect(),
+    )
+}
+
+/// Whether every crossing `arc` would make leaves room at it for the turns through it.
+///
+/// A junction reaches a pull-back down each of its arms, so two crossings closer than its whole
+/// extent have no room between them for either turn. Refusing the second is what leaves the
+/// junction the player already built exactly where they built it. A crossing landing on one
+/// already there is that crossing rather than a second one, and is what a third road meeting two
+/// others at a point makes.
+fn leaves_room_for_its_turns(arc: &Arc, laid: &[Arc], crossings: &[Vec3]) -> bool {
+    let mut met: Vec<Vec3> = crossings.to_vec();
+    for other in laid {
+        for (at, ..) in crossings_of(arc, other) {
+            if !room_for_a_junction_at(at, &met) {
+                return false;
+            }
+            met.push(at);
+        }
+    }
+    true
+}
+
+/// Whether a crossing at `at` stands clear enough of those already `met` for both to turn.
+fn room_for_a_junction_at(at: Vec3, met: &[Vec3]) -> bool {
+    !met.iter().any(|met| {
+        let apart = met.distance(at);
+        apart > CROSSING_TOLERANCE && apart < JUNCTION_EXTENT
+    })
+}
+
 /// The arc a click on `target` would lay, or nothing where the road tool refuses it.
 ///
-/// It refuses a target no arc can turn tightly enough to reach, and one whose arc would run over a
-/// tile a building stands on. Both answers come from here, so the tool says no in one voice and
-/// draws the refusal the same way whichever of them it is.
+/// It refuses a target no arc can turn tightly enough to reach, one whose arc would run over a
+/// tile a building stands on, and one that would cross a road too near a crossing already there
+/// for either of them to have room to turn. Every answer comes from here, so the tool says no in
+/// one voice and draws the refusal the same way whichever of them it is.
 fn proposed_arc(
     placing: &DrawnRoad,
     target: LatticeNode,
     buildings: &BuildingTiles,
+    laid: &[Arc],
+    crossings: &[Vec3],
 ) -> Option<Arc> {
     let standing = placing.nodes.last()?.world_position();
     let target = target.world_position();
@@ -919,8 +1002,10 @@ fn proposed_arc(
     };
 
     let arc = Arc::through(standing, tangent, target);
-    (arc.curvature.abs() * MIN_TURN_RADIUS <= 1. && nothing_stands_under(&arc, buildings))
-        .then_some(arc)
+    (arc.curvature.abs() * MIN_TURN_RADIUS <= 1.
+        && nothing_stands_under(&arc, buildings)
+        && leaves_room_for_its_turns(&arc, laid, crossings))
+    .then_some(arc)
 }
 
 /// Whether the tiles `arc` would take are clear of buildings.
@@ -1091,6 +1176,7 @@ fn cut_the_roads_where_they_cross(
     roads: Query<(Entity, &Road, Has<Crossed>), Without<NeedsInitialization>>,
     children: Query<&Children>,
     mut segments: Query<(&mut RoadSegment, Option<&NextSegment>)>,
+    before: Query<&PreviousSegments>,
     mut junctions: Query<(Entity, &mut Junction)>,
 ) {
     let laid: Vec<(Entity, Vec<Arc>, bool)> = roads
@@ -1114,24 +1200,41 @@ fn cut_the_roads_where_they_cross(
         }
     }
 
+    let mut made: Vec<Vec3> = junctions.iter().map(|(_, junction)| junction.at).collect();
     for (at, across) in found {
-        let standing = roads_crossing(&across);
-        for &road in &standing {
-            cut_the_segments_of(road, at, &children, &mut segments, &mut commands);
+        if !room_for_a_junction_at(at, &made) {
+            continue;
         }
-        match junctions
-            .iter_mut()
+        made.push(at);
+        let standing = roads_crossing(&across);
+        let standing_at = junctions
+            .iter()
             .find(|(_, junction)| junction.at.distance(at) <= CROSSING_TOLERANCE)
-        {
-            Some((entity, mut junction)) => {
+            .map(|(entity, _)| entity);
+        let junction = standing_at.unwrap_or_else(|| commands.spawn_empty().id());
+        for &road in &standing {
+            cut_the_road_back_from(
+                road,
+                at,
+                junction,
+                &children,
+                &mut segments,
+                &before,
+                &mut commands,
+            );
+        }
+        match standing_at.and_then(|entity| junctions.get_mut(entity).ok()) {
+            Some((entity, mut standing)) => {
                 for crossing in across {
-                    note(&mut junction.across, crossing);
+                    note(&mut standing.across, crossing);
                 }
                 commands.entity(entity).remove::<JunctionLegs>();
             }
             None => {
                 let policy = gives_way_at(&standing, &laid);
-                commands.spawn((Junction { at, across }, policy));
+                commands
+                    .entity(junction)
+                    .insert((Junction { at, across }, policy));
             }
         }
     }
@@ -1166,7 +1269,7 @@ fn join_the_legs_at_the_junctions(
     junctions: Query<(Entity, &Junction)>,
     joined: Query<Entity, With<EndsAtJunction>>,
     children: Query<&Children>,
-    segments: Query<&RoadSegment>,
+    segments: Query<(&RoadSegment, Option<&NextSegment>, Option<&Inside>)>,
 ) {
     let gone = removed.read().count() > 0;
     if !gone && changed.is_empty() {
@@ -1178,7 +1281,8 @@ fn join_the_legs_at_the_junctions(
     }
 
     for (entity, junction) in &junctions {
-        let legs = legs_of(junction, &children, &segments);
+        let mut legs = legs_of(entity, junction, &children, &segments);
+        join_the_ways_through(entity, &mut legs, &children, &segments);
         for (index, leg) in legs.iter().enumerate() {
             for &arriving in &leg.arriving {
                 commands.entity(arriving).insert(EndsAtJunction {
@@ -1191,32 +1295,248 @@ fn join_the_legs_at_the_junctions(
     }
 }
 
-/// The arms of `junction`, as the segments of its roads that begin or end where it stands.
+/// Fit an arc between every pair of legs a junction's own roads do not already join.
+///
+/// A rover carrying straight on drives the stretch of its road inside the junction, which is that
+/// road's arc and priced by that road's curvature, so it pays nothing to cross a straight. Every
+/// other turn is an arc of its own, fitted between the legs it joins and priced the same way, so
+/// the sharpest corner in a network is charged for by the rule already there rather than a term
+/// added beside it.
+fn fit_the_turns_through_the_junctions(
+    mut commands: Commands,
+    junctions: Query<(Entity, &Junction), Changed<Junction>>,
+    children: Query<&Children>,
+    segments: Query<(&RoadSegment, Option<&NextSegment>, Option<&Inside>)>,
+) {
+    for (entity, junction) in &junctions {
+        for turn in children.get(entity).into_iter().flat_map(Children::iter) {
+            commands.entity(turn).despawn();
+        }
+
+        let legs = legs_of(entity, junction, &children, &segments);
+        for (index, leg) in legs.iter().enumerate() {
+            let carried_on: Vec<usize> = leg
+                .arriving
+                .iter()
+                .filter_map(|&arriving| segments.get(arriving).ok())
+                .filter_map(|(_, onward, _)| onward.map(|onward| onward.0))
+                .filter_map(|head| the_leg_reached_by(head, &legs, &segments))
+                .collect();
+
+            for (other, out) in legs.iter().enumerate() {
+                if other == index || carried_on.contains(&other) {
+                    continue;
+                }
+                lay_the_turn_between(entity, leg, out, &segments, &mut commands);
+            }
+        }
+    }
+}
+
+/// Lay the arc a rover arriving on `from` drives to leave a junction by `out`.
+fn lay_the_turn_between(
+    junction: Entity,
+    from: &JunctionLeg,
+    out: &JunctionLeg,
+    segments: &Query<(&RoadSegment, Option<&NextSegment>, Option<&Inside>)>,
+    commands: &mut Commands,
+) {
+    let sets_off = from
+        .arriving
+        .first()
+        .and_then(|&arriving| segments.get(arriving).ok())
+        .map(|(segment, _, _)| {
+            (
+                segment.world_position(segment.ends_at()),
+                segment.heading_at(segment.ends_at()),
+            )
+        });
+    let reaches = out
+        .leaving
+        .first()
+        .and_then(|&leaving| segments.get(leaving).ok().map(|found| (leaving, found)))
+        .map(|(leaving, (segment, _, _))| {
+            (
+                leaving,
+                segment.world_position(segment.starts_at()),
+                segment.heading_at(segment.starts_at()),
+            )
+        });
+    let (Some((sets_off, heading)), Some((leaving, reaches, along))) = (sets_off, reaches) else {
+        return;
+    };
+
+    let mut laid: Option<Entity> = None;
+    for arc in turn_between(sets_off, heading, reaches, along) {
+        let piece = commands
+            .spawn((
+                RoadSegment {
+                    arc,
+                    from: 0.,
+                    to: arc.length,
+                },
+                ChildOf(junction),
+            ))
+            .id();
+        if let Some(laid) = laid {
+            commands.entity(laid).insert(NextSegment(piece));
+        }
+        laid = Some(piece);
+    }
+    if let Some(laid) = laid {
+        commands.entity(laid).insert(NextSegment(leaving));
+    }
+}
+
+/// The arcs a rover drives to turn from `heading` at `from` onto `along` at `to`.
+///
+/// One where the arc leaving along the leg arrived on also reaches the far leg along it, which is
+/// what equal pull-backs either side of a crossing of straights give. Two where a leg curves
+/// through the junction: a pair joined at a shared tangent meets both ends exactly, where a single
+/// arc has a curvature and a length to spend and three ends' worth of geometry to spend them on.
+fn turn_between(from: Vec3, heading: Vec3, to: Vec3, along: Vec3) -> Vec<Arc> {
+    let one = Arc::through(from, heading, to);
+    if one.tangent_at(one.length).dot(along) >= 1. - TURN_TANGENT_REACH {
+        return vec![one];
+    }
+
+    let reach = to - from;
+    let opening = 2. * (1. - heading.dot(along));
+    let leaning = 2. * reach.dot(heading + along);
+    let span = reach.length_squared();
+    let chord = if opening.abs() < STRAIGHT_REACH {
+        if leaning.abs() < STRAIGHT_REACH {
+            return vec![one];
+        }
+        span / leaning
+    } else {
+        (-leaning + (leaning * leaning + 4. * opening * span).sqrt()) / (2. * opening)
+    };
+
+    let joint = ((from + heading * chord) + (to - along * chord)) / 2.;
+    let first = Arc::through(from, heading, joint);
+    let second = Arc::through(joint, first.tangent_at(first.length), to);
+    vec![first, second]
+}
+
+/// Tell each leg which way through the junction reaches each of the others.
+///
+/// A way is the stretch of road inside the junction where it carries the rover straight on and the
+/// arc fitted between two legs where it turns, so both are found the same way: follow what leaves
+/// the leg until it runs into a segment another leg is left by.
+fn join_the_ways_through(
+    entity: Entity,
+    legs: &mut [JunctionLeg],
+    children: &Query<&Children>,
+    segments: &Query<(&RoadSegment, Option<&NextSegment>, Option<&Inside>)>,
+) {
+    let mut ways: Vec<Vec<(usize, Entity)>> = vec![Vec::new(); legs.len()];
+    for (index, leg) in legs.iter().enumerate() {
+        for &arriving in &leg.arriving {
+            let Some(head) = segments
+                .get(arriving)
+                .ok()
+                .and_then(|(_, onward, _)| onward.map(|onward| onward.0))
+            else {
+                continue;
+            };
+            if let Some(out) = the_leg_reached_by(head, legs, segments) {
+                ways[index].push((out, head));
+            }
+        }
+    }
+
+    for turn in children.get(entity).into_iter().flat_map(Children::iter) {
+        let Ok((segment, _, _)) = segments.get(turn) else {
+            continue;
+        };
+        let sets_off = segment.world_position(segment.starts_at());
+        let Some(index) = the_leg_setting_off_at(sets_off, legs, segments) else {
+            continue;
+        };
+        if let Some(out) = the_leg_reached_by(turn, legs, segments) {
+            ways[index].push((out, turn));
+        }
+    }
+
+    for (leg, ways) in legs.iter_mut().zip(ways) {
+        leg.ways = ways;
+    }
+}
+
+/// Which leg the way through a junction beginning at `head` comes out on.
+fn the_leg_reached_by(
+    head: Entity,
+    legs: &[JunctionLeg],
+    segments: &Query<(&RoadSegment, Option<&NextSegment>, Option<&Inside>)>,
+) -> Option<usize> {
+    let mut standing = head;
+    for _ in 0..STEPS_THROUGH_A_JUNCTION {
+        let (_, onward, _) = segments.get(standing).ok()?;
+        let onward = onward?.0;
+        if let Some(leg) = legs.iter().position(|leg| leg.leaving.contains(&onward)) {
+            return Some(leg);
+        }
+        standing = onward;
+    }
+    None
+}
+
+/// Which leg a way through a junction that begins at `sets_off` is entered from.
+fn the_leg_setting_off_at(
+    sets_off: Vec3,
+    legs: &[JunctionLeg],
+    segments: &Query<(&RoadSegment, Option<&NextSegment>, Option<&Inside>)>,
+) -> Option<usize> {
+    legs.iter().position(|leg| {
+        leg.arriving.iter().any(|&arriving| {
+            segments.get(arriving).is_ok_and(|(segment, _, _)| {
+                segment.world_position(segment.ends_at()).distance(sets_off) <= CROSSING_TOLERANCE
+            })
+        })
+    })
+}
+
+/// The arms of `junction`, as the segments of its roads that reach the stretch it holds.
+///
+/// A leg begins where the road stops being the lane's to drive, which is a pull-back short of the
+/// crossing rather than at it, so a junction has an extent on every arm. Nothing here derives a
+/// curve: the arms are read off the segments already cut (invariant 3).
 fn legs_of(
+    entity: Entity,
     junction: &Junction,
     children: &Query<&Children>,
-    segments: &Query<&RoadSegment>,
+    segments: &Query<(&RoadSegment, Option<&NextSegment>, Option<&Inside>)>,
 ) -> Vec<JunctionLeg> {
     let mut legs: Vec<JunctionLeg> = Vec::new();
     for road in roads_crossing(&junction.across) {
-        for piece in pieces_of(road, children) {
-            let Ok(segment) = segments.get(piece) else {
+        let pieces = pieces_of(road, children);
+        let held = |piece: Entity| {
+            segments
+                .get(piece)
+                .is_ok_and(|(_, _, inside)| inside.is_some_and(|inside| inside.0 == entity))
+        };
+        let left_by: Vec<Entity> = pieces
+            .iter()
+            .filter(|&&piece| held(piece))
+            .filter_map(|&piece| segments.get(piece).ok())
+            .filter_map(|(_, onward, _)| onward.map(|onward| onward.0))
+            .filter(|&onward| !held(onward))
+            .collect();
+
+        for &piece in &pieces {
+            let Ok((segment, onward, _)) = segments.get(piece) else {
                 continue;
             };
-            if segment
-                .world_position(segment.ends_at())
-                .distance(junction.at)
-                <= CROSSING_TOLERANCE
-            {
+            if held(piece) {
+                continue;
+            }
+            if onward.map(|onward| onward.0).is_some_and(held) {
                 arm_of(&mut legs, road, -segment.heading_at(segment.ends_at()))
                     .arriving
                     .push(piece);
             }
-            if segment
-                .world_position(segment.starts_at())
-                .distance(junction.at)
-                <= CROSSING_TOLERANCE
-            {
+            if left_by.contains(&piece) {
                 arm_of(&mut legs, road, segment.heading_at(segment.starts_at()))
                     .leaving
                     .push(piece);
@@ -1249,6 +1569,7 @@ fn arm_of(legs: &mut Vec<JunctionLeg>, road: Entity, heading: Vec3) -> &mut Junc
             heading,
             arriving: Vec::new(),
             leaving: Vec::new(),
+            ways: Vec::new(),
         });
         legs.len() - 1
     });
@@ -1322,16 +1643,18 @@ fn note(across: &mut Vec<Crossing>, crossing: Crossing) {
     }
 }
 
-/// Cut every segment of `road` that covers `at` in two, both halves on the arc it already had.
+/// Take every lane of `road` back from `at` by a pull-back, giving the stretch between to `junction`.
 ///
-/// The arc is copied rather than worked out again, so the halves hold the same curve to the bit
-/// and neither of them has moved. A crossing that lands on an end of a segment cuts nothing: the
-/// junction already stands where two segments meet.
-fn cut_the_segments_of(
+/// Every arc is the one the road already had and so is every distance along it: a cut moves where
+/// one segment stops answering for the road and the next starts, and nothing else. A road crossed
+/// however often therefore stands exactly where it was drawn (invariant 6).
+fn cut_the_road_back_from(
     road: Entity,
     at: Vec3,
+    junction: Entity,
     children: &Query<&Children>,
     segments: &mut Query<(&mut RoadSegment, Option<&NextSegment>)>,
+    before: &Query<&PreviousSegments>,
     commands: &mut Commands,
 ) {
     let Ok(lanes) = children.get(road) else {
@@ -1341,42 +1664,262 @@ fn cut_the_segments_of(
         let Ok(pieces) = children.get(lane) else {
             continue;
         };
-        for piece in pieces.iter() {
-            let Ok((segment, onward)) = segments.get(piece) else {
-                continue;
-            };
-            let (arc, from, to) = (segment.arc, segment.from, segment.to);
-            let onward = onward.map(|onward| onward.0);
-            let Some(along) = arc.distance_along(at) else {
-                continue;
-            };
-            if along <= from + CROSSING_TOLERANCE || along >= to - CROSSING_TOLERANCE {
-                continue;
-            }
+        let held: Vec<Entity> = pieces.iter().collect();
+        let Some((piece, along)) = the_piece_covering(at, &held, segments) else {
+            continue;
+        };
+        let (back, enters_at) = walked_back_from(piece, along, &held, segments, before);
+        let (on, leaves_at) = walked_on_from(piece, along, &held, segments);
+        let mut spanned = back;
+        spanned.extend(on.into_iter().skip(1));
+        give_the_stretch_to(
+            lane, junction, &spanned, enters_at, leaves_at, segments, commands,
+        );
+    }
+}
 
-            let cut = commands
-                .spawn((
-                    RoadSegment {
-                        arc,
-                        from: along,
-                        to,
-                    },
-                    ChildOf(lane),
-                ))
-                .id();
-            if let Some(onward) = onward {
-                commands.entity(cut).insert(NextSegment(onward));
-            }
-            commands.entity(piece).insert(NextSegment(cut));
+/// Which of `held` covers `at`, and how far along its arc that stands.
+fn the_piece_covering(
+    at: Vec3,
+    held: &[Entity],
+    segments: &Query<(&mut RoadSegment, Option<&NextSegment>)>,
+) -> Option<(Entity, f32)> {
+    held.iter().find_map(|&piece| {
+        let (segment, _) = segments.get(piece).ok()?;
+        let along = segment.arc.distance_along(at)?;
+        (along >= segment.from - CROSSING_TOLERANCE && along <= segment.to + CROSSING_TOLERANCE)
+            .then(|| (piece, along.clamp(segment.from, segment.to)))
+    })
+}
+
+/// The pieces a pull-back back down the lane from `along` on `piece` covers, and where it stops.
+///
+/// They come back in the order a rover drives them, so the first is the one the junction is
+/// entered on. A lane that runs out first stops there: a road beginning on another is inside the
+/// junction from its first node, and has nothing further back to give.
+fn walked_back_from(
+    piece: Entity,
+    along: f32,
+    held: &[Entity],
+    segments: &Query<(&mut RoadSegment, Option<&NextSegment>)>,
+    before: &Query<&PreviousSegments>,
+) -> (Vec<Entity>, f32) {
+    let mut walked = vec![piece];
+    let mut standing = piece;
+    let mut reached = along;
+    let mut left = JUNCTION_PULLBACK;
+    for _ in 0..held.len() {
+        let Ok((segment, _)) = segments.get(standing) else {
+            break;
+        };
+        let room = reached - segment.from;
+        if room >= left {
+            walked.reverse();
+            return (walked, reached - left);
+        }
+        left -= room;
+        let earlier = before.get(standing).ok().and_then(|earlier| {
+            earlier
+                .0
+                .iter()
+                .copied()
+                .find(|piece| held.contains(piece) && !walked.contains(piece))
+        });
+        let Some(earlier) = earlier else {
+            walked.reverse();
+            return (walked, segment.from);
+        };
+        reached = segments.get(earlier).map_or(0., |(segment, _)| segment.to);
+        standing = earlier;
+        walked.push(earlier);
+    }
+    walked.reverse();
+    (walked, reached)
+}
+
+/// The pieces a pull-back on down the lane from `along` on `piece` covers, and where it stops.
+fn walked_on_from(
+    piece: Entity,
+    along: f32,
+    held: &[Entity],
+    segments: &Query<(&mut RoadSegment, Option<&NextSegment>)>,
+) -> (Vec<Entity>, f32) {
+    let mut walked = vec![piece];
+    let mut standing = piece;
+    let mut reached = along;
+    let mut left = JUNCTION_PULLBACK;
+    for _ in 0..held.len() {
+        let Ok((segment, onward)) = segments.get(standing) else {
+            break;
+        };
+        let room = segment.to - reached;
+        if room >= left {
+            return (walked, reached + left);
+        }
+        left -= room;
+        let onward = onward
+            .map(|onward| onward.0)
+            .filter(|piece| held.contains(piece) && !walked.contains(piece));
+        let Some(onward) = onward else {
+            return (walked, segment.to);
+        };
+        reached = segments.get(onward).map_or(0., |(segment, _)| segment.from);
+        standing = onward;
+        walked.push(onward);
+    }
+    (walked, reached)
+}
+
+/// Mark the stretch of `spanned` between `enters_at` and `leaves_at` as `junction`'s, cutting the
+/// ends off the pieces that reach past it.
+fn give_the_stretch_to(
+    lane: Entity,
+    junction: Entity,
+    spanned: &[Entity],
+    enters_at: f32,
+    leaves_at: f32,
+    segments: &mut Query<(&mut RoadSegment, Option<&NextSegment>)>,
+    commands: &mut Commands,
+) {
+    let (Some(&first), Some(&last)) = (spanned.first(), spanned.last()) else {
+        return;
+    };
+    if first == last {
+        give_one_piece_to(
+            lane, junction, first, enters_at, leaves_at, segments, commands,
+        );
+        return;
+    }
+
+    let mut inside = spanned.to_vec();
+    if let Some(beyond) = cut_beyond(lane, first, enters_at, segments, commands) {
+        inside[0] = beyond;
+    }
+    cut_beyond(lane, last, leaves_at, segments, commands);
+    for piece in inside {
+        commands.entity(piece).insert(Inside(junction));
+    }
+}
+
+/// Give `junction` the stretch of one piece between `enters_at` and `leaves_at`.
+fn give_one_piece_to(
+    lane: Entity,
+    junction: Entity,
+    piece: Entity,
+    enters_at: f32,
+    leaves_at: f32,
+    segments: &mut Query<(&mut RoadSegment, Option<&NextSegment>)>,
+    commands: &mut Commands,
+) {
+    let Ok((segment, onward)) = segments.get(piece) else {
+        return;
+    };
+    let (arc, from, to) = (segment.arc, segment.from, segment.to);
+    let onward = onward.map(|onward| onward.0);
+    let tail = (leaves_at < to - CROSSING_TOLERANCE).then(|| {
+        let tail = commands
+            .spawn((
+                RoadSegment {
+                    arc,
+                    from: leaves_at,
+                    to,
+                },
+                ChildOf(lane),
+            ))
+            .id();
+        if let Some(onward) = onward {
+            commands.entity(tail).insert(NextSegment(onward));
+        }
+        tail
+    });
+
+    if enters_at > from + CROSSING_TOLERANCE {
+        let middle = commands
+            .spawn((
+                RoadSegment {
+                    arc,
+                    from: enters_at,
+                    to: leaves_at,
+                },
+                ChildOf(lane),
+                Inside(junction),
+            ))
+            .id();
+        if let Some(onward) = tail.or(onward) {
+            commands.entity(middle).insert(NextSegment(onward));
+        }
+        commands.entity(piece).insert(NextSegment(middle));
+        commands.trigger(SegmentCut {
+            segment: piece,
+            beyond: middle,
+        });
+        if let Some(tail) = tail {
             commands.trigger(SegmentCut {
-                segment: piece,
-                beyond: cut,
+                segment: middle,
+                beyond: tail,
             });
-            if let Ok((mut segment, _)) = segments.get_mut(piece) {
-                segment.to = along;
-            }
+        }
+        if let Ok((mut segment, _)) = segments.get_mut(piece) {
+            segment.to = enters_at;
+        }
+        return;
+    }
+
+    commands.entity(piece).insert(Inside(junction));
+    if let Some(tail) = tail {
+        commands.entity(piece).insert(NextSegment(tail));
+        commands.trigger(SegmentCut {
+            segment: piece,
+            beyond: tail,
+        });
+        if let Ok((mut segment, _)) = segments.get_mut(piece) {
+            segment.to = leaves_at;
         }
     }
+}
+
+/// Cut `piece` at `along`, handing the stretch past it to a segment of its own on the same arc.
+///
+/// The arc is copied rather than worked out again, so both halves hold the same curve to the bit
+/// and neither has moved. A cut that lands on an end of the piece moves nothing and makes nothing.
+fn cut_beyond(
+    lane: Entity,
+    piece: Entity,
+    along: f32,
+    segments: &mut Query<(&mut RoadSegment, Option<&NextSegment>)>,
+    commands: &mut Commands,
+) -> Option<Entity> {
+    let Ok((segment, onward)) = segments.get(piece) else {
+        return None;
+    };
+    let (arc, from, to) = (segment.arc, segment.from, segment.to);
+    if along <= from + CROSSING_TOLERANCE || along >= to - CROSSING_TOLERANCE {
+        return None;
+    }
+    let onward = onward.map(|onward| onward.0);
+
+    let beyond = commands
+        .spawn((
+            RoadSegment {
+                arc,
+                from: along,
+                to,
+            },
+            ChildOf(lane),
+        ))
+        .id();
+    if let Some(onward) = onward {
+        commands.entity(beyond).insert(NextSegment(onward));
+    }
+    commands.entity(piece).insert(NextSegment(beyond));
+    commands.trigger(SegmentCut {
+        segment: piece,
+        beyond,
+    });
+    if let Ok((mut segment, _)) = segments.get_mut(piece) {
+        segment.to = along;
+    }
+    Some(beyond)
 }
 
 /// Where two arcs cross, and how far along each of them the crossing stands.
@@ -1483,8 +2026,14 @@ fn draw_the_road_being_placed(
     mut gizmos: Gizmos<DebugGizmos>,
     player_input: Res<PlayerInput>,
     buildings: Res<BuildingTiles>,
+    roads: Query<&Road>,
+    junctions: Query<&Junction>,
     placing: Query<&DrawnRoad>,
 ) {
+    if placing.is_empty() {
+        return;
+    }
+    let (laid, crossings) = the_network_standing(&roads, &junctions);
     for placed in &placing {
         gizmos.linestrip(
             placed
@@ -1507,7 +2056,7 @@ fn draw_the_road_being_placed(
         let Some(target) = player_input.cursor_node else {
             continue;
         };
-        match proposed_arc(placed, target, &buildings) {
+        match proposed_arc(placed, target, &buildings, &laid, &crossings) {
             Some(arc) => gizmos.linestrip(sampled(&arc), PROPOSAL_COLOUR),
             None => gizmos.line(
                 standing + GIZMO_LIFT,
@@ -1567,12 +2116,13 @@ fn ring_around(centre: Vec3, radius: f32) -> impl Iterator<Item = Vec3> {
     })
 }
 
-/// Mark every junction, its legs, and which of them the policy in force lets go first.
+/// Mark how far every junction reaches, its legs, and which of them the policy lets go first.
 ///
 /// A crossing is a point on both roads rather than anything either of them stores, so a road
-/// drawn over another looks exactly like a road drawn beside it until the junction is drawn. Nor
-/// does anything on the ground say which arms it gathered into one leg, or which of them a rover
-/// will be made to wait on, so the arrows say both.
+/// drawn over another looks exactly like a road drawn beside it until the junction is drawn. The
+/// circle is the pull-back the junction takes its legs back by, which is the ground the turns
+/// through it are fitted over. Nor does anything say which arms it gathered into one leg, or
+/// which of them a rover waits on, so the arrows say both.
 fn draw_the_junctions(
     mut gizmos: Gizmos<DebugGizmos>,
     junctions: Query<(&Junction, Option<&JunctionLegs>, Option<&JunctionPolicy>)>,
@@ -1580,7 +2130,7 @@ fn draw_the_junctions(
     for (junction, legs, policy) in &junctions {
         gizmos.circle(
             Isometry3d::new(junction.at + GIZMO_LIFT, Quat::from_rotation_x(FRAC_PI_2)),
-            MAP_TILE_INRADIUS * JUNCTION_MARK,
+            JUNCTION_PULLBACK,
             JUNCTION_COLOUR,
         );
 
@@ -1667,8 +2217,9 @@ fn draw_the_taken_tile_under_the_cursor(
 /// Give every endpoint nothing serves the segment of a road that does.
 ///
 /// One that is already served keeps what it has, so a road laid later does not take a building
-/// that is already on the network. One whose segment has gone looks again, which is what a road
-/// cut in two leaves behind it.
+/// that is already on the network. One whose segment no longer reaches the place it stops at looks
+/// again, which is what a road cut under it leaves behind: the segment that was serving it answers
+/// for a shorter stretch than it did, and the place is another's to give.
 fn connect_the_endpoints(
     mut endpoints: Query<&mut RoadEndpoint>,
     occupied: Res<RoadTiles>,
@@ -1677,10 +2228,11 @@ fn connect_the_endpoints(
     segments: Query<&RoadSegment>,
 ) {
     for mut endpoint in &mut endpoints {
-        if endpoint
-            .served
-            .is_some_and(|served| segments.contains(served.segment))
-        {
+        if endpoint.served.is_some_and(|served| {
+            segments
+                .get(served.segment)
+                .is_ok_and(|piece| (piece.starts_at()..=piece.ends_at()).contains(&served.along))
+        }) {
             continue;
         }
 
@@ -1719,10 +2271,9 @@ fn the_road_serving(
 
 /// The place on `road` standing on `node`, which is where a rover arriving there stops.
 ///
-/// Every node of a road ends one of its segments or starts the next, so the nearest of those
-/// places to the node is the node itself. A segment's end answers before its start, a rover
-/// reaching a node having driven to the end of something — but the single lane of a one-way road
-/// may only set off from that node, and then its start is the place.
+/// The nearest place on any of its stretches, rather than the nearest end of one: a node is
+/// usually where a segment stops and the next starts, and a junction standing on it leaves it in
+/// the middle of the stretch the junction holds. Both answer the node itself.
 fn segment_standing_on(
     node: LatticeNode,
     road: Entity,
@@ -1737,9 +2288,9 @@ fn segment_standing_on(
         .filter_map(|lane| children.get(lane).ok())
         .flat_map(|lane| lane.iter())
         .filter_map(|segment| segments.get(segment).ok().map(|piece| (segment, piece)))
-        .flat_map(|(segment, piece)| {
-            [piece.ends_at(), piece.starts_at()]
-                .map(|along| (ServedBy { segment, along }, piece.world_position(along)))
+        .map(|(segment, piece)| {
+            let along = piece.place_of(standing);
+            (ServedBy { segment, along }, piece.world_position(along))
         })
         .min_by(|(_, place), (_, other)| {
             place
@@ -1831,6 +2382,12 @@ mod tests {
     /// A straight run of tiles, in offset-row coordinates.
     const STRAIGHT: [(i32, i32); 4] = [(0, 0), (1, 0), (2, 0), (3, 0)];
 
+    /// A straight run of tiles crossing `STRAIGHT` at the last of them, in offset-row coordinates.
+    ///
+    /// A rover arriving down `STRAIGHT` may leave by either arm: the one turning sixty degrees, or
+    /// the one turning a hundred and twenty back on itself.
+    const TURNING_OFF: [(i32, i32); 3] = [(2, 1), (3, 0), (3, -1)];
+
     /// A run of tiles that turns a corner, in offset-row coordinates.
     const TURNING: [(i32, i32); 3] = [(0, 0), (1, 0), (1, 1)];
 
@@ -1882,6 +2439,13 @@ mod tests {
     /// A direction from a tile's middle far enough towards the corner two round from that one.
     const TOWARDS_THE_CORNER_TWO_ROUND: Vec3 =
         Vec3::new(MAP_TILE_INRADIUS, 0., -MAP_TILE_INRADIUS / 2.);
+
+    /// A direction from a tile's middle towards the corner one round from `TOWARDS_A_CORNER`.
+    const TOWARDS_THE_NEXT_CORNER: Vec3 = Vec3::new(MAP_TILE_INRADIUS, 0., MAP_TILE_INRADIUS / 2.);
+
+    /// A direction from a tile's middle towards the corner opposite `TOWARDS_THE_NEXT_CORNER`.
+    const TOWARDS_THE_CORNER_OPPOSITE: Vec3 =
+        Vec3::new(-MAP_TILE_INRADIUS, 0., -MAP_TILE_INRADIUS / 2.);
 
     /// A straight run crossing the curve of `TURNING` between its nodes, in offset-row coordinates.
     const ACROSS_THE_CURVE: [(i32, i32); 2] = [(0, 2), (2, 0)];
@@ -2858,6 +3422,18 @@ mod tests {
         ]
     }
 
+    /// The two corners of the tile at `offset` a road drawn between crosses `STRAIGHT` at its
+    /// middle.
+    ///
+    /// The tile's other diameter, so the crossing it makes stands nearer the one `crossing_arm`
+    /// makes than a junction's extent: the two have no room between them for either turn.
+    fn a_second_arm_across(offset: (i32, i32)) -> Vec<LatticeNode> {
+        vec![
+            corner_of(offset, TOWARDS_THE_NEXT_CORNER),
+            corner_of(offset, TOWARDS_THE_CORNER_OPPOSITE),
+        ]
+    }
+
     /// `STRAIGHT`, and a road laid across the middle of it a frame later.
     fn a_crossed_road() -> (App, Entity, Entity) {
         let mut app = road_app();
@@ -3098,10 +3674,11 @@ mod tests {
 
         let mut met = 0;
         for segment in segments_under(&app, crossed) {
-            if position(&app, segment, 1.).distance(at) > TOLERANCE {
+            let ends = position(&app, segment, 1.).distance(at);
+            if (ends - JUNCTION_PULLBACK).abs() > TOLERANCE {
                 continue;
             }
-            let onward = next_of(&app, segment).expect("the segment past the junction");
+            let onward = next_of(&app, segment).expect("the segment past the cut");
             let before = component_of::<RoadSegment>(&app, segment).expect("the segment before");
             let after = component_of::<RoadSegment>(&app, onward).expect("the segment after");
 
@@ -3110,7 +3687,44 @@ mod tests {
             met += 1;
         }
 
-        assert_eq!(met, lanes(&app, crossed).len(), "a lane that was not cut");
+        assert_eq!(
+            met,
+            2 * lanes(&app, crossed).len(),
+            "a lane the junction did not take a stretch of at both ends"
+        );
+    }
+
+    #[test]
+    fn a_road_that_would_cross_another_too_near_a_crossing_already_there_is_not_laid() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        spawn_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+        spawn_road_through(&mut app, &crossing_arm(STRAIGHT[1]));
+        tick(&mut app);
+        let standing = roads_in_the_world(&mut app);
+        assert_eq!(junctions(&mut app).len(), 1);
+
+        place_road(&mut app, &a_second_arm_across(STRAIGHT[1]));
+
+        assert_eq!(
+            junctions(&mut app).len(),
+            1,
+            "a second crossing with no room for the turns through either"
+        );
+        assert_eq!(roads_in_the_world(&mut app), standing, "the road was laid");
+    }
+
+    #[test]
+    fn a_road_crossed_far_enough_from_a_crossing_already_there_is_laid() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        spawn_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+        spawn_road_through(&mut app, &crossing_arm(STRAIGHT[1]));
+        tick(&mut app);
+
+        place_road(&mut app, &crossing_arm(STRAIGHT[2]));
+
+        assert_eq!(junctions(&mut app).len(), 2);
     }
 
     #[test]
@@ -3128,7 +3742,7 @@ mod tests {
         assert_eq!(junctions(&mut app).len(), 2);
         assert_eq!(
             segments_under(&app, crossed).len(),
-            before + 2 * lanes(&app, crossed).len()
+            before + 4 * lanes(&app, crossed).len()
         );
     }
 
@@ -3225,6 +3839,202 @@ mod tests {
             .expect("the junction has legs")
     }
 
+    /// `STRAIGHT`, and a road laid across its far end a frame later.
+    fn a_road_turned_off() -> (App, Entity) {
+        let mut app = road_app();
+        let arriving = spawn_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+        spawn_road(&mut app, &TURNING_OFF);
+        tick(&mut app);
+        (app, arriving)
+    }
+
+    /// Which leg of the one junction in the world is the arm of `road`, of which there is one.
+    fn the_leg_of(app: &mut App, road: Entity) -> usize {
+        the_legs(app)
+            .iter()
+            .position(|leg| leg.road == road)
+            .expect("the road has a leg")
+    }
+
+    /// The arc under `segment`.
+    fn arc_under(app: &App, segment: Entity) -> Arc {
+        component_of::<RoadSegment>(app, segment)
+            .map(|piece| piece.arc)
+            .expect("the segment is there")
+    }
+
+    /// How fast `segment` allows.
+    fn speed_limit_of(app: &App, segment: Entity) -> f32 {
+        component_of::<RoadSegment>(app, segment)
+            .map(RoadSegment::speed_limit)
+            .expect("the segment is there")
+    }
+
+    /// Where `segment` ends, and which way a rover leaving it is pointing.
+    fn leaves(app: &App, segment: Entity) -> (Vec3, Vec3) {
+        let piece = component_of::<RoadSegment>(app, segment).expect("the segment is there");
+        (
+            piece.world_position(piece.ends_at()),
+            piece.heading_at(piece.ends_at()),
+        )
+    }
+
+    /// Where `segment` begins, and which way a rover setting off down it is pointing.
+    fn sets_off(app: &App, segment: Entity) -> (Vec3, Vec3) {
+        let piece = component_of::<RoadSegment>(app, segment).expect("the segment is there");
+        (
+            piece.world_position(piece.starts_at()),
+            piece.heading_at(piece.starts_at()),
+        )
+    }
+
+    #[test]
+    fn a_rover_turning_at_a_junction_leaves_the_leg_it_arrived_on_along_it() {
+        let (mut app, arriving) = a_road_turned_off();
+        let leg = the_leg_of(&mut app, arriving);
+        let reached = the_legs(&mut app)[leg].arriving.clone();
+
+        for way in exits_from(&mut app, leg) {
+            let (ends, heading) = leaves(&app, reached[0]);
+            let (begins, along) = sets_off(&app, way);
+            assert!(
+                begins.distance(ends) < TOLERANCE,
+                "a turn beginning off the leg"
+            );
+            assert!(
+                along.dot(heading) > 1. - TOLERANCE,
+                "a corner in the junction"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rover_turning_at_a_junction_reaches_the_leg_it_leaves_by_along_it() {
+        let (mut app, arriving) = a_road_turned_off();
+        let leg = the_leg_of(&mut app, arriving);
+
+        let legs = the_legs(&mut app);
+        for way in exits_from(&mut app, leg) {
+            let last = the_end_of_the_way(&app, way, &legs);
+            let onward = next_of(&app, last).expect("the way runs onto a leg");
+            let (ends, heading) = leaves(&app, last);
+            let (begins, along) = sets_off(&app, onward);
+            assert!(
+                ends.distance(begins) < TOLERANCE,
+                "a turn ending off the leg"
+            );
+            assert!(
+                heading.dot(along) > 1. - TOLERANCE,
+                "a corner in the junction"
+            );
+        }
+    }
+
+    /// The last segment of the way through a junction that begins at `way`.
+    fn the_end_of_the_way(app: &App, way: Entity, legs: &[JunctionLeg]) -> Entity {
+        let mut standing = way;
+        for _ in 0..STEPS_THROUGH_A_JUNCTION {
+            let Some(onward) = next_of(app, standing) else {
+                break;
+            };
+            if legs.iter().any(|leg| leg.leaving.contains(&onward)) {
+                break;
+            }
+            standing = onward;
+        }
+        standing
+    }
+
+    #[test]
+    fn a_turn_where_a_leg_curves_through_a_junction_still_meets_both_legs_along_them() {
+        let mut app = road_app();
+        spawn_road(&mut app, &CURVING_ACROSS);
+        tick(&mut app);
+        spawn_road(&mut app, &ACROSS_THE_CURVE);
+        tick(&mut app);
+
+        let mut met = 0;
+        for (_, legs) in legs_in_the_world(&mut app) {
+            let arms = JunctionLegs(legs.clone());
+            for (index, leg) in legs.iter().enumerate() {
+                for way in arms.exits_from(index) {
+                    let (ends, heading) = leaves(&app, leg.arriving[0]);
+                    let (begins, along) = sets_off(&app, way);
+                    assert!(
+                        begins.distance(ends) < TOLERANCE,
+                        "a turn beginning off the leg"
+                    );
+                    assert!(
+                        along.dot(heading) > 1. - TOLERANCE,
+                        "a corner leaving the junction"
+                    );
+
+                    let last = the_end_of_the_way(&app, way, &legs);
+                    let onward = next_of(&app, last).expect("the way runs onto a leg");
+                    let (stops, leaving) = leaves(&app, last);
+                    let (takes_up, onto) = sets_off(&app, onward);
+                    assert!(
+                        stops.distance(takes_up) < TOLERANCE,
+                        "a turn ending off the leg"
+                    );
+                    assert!(
+                        leaving.dot(onto) > 1. - TOLERANCE,
+                        "a corner reaching the leg"
+                    );
+                    met += 1;
+                }
+            }
+        }
+
+        assert!(
+            met > 0,
+            "no way through any junction of two crossing curves"
+        );
+    }
+
+    #[test]
+    fn a_sixty_degree_turn_through_a_junction_is_as_tight_as_the_road_tool_will_build() {
+        let (mut app, arriving) = a_road_turned_off();
+        let leg = the_leg_of(&mut app, arriving);
+        let sweeping = exits_from(&mut app, leg)[0];
+
+        let radius = arc_under(&app, sweeping).radius();
+
+        assert!(
+            (radius - MIN_TURN_RADIUS).abs() < TOLERANCE,
+            "a turn of radius {radius} against the tightest arc the tool lays, {MIN_TURN_RADIUS}"
+        );
+    }
+
+    #[test]
+    fn a_sharper_turn_through_a_junction_is_held_slower_than_a_sweeping_one() {
+        let (mut app, arriving) = a_road_turned_off();
+        let leg = the_leg_of(&mut app, arriving);
+        let ways = exits_from(&mut app, leg);
+
+        assert_eq!(ways.len(), 2, "a junction of other than two ways out");
+        let (sweeping, sharp) = (speed_limit_of(&app, ways[0]), speed_limit_of(&app, ways[1]));
+        assert!(
+            sharp < sweeping,
+            "{sharp} round the sharp turn against {sweeping}"
+        );
+    }
+
+    #[test]
+    fn carrying_straight_on_through_a_junction_is_driven_at_the_speed_of_the_road() {
+        let (mut app, crossed, _) = a_crossed_road();
+        let leg = the_leg_of(&mut app, crossed);
+
+        let ways = exits_from(&mut app, leg);
+        let straight_on = ways.first().copied().expect("a way out");
+
+        assert!(
+            (speed_limit_of(&app, straight_on) - STRAIGHT_SPEED_LIMIT).abs() < TOLERANCE,
+            "a straight road slowed by being crossed"
+        );
+    }
+
     #[test]
     fn a_road_ending_on_another_meets_it_at_a_junction_of_three_legs() {
         let mut app = a_road_placed_onto_another();
@@ -3250,16 +4060,24 @@ mod tests {
     }
 
     #[test]
-    fn every_segment_a_leg_names_reaches_the_junction() {
+    fn every_segment_a_leg_names_stops_a_pull_back_short_of_the_crossing() {
         let (mut app, ..) = a_crossed_road();
         let (at, _) = the_junction(&mut app);
 
         for leg in the_legs(&mut app) {
             for segment in leg.arriving {
-                assert!(position(&app, segment, 1.).distance(at) < TOLERANCE);
+                let ends = position(&app, segment, 1.).distance(at);
+                assert!(
+                    (ends - JUNCTION_PULLBACK).abs() < TOLERANCE,
+                    "arriving {ends} out"
+                );
             }
             for segment in leg.leaving {
-                assert!(position(&app, segment, 0.).distance(at) < TOLERANCE);
+                let starts = position(&app, segment, 0.).distance(at);
+                assert!(
+                    (starts - JUNCTION_PULLBACK).abs() < TOLERANCE,
+                    "leaving {starts} out"
+                );
             }
         }
     }
@@ -3324,7 +4142,8 @@ mod tests {
         for (junction, legs) in legs_in_the_world(&mut app) {
             for leg in legs {
                 for segment in leg.arriving {
-                    assert!(position(&app, segment, 1.).distance(junction) < TOLERANCE);
+                    let ends = position(&app, segment, 1.).distance(junction);
+                    assert!((ends - JUNCTION_PULLBACK).abs() < TOLERANCE, "{ends} out");
                 }
             }
         }
