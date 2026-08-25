@@ -109,6 +109,90 @@ is visible and can block other work. A marker in a source file is neither."
 	else
 		pass "no TODO markers (3.4)"
 	fi
+
+	# --- AGENTS.md invariant 2 — the tick reads no frame ------------------
+	#
+	# The three failure modes a test can catch — two runs disagreeing, two
+	# frame rates disagreeing, a junction served in storage order — are
+	# caught by the determinism trace in src/rover.rs. The fourth cannot be:
+	# a world position is derived through `sin` and `cos`, which agree with
+	# themselves on the machine that wrote the test and differ across
+	# platforms and standard libraries. A tick that decides anything from
+	# one gives different traffic elsewhere while every test here passes, so
+	# the line is held here instead: the simulation stays in arc-length
+	# space, and a `Vec3` is presentation.
+	#
+	# Invariant 4 puts a system in the same file as the plugin registering
+	# it, so the systems on the tick are read out of the FixedUpdate
+	# registrations in each file and matched against the functions it
+	# defines. A body is the lines from its `fn` to the `}` at that
+	# indentation, which is what rustfmt guarantees and nothing else here
+	# needs to parse.
+	found=$(git ls-files '*.rs' | tr '\n' '\0' | xargs -0 awk '
+		function countchar(s, c,   i, k) {
+			k = 0
+			for (i = 1; i <= length(s); i++)
+				if (substr(s, i, 1) == c) k++
+			return k
+		}
+		function scan(   i, j, k, name, rest, line, region, depth, start, indent, closes) {
+			if (n == 0) return
+			delete defined
+			for (i = 1; i <= n; i++) {
+				if (L[i] !~ /^[ \t]*fn [a-z_]/) continue
+				name = L[i]
+				sub(/^[ \t]*fn /, "", name)
+				sub(/[^A-Za-z0-9_].*$/, "", name)
+				defined[name] = i
+			}
+			delete ticking
+			for (i = 1; i <= n; i++) {
+				j = index(L[i], "add_systems(")
+				if (j == 0) continue
+				rest = substr(L[i], j + 12)
+				if (rest ~ /^[ \t]*$/ && i < n) rest = L[i + 1]
+				if (rest !~ /^[ \t]*FixedUpdate([,)]|$)/) continue
+				region = ""
+				depth = 0
+				for (k = i; k <= n; k++) {
+					line = (k == i) ? substr(L[i], j + 11) : L[k]
+					region = region " " line
+					depth += countchar(line, "(") - countchar(line, ")")
+					if (depth <= 0) break
+				}
+				while (match(region, /[A-Za-z_][A-Za-z0-9_]*/)) {
+					name = substr(region, RSTART, RLENGTH)
+					region = substr(region, RSTART + RLENGTH)
+					if (name in defined) ticking[name] = 1
+				}
+			}
+			for (name in ticking) {
+				start = defined[name]
+				match(L[start], /^[ \t]*/)
+				indent = substr(L[start], 1, RLENGTH)
+				closes = indent "}"
+				for (k = start; k <= n; k++) {
+					if (L[k] ~ /delta_secs|elapsed_secs|world_position|\.translation|Transform|Time<Virtual>|Time<Real>/)
+						printf "%s:%d: %s runs on the tick and reads what only a frame knows\n",
+							file, k, name
+					if (k > start && L[k] == closes) break
+				}
+			}
+		}
+		FILENAME != file { scan(); file = FILENAME; n = 0 }
+		{ L[++n] = $0 }
+		END { scan() }
+	' 2>&1 || true)
+	if [ -n "$found" ]; then
+		report "a system on the tick reading a frame (AGENTS.md invariant 2)" "$found
+A tick measures in ticks and in distances along an arc. Real time belongs to
+presentation, and so does a world position: it is derived through \`sin\` and
+\`cos\`, which are not identical across platforms, so a decision taken from one
+gives different traffic on another machine while every test here still passes.
+Move the reading into an \`Update\` system, or decide it from arc length."
+	else
+		pass "no system on the tick reads a frame (invariant 2)"
+	fi
 fi
 
 # --- AGENTS.md 1.6 — the only prose outside the code is a folder README ------
