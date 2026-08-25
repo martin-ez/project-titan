@@ -679,12 +679,6 @@ mod tests {
     /// which is the arm turning sixty degrees rather than the one turning a hundred and twenty.
     const ACROSS: [(i32, i32); 3] = [(2, 1), (3, 0), (3, -1)];
 
-    /// `APPROACH` and the arm of `ACROSS` beyond it, laid as one road, in offset-row coordinates.
-    ///
-    /// The same five nodes, so the two routes run between the same tiles over the same four steps
-    /// of the lattice and differ only in whether the corner is an arc or a junction.
-    const CURVING: [(i32, i32); 5] = [(0, 0), (1, 0), (2, 0), (3, 0), (3, -1)];
-
     /// The same four steps of the lattice with no turn in them, in offset-row coordinates.
     const STRAIGHT_ON: [(i32, i32); 5] = [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)];
 
@@ -694,10 +688,11 @@ mod tests {
     /// Where the route with no turn in it comes out, in offset-row coordinates.
     const PAST_THE_STRAIGHT: (i32, i32) = (4, 0);
 
-    /// How many ticks a junction may cost a rover that nothing else is holding up.
+    /// How many ticks the wait at a junction costs a rover that nothing else is holding up.
     ///
     /// The handover is one tick and the tick it lands on is where the rounding goes, so a rover
-    /// let straight through has lost this much of its journey and no more.
+    /// carried straight through has lost this much of its journey and no more. What a rover that
+    /// turns loses on top is the arc it drives, which is the junction's whole cost.
     const TICKS_LOST_AT_A_JUNCTION: u32 = 2;
 
     /// How near the middle of its last tile a rover has to stand to have arrived there.
@@ -1455,15 +1450,27 @@ mod tests {
     }
 
     #[test]
-    fn a_rover_short_of_the_cut_keeps_the_stretch_it_was_on() {
+    fn a_rover_is_never_handed_a_stretch_it_has_not_reached() {
         let mut app = road_app();
         let rovers = rovers_all_along(&mut app);
         advance(&mut app, SHORT_FRAME);
+        let stood: Vec<(Entity, Entity, f32)> = rovers
+            .iter()
+            .flat_map(|&(segment, early, late)| [(segment, early), (segment, late)])
+            .map(|(segment, rover)| (segment, rover, place_along(&app, segment, 0.)))
+            .collect();
 
         cut_the_road_across(&mut app);
 
-        for (segment, early, _) in handed_on(&app, &rovers) {
-            assert_eq!(place_of(&app, early).0, segment);
+        for (segment, rover, began) in stood {
+            let (now, _) = place_of(&app, rover);
+            if now == segment {
+                continue;
+            }
+            assert!(
+                place_along(&app, now, 0.) > began,
+                "a rover was handed a stretch beginning behind the one it was on"
+            );
         }
     }
 
@@ -1944,24 +1951,24 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_through_a_junction_costs_the_tick_it_waits_and_nothing_more() {
+    fn a_turn_through_a_junction_costs_the_arc_it_drives() {
         let turning = ticks_along(&[&APPROACH, &ACROSS], &APPROACH, PAST_THE_TURN);
         let straight_on = ticks_along(&[&STRAIGHT_ON], &STRAIGHT_ON, PAST_THE_STRAIGHT);
 
         assert!(
-            turning <= straight_on + TICKS_LOST_AT_A_JUNCTION,
+            turning > straight_on + TICKS_LOST_AT_A_JUNCTION,
             "{turning} ticks round the turn against {straight_on} straight on, over the same steps"
         );
     }
 
     #[test]
-    fn a_junction_turn_beats_the_curve_that_makes_the_same_turn() {
-        let turning = ticks_along(&[&APPROACH, &ACROSS], &APPROACH, PAST_THE_TURN);
-        let curving = ticks_along(&[&CURVING], &CURVING, PAST_THE_TURN);
+    fn carrying_straight_on_through_a_junction_costs_the_tick_it_waits_and_nothing_more() {
+        let crossed = ticks_along(&[&STRAIGHT_ON, &CROSSING], &STRAIGHT_ON, PAST_THE_STRAIGHT);
+        let clear = ticks_along(&[&STRAIGHT_ON], &STRAIGHT_ON, PAST_THE_STRAIGHT);
 
         assert!(
-            turning < curving,
-            "{turning} ticks turning at the junction against {curving} curving through the corner"
+            crossed <= clear + TICKS_LOST_AT_A_JUNCTION,
+            "{crossed} ticks across the junction against {clear} down the road nothing crosses"
         );
     }
 
