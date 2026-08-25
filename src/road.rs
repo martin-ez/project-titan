@@ -7,7 +7,8 @@ use crate::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
 use crate::map::{HexCoordinates, LatticeNode, MapTile, MAP_TILE_INRADIUS, MAP_TILE_SIZE};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
-use std::collections::HashMap;
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap};
 use std::f32::consts::FRAC_PI_2;
 
 /// How many straight pieces a segment's arc is drawn as.
@@ -395,10 +396,207 @@ pub struct ServedBy {
     pub along: f32,
 }
 
+/// The network as a graph, and the quickest way through it.
+///
+/// A segment leads to the segments the junction at its end permits rather than to every segment
+/// touching it, so a one-way road and a junction that refuses a turn take edges out of the graph
+/// rather than being checked around it. What a stretch costs is its length over its speed limit
+/// and a turn costs nothing of its own, which is what leaves the shortest way through and the
+/// quickest way through two different answers.
+#[derive(SystemParam)]
+pub struct RoadNetwork<'w, 's> {
+    segments: Query<
+        'w,
+        's,
+        (
+            &'static RoadSegment,
+            Option<&'static NextSegment>,
+            Option<&'static EndsAtJunction>,
+        ),
+    >,
+    junctions: Query<'w, 's, &'static JunctionLegs>,
+    endpoints: Query<'w, 's, &'static RoadEndpoint>,
+    frontier: Local<'s, BinaryHeap<Reverse<Reached>>>,
+    walked: Local<'s, HashMap<Entity, Step>>,
+}
+
+/// A segment the search has reached, ordered by what it costs to reach and then by when it was.
+///
+/// The order two segments of equal cost come out in is the order they were found in, and they
+/// were found in the order the junction offers its ways out, which is the straightest turn first.
+/// Nothing here is decided by the order the world stores its entities in (invariant 2).
+struct Reached {
+    cost: f32,
+    found: usize,
+    segment: Entity,
+}
+
+/// How the search reached a segment, and what it cost to get there.
+///
+/// A segment reached straight off the rover's own came from nowhere, which is where walking the
+/// ways out back from the destination stops.
+struct Step {
+    cost: f32,
+    came_from: Option<Entity>,
+    through_a_junction: bool,
+    expanded: bool,
+}
+
 #[derive(SystemParam)]
 struct RoadInitializeParams<'w, 's> {
     commands: Commands<'w, 's>,
     occupied: ResMut<'w, RoadTiles>,
+}
+
+impl RoadNetwork<'_, '_> {
+    /// The ways out a rover standing `along` `from` takes to reach whatever serves `to` soonest.
+    ///
+    /// The ways out alone, because the lane decides the rest: what comes back is what the rover
+    /// has to choose at each junction and nothing else. A rover already standing on the stretch
+    /// serving the destination and short of where it stops has nothing to choose at all. Where no
+    /// drivable way exists nothing comes back, rather than the part of one that does.
+    pub fn fastest_way(&mut self, from: Entity, along: f32, to: Entity) -> Option<Vec<Entity>> {
+        let served = self
+            .endpoints
+            .get(to)
+            .ok()
+            .and_then(RoadEndpoint::served_by)?;
+        let (setting_off, ..) = self.segments.get(from).ok()?;
+        if from == served.segment && along <= served.along {
+            return Some(Vec::new());
+        }
+
+        self.walked.clear();
+        self.frontier.clear();
+        let mut found = 0;
+        let left_of_it = (setting_off.ends_at() - along).max(0.);
+        let set_off = left_of_it / setting_off.speed_limit();
+        self.open(from, None, set_off, &mut found);
+
+        while let Some(Reverse(reached)) = self.frontier.pop() {
+            let Some(step) = self.walked.get_mut(&reached.segment) else {
+                continue;
+            };
+            if step.expanded || step.cost < reached.cost {
+                continue;
+            }
+            step.expanded = true;
+            if reached.segment == served.segment {
+                return Some(self.ways_out_to(reached.segment));
+            }
+            self.open(
+                reached.segment,
+                Some(reached.segment),
+                reached.cost,
+                &mut found,
+            );
+        }
+        None
+    }
+
+    /// Offer every segment a rover leaving `leaving` may drive onto a place in the search.
+    ///
+    /// Which those are is the junction's answer where there is one and the lane's where there is
+    /// not, so a turn a junction refuses and a lane that runs one way are edges the graph does not
+    /// have rather than edges walked and then rejected.
+    fn open(&mut self, leaving: Entity, came_from: Option<Entity>, spent: f32, found: &mut usize) {
+        let Ok((_, next, junction)) = self.segments.get(leaving) else {
+            return;
+        };
+        let onward = next.map(|next| next.0);
+        let Some(junction) = junction.copied() else {
+            if let Some(onward) = onward {
+                self.offer(onward, came_from, spent, false, found);
+            }
+            return;
+        };
+
+        let ways_out = self
+            .junctions
+            .get(junction.junction)
+            .map(|legs| legs.exits_from(junction.leg))
+            .unwrap_or_default();
+        for onward in ways_out {
+            self.offer(onward, came_from, spent, true, found);
+        }
+    }
+
+    /// Offer `onward` a place in the search, unless it has already been reached for as little.
+    fn offer(
+        &mut self,
+        onward: Entity,
+        came_from: Option<Entity>,
+        spent: f32,
+        through_a_junction: bool,
+        found: &mut usize,
+    ) {
+        let Ok((segment, ..)) = self.segments.get(onward) else {
+            return;
+        };
+        let cost = spent + segment.length() / segment.speed_limit();
+        if self
+            .walked
+            .get(&onward)
+            .is_some_and(|step| step.cost <= cost)
+        {
+            return;
+        }
+
+        self.walked.insert(
+            onward,
+            Step {
+                cost,
+                came_from,
+                through_a_junction,
+                expanded: false,
+            },
+        );
+        self.frontier.push(Reverse(Reached {
+            cost,
+            found: *found,
+            segment: onward,
+        }));
+        *found += 1;
+    }
+
+    /// The ways out of junctions along the way the search walked to `arrived`, in driving order.
+    fn ways_out_to(&self, arrived: Entity) -> Vec<Entity> {
+        let mut ways_out = Vec::new();
+        let mut at = arrived;
+        while let Some(step) = self.walked.get(&at) {
+            if step.through_a_junction {
+                ways_out.push(at);
+            }
+            match step.came_from {
+                Some(came_from) => at = came_from,
+                None => break,
+            }
+        }
+        ways_out.reverse();
+        ways_out
+    }
+}
+
+impl PartialEq for Reached {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Reached {}
+
+impl PartialOrd for Reached {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Reached {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.cost
+            .total_cmp(&other.cost)
+            .then(self.found.cmp(&other.found))
+    }
 }
 
 impl Plugin for RoadPlugin {

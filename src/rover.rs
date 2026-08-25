@@ -4,7 +4,7 @@ use crate::diagnostics::DebugGizmos;
 use crate::map::MAP_TILE_SIZE;
 use crate::road::{
     EndsAtJunction, JunctionLegs, JunctionPolicy, NextSegment, PlaceOnTheRoad, RoadEndpoint,
-    RoadSegment, RoadsLaid, SegmentCut,
+    RoadNetwork, RoadSegment, RoadsLaid, SegmentCut,
 };
 use crate::simulation::{Simulation, Ticks};
 use bevy::ecs::system::SystemParam;
@@ -117,12 +117,22 @@ pub struct Route {
     pub ways_out: Vec<Entity>,
 }
 
-/// A rover holding a route it cannot drive, standing wherever the route ran out under it.
+/// A rover that has been sent somewhere, which is an order for a route rather than a route.
 ///
-/// A destination no road reaches, a junction that refuses the turn the route names, and a lane
-/// that stops short of the destination are the three ways that happens, and the alternatives to
-/// saying so are a rover driving off down whatever road it can reach and one quietly forgetting
-/// where it was going. Both look like a delivery still under way to anything waiting on it.
+/// Where it is going is the whole of it: how it gets there is worked out from the network the
+/// tick it is asked for, and the order is spent doing so. A rover already driving one is holding
+/// a `Route` and nothing else, so a fleet under way asks for nothing and the search runs once a
+/// delivery rather than once a rover a tick.
+#[derive(Component)]
+pub struct SentTo(pub Entity);
+
+/// A rover that cannot get where it was sent, standing wherever it ran out of route.
+///
+/// A destination no road reaches, one no road joins it to, a junction that refuses the turn the
+/// route names and a lane that stops short of the destination are the four ways that happens, and
+/// the alternatives to saying so are a rover driving off down whatever road it can reach and one
+/// quietly forgetting where it was going. Both look like a delivery still under way to anything
+/// waiting on it.
 #[derive(Component)]
 pub struct Stranded;
 
@@ -157,6 +167,7 @@ impl Plugin for RoverPlugin {
             .add_systems(
                 FixedUpdate,
                 (
+                    find_the_route_a_rover_was_sent_on,
                     let_the_rovers_through,
                     drive_the_rovers,
                     hand_the_load_to_the_endpoint_it_was_driven_to,
@@ -197,6 +208,35 @@ impl Initialize<RoverInitializeParams<'_, '_>> for Rover {
             ));
         });
         Ok(())
+    }
+}
+
+/// Work out the route every rover that has been sent somewhere drives, and spend the order.
+///
+/// A search runs when a rover is sent rather than while it drives, so what it costs is one search
+/// a delivery however long the journey and however large the fleet already under way. What it
+/// finds is the quickest way through an empty network: nothing here reads how many rovers a
+/// segment is carrying, and a route that answers to congestion is #8's.
+fn find_the_route_a_rover_was_sent_on(
+    mut commands: Commands,
+    mut network: RoadNetwork,
+    sent: Query<(Entity, &Rover, &SentTo)>,
+) {
+    for (entity, rover, sent_to) in &sent {
+        let found = network.fastest_way(rover.segment, rover.along, sent_to.0);
+        let mut rover = commands.entity(entity);
+        rover.remove::<SentTo>();
+        match found {
+            Some(ways_out) => {
+                rover.insert(Route {
+                    destination: sent_to.0,
+                    ways_out,
+                });
+            }
+            None => {
+                rover.insert_if_new(Stranded);
+            }
+        }
     }
 }
 
@@ -765,6 +805,64 @@ mod tests {
 
     /// A tile far enough from either road that nothing serves it, in offset-row coordinates.
     const OFF_THE_NETWORK: (i32, i32) = (8, 8);
+
+    /// A tile on a road of its own, in offset-row coordinates.
+    ///
+    /// Far enough from the road under test that no arc of either reaches the other, so a rover on
+    /// one is served by a network the other is no part of rather than merely a long way off.
+    const ELSEWHERE_FROM: (i32, i32) = (12, 12);
+
+    /// The far end of that road, in offset-row coordinates.
+    const ELSEWHERE_TO: (i32, i32) = (12, 16);
+
+    /// The road a delivery through the fork sets off down, in offset-row coordinates.
+    const THE_STEM: [(i32, i32); 2] = [(-1, 0), (0, 0)];
+
+    /// The arm of the fork that covers less road and costs more time, in offset-row coordinates.
+    ///
+    /// Three tiles of corners tight enough that driving them costs half as much time again as the
+    /// longer way round, which is what leaves the shortest route and the quickest route two
+    /// different answers to ask for.
+    const THE_SHORT_ARM: [(i32, i32); 5] = [(0, 0), (1, -1), (2, -1), (3, -1), (4, 0)];
+
+    /// The arm that covers more road and costs less time, in offset-row coordinates.
+    const THE_LONG_ARM: [(i32, i32); 4] = [(0, 0), (1, 2), (3, 2), (4, 0)];
+
+    /// That same arm as the player would have drawn it the other way about.
+    const THE_LONG_ARM_REVERSED: [(i32, i32); 4] = [(4, 0), (3, 2), (1, 2), (0, 0)];
+
+    /// The road running on from where the arms come back together, in offset-row coordinates.
+    const THE_RUN_OUT: [(i32, i32); 2] = [(4, 0), (5, 0)];
+
+    /// The tile a delivery through the fork sets off from, in offset-row coordinates.
+    const FORK_FROM: (i32, i32) = (-2, 0);
+
+    /// The tile a delivery through the fork is bound for, in offset-row coordinates.
+    const FORK_TO: (i32, i32) = (6, 0);
+
+    /// The tile the shorter arm of the fork heads for, in offset-row coordinates.
+    const THE_SHORT_WAY: (i32, i32) = (1, -1);
+
+    /// The tile the longer arm of the fork heads for, in offset-row coordinates.
+    const THE_LONG_WAY: (i32, i32) = (1, 2);
+
+    /// How many roads run each way across the network a route is looked for over.
+    const ROADS_EACH_WAY: i32 = 11;
+
+    /// How many tiles apart those roads run.
+    const ROAD_SPACING: i32 = 3;
+
+    /// The tile each of them begins on, in offset-row coordinates.
+    ///
+    /// Short of the first road crossing it, so that every crossing of the network is one road
+    /// drawn across the middle of another rather than one begun on the edge of it.
+    const ROAD_BEGINS_AT: i32 = -2;
+
+    /// The tile each of them ends on, in offset-row coordinates.
+    const ROAD_ENDS_AT: i32 = 33;
+
+    /// How many segments a network has to hold to be worth looking for a route across.
+    const A_LARGE_NETWORK: usize = 2000;
 
     /// How much a rover carries on a delivery under test.
     const LOAD: u32 = 3;
@@ -2098,6 +2196,154 @@ mod tests {
             .id()
     }
 
+    /// The node of `tile` facing `towards`, which is a corner a road can serve the tile from.
+    fn corner_facing(tile: (i32, i32), towards: (i32, i32)) -> LatticeNode {
+        LatticeNode::nearest_on(
+            HexCoordinates::from_offset_row(tile.0, tile.1),
+            HexCoordinates::from_offset_row(towards.0, towards.1).world_position(),
+        )
+    }
+
+    /// Lay one road of the fork, through the middle of each of `drawn`'s tiles.
+    fn lay_a_road_of_the_fork(app: &mut App, drawn: &[LatticeNode], one_way: bool) {
+        app.world_mut().spawn(Road {
+            nodes: drawn.to_vec(),
+            leaving: None,
+            one_way,
+        });
+    }
+
+    /// The road a delivery sets off down, from the collection tile's corner to where it forks.
+    fn the_stem() -> Vec<LatticeNode> {
+        let mut nodes = vec![corner_facing(FORK_FROM, THE_STEM[0])];
+        nodes.extend(tiles(&THE_STEM).into_iter().map(LatticeNode::from_tile));
+        nodes
+    }
+
+    /// The road running on from where the arms come together to the delivery tile's corner.
+    fn the_run_out() -> Vec<LatticeNode> {
+        let mut nodes: Vec<LatticeNode> = tiles(&THE_RUN_OUT)
+            .into_iter()
+            .map(LatticeNode::from_tile)
+            .collect();
+        nodes.push(corner_facing(FORK_TO, THE_RUN_OUT[THE_RUN_OUT.len() - 1]));
+        nodes
+    }
+
+    /// One arm of the fork, as the player drew it.
+    fn an_arm(drawn: &[(i32, i32)]) -> Vec<LatticeNode> {
+        tiles(drawn)
+            .into_iter()
+            .map(LatticeNode::from_tile)
+            .collect()
+    }
+
+    /// An endpoint at either end of the fork, once its roads are laid.
+    fn endpoints_of_the_fork(app: &mut App) -> (Entity, Entity) {
+        let collection = endpoint_on(app, FORK_FROM);
+        let delivery = endpoint_on(app, FORK_TO);
+        tick(app);
+        (collection, delivery)
+    }
+
+    /// The fork, with both of its arms drivable both ways.
+    fn a_fork_between_endpoints() -> (App, Entity, Entity) {
+        let mut app = rover_app();
+        lay_a_road_of_the_fork(&mut app, &the_stem(), false);
+        lay_a_road_of_the_fork(&mut app, &an_arm(&THE_SHORT_ARM), false);
+        lay_a_road_of_the_fork(&mut app, &an_arm(&THE_LONG_ARM), false);
+        lay_a_road_of_the_fork(&mut app, &the_run_out(), false);
+        let (collection, delivery) = endpoints_of_the_fork(&mut app);
+        (app, collection, delivery)
+    }
+
+    /// How long the stretch of lane from `way_out` to the next junction is, and how long it takes.
+    fn arm_from(app: &App, way_out: Entity) -> (f32, f32) {
+        let (mut length, mut time) = (0., 0.);
+        let mut at = way_out;
+        for _ in 0..LAP_SEGMENTS {
+            let segment = app
+                .world()
+                .entity(at)
+                .get::<RoadSegment>()
+                .expect("the arm is still there");
+            length += segment.length();
+            time += segment.length() / segment.speed_limit();
+            if app.world().entity(at).contains::<EndsAtJunction>() {
+                break;
+            }
+            match next_of(app, at) {
+                Some(onward) => at = onward,
+                None => break,
+            }
+        }
+        (length, time)
+    }
+
+    /// Where each way out of the route `rover` holds comes out, which is the shape of the route.
+    ///
+    /// Where rather than which, because two networks built from the same roads in a different
+    /// order hold different entities standing in the same places, and it is the places that say
+    /// whether the same way through was taken.
+    fn shape_of_the_route(app: &App, rover: Entity) -> Vec<Vec3> {
+        route_of(app, rover)
+            .expect("the rover was given a route")
+            .into_iter()
+            .map(|way_out| reach_of(app, way_out))
+            .collect()
+    }
+
+    /// A network of roads crossing each other, and an endpoint at opposite corners of it.
+    fn a_large_network() -> (App, Entity, Entity) {
+        let mut app = rover_app();
+        let far = (ROADS_EACH_WAY - 1) * ROAD_SPACING;
+        for step in 0..ROADS_EACH_WAY {
+            let at = step * ROAD_SPACING;
+            lay_road_between(&mut app, (ROAD_BEGINS_AT, at), (ROAD_ENDS_AT, at));
+            lay_road_between(&mut app, (at, ROAD_BEGINS_AT), (at, ROAD_ENDS_AT));
+        }
+        let collection = endpoint_on(&mut app, (ROAD_BEGINS_AT, 0));
+        let delivery = endpoint_on(&mut app, (ROAD_ENDS_AT, far));
+        tick(&mut app);
+        (app, collection, delivery)
+    }
+
+    /// How many stretches of road the world holds.
+    fn segments_in_the_world(app: &mut App) -> usize {
+        app.world_mut()
+            .query::<&RoadSegment>()
+            .iter(app.world())
+            .count()
+    }
+
+    /// Put a loaded rover where `collection` is served, sent to `delivery` to find its own way.
+    fn send_from(app: &mut App, collection: Entity, delivery: Entity) -> Entity {
+        let from = served_place(app, collection);
+        app.world_mut()
+            .spawn((
+                Rover {
+                    segment: from.segment,
+                    along: from.along,
+                },
+                Cargo { quantity: LOAD },
+                SentTo(delivery),
+            ))
+            .id()
+    }
+
+    /// The ways out `rover` is holding, or nothing at all where it was given no route.
+    fn route_of(app: &App, rover: Entity) -> Option<Vec<Entity>> {
+        app.world()
+            .entity(rover)
+            .get::<Route>()
+            .map(|route| route.ways_out.clone())
+    }
+
+    /// Whether `rover` is still carrying an order for a route.
+    fn is_still_asking(app: &App, rover: Entity) -> bool {
+        app.world().entity(rover).contains::<SentTo>()
+    }
+
     /// How much `entity` is carrying or holding, which is nothing while it holds no load at all.
     fn load_of(app: &App, entity: Entity) -> u32 {
         app.world()
@@ -2255,6 +2501,187 @@ mod tests {
 
         assert!(is_stranded(&app, rover));
         assert_eq!(load_of(&app, delivery), 0);
+    }
+
+    #[test]
+    fn a_rover_sent_to_an_endpoint_finds_its_own_way_there() {
+        let (mut app, collection, across) = a_crossroads_between_endpoints();
+        send_from(&mut app, collection, across);
+
+        tick_delivered_on(&mut app, across).expect("the delivery lands");
+
+        assert_eq!(load_of(&app, across), LOAD);
+    }
+
+    #[test]
+    fn a_route_is_found_once_rather_than_on_every_tick_of_the_journey() {
+        let (mut app, collection, across) = a_crossroads_between_endpoints();
+        let rover = send_from(&mut app, collection, across);
+
+        tick(&mut app);
+        assert!(
+            route_of(&app, rover).is_some(),
+            "the rover set off without a route"
+        );
+
+        for _ in 0..TICKS_TO_DELIVER {
+            assert!(
+                !is_still_asking(&app, rover),
+                "a rover asking again for the route it is already driving"
+            );
+            if load_of(&app, across) > 0 {
+                return;
+            }
+            tick(&mut app);
+        }
+        panic!("the delivery never landed");
+    }
+
+    #[test]
+    fn a_rover_sent_to_an_endpoint_no_road_reaches_is_stranded_rather_than_routed() {
+        let (mut app, collection, _) = a_road_between_endpoints();
+        let nowhere = endpoint_on(&mut app, OFF_THE_NETWORK);
+        let rover = send_from(&mut app, collection, nowhere);
+
+        tick(&mut app);
+
+        assert!(is_stranded(&app, rover));
+        assert!(
+            route_of(&app, rover).is_none(),
+            "a rover handed part of a route to somewhere it cannot go"
+        );
+    }
+
+    #[test]
+    fn a_rover_sent_across_a_gap_in_the_network_is_stranded_rather_than_half_routed() {
+        let (mut app, collection, _) = a_road_between_endpoints();
+        lay_road_between(&mut app, ELSEWHERE_FROM, ELSEWHERE_TO);
+        let elsewhere = endpoint_on(&mut app, ELSEWHERE_TO);
+        tick(&mut app);
+        let rover = send_from(&mut app, collection, elsewhere);
+
+        tick(&mut app);
+
+        assert!(is_stranded(&app, rover));
+        assert!(
+            route_of(&app, rover).is_none(),
+            "a rover handed a route that stops at the gap"
+        );
+    }
+
+    #[test]
+    fn a_rover_sent_where_it_already_stands_is_given_a_route_with_nothing_to_choose() {
+        let (mut app, _, delivery) = a_road_between_endpoints();
+        let stops = served_place(&app, delivery);
+        let rover = app
+            .world_mut()
+            .spawn((
+                Rover {
+                    segment: stops.segment,
+                    along: stops.along,
+                },
+                Cargo { quantity: LOAD },
+                SentTo(delivery),
+            ))
+            .id();
+
+        tick(&mut app);
+
+        assert_eq!(route_of(&app, rover), Some(Vec::new()));
+        assert_eq!(load_of(&app, delivery), LOAD);
+    }
+
+    #[test]
+    fn the_route_found_is_the_quickest_way_rather_than_the_shortest() {
+        let (mut app, collection, delivery) = a_fork_between_endpoints();
+        let arriving = arriving_from(&mut app, FORK_FROM);
+        let short_way = way_out_towards(&app, arriving, THE_SHORT_WAY);
+        let long_way = way_out_towards(&app, arriving, THE_LONG_WAY);
+        let (short, slowly) = arm_from(&app, short_way);
+        let (long, quickly) = arm_from(&app, long_way);
+        assert!(short < long, "the fork has no shorter arm to be tempted by");
+        assert!(quickly < slowly, "the longer arm is not the quicker one");
+
+        let rover = send_from(&mut app, collection, delivery);
+        tick(&mut app);
+
+        assert_eq!(
+            route_of(&app, rover).as_deref().and_then(<[Entity]>::first),
+            Some(&long_way),
+            "the rover took the shorter arm rather than the quicker one"
+        );
+        tick_delivered_on(&mut app, delivery).expect("the delivery lands");
+    }
+
+    #[test]
+    fn a_route_does_not_run_against_a_one_way_road() {
+        let mut app = rover_app();
+        lay_a_road_of_the_fork(&mut app, &the_stem(), false);
+        lay_a_road_of_the_fork(&mut app, &an_arm(&THE_SHORT_ARM), false);
+        lay_a_road_of_the_fork(&mut app, &an_arm(&THE_LONG_ARM_REVERSED), true);
+        lay_a_road_of_the_fork(&mut app, &the_run_out(), false);
+        let (collection, delivery) = endpoints_of_the_fork(&mut app);
+        let arriving = arriving_from(&mut app, FORK_FROM);
+        let short_way = way_out_towards(&app, arriving, THE_SHORT_WAY);
+
+        let rover = send_from(&mut app, collection, delivery);
+        tick(&mut app);
+
+        assert_eq!(
+            route_of(&app, rover).as_deref().and_then(<[Entity]>::first),
+            Some(&short_way),
+            "the rover set off the wrong way down a one-way arm"
+        );
+        tick_delivered_on(&mut app, delivery).expect("the delivery lands");
+    }
+
+    #[test]
+    fn the_route_found_is_the_same_however_the_network_was_laid() {
+        let (mut drawn_in_order, collection, delivery) = a_fork_between_endpoints();
+        let rover = send_from(&mut drawn_in_order, collection, delivery);
+        tick(&mut drawn_in_order);
+        let taken = shape_of_the_route(&drawn_in_order, rover);
+
+        let mut drawn_the_other_way = rover_app();
+        lay_a_road_of_the_fork(&mut drawn_the_other_way, &the_run_out(), false);
+        lay_a_road_of_the_fork(&mut drawn_the_other_way, &an_arm(&THE_LONG_ARM), false);
+        lay_a_road_of_the_fork(&mut drawn_the_other_way, &an_arm(&THE_SHORT_ARM), false);
+        lay_a_road_of_the_fork(&mut drawn_the_other_way, &the_stem(), false);
+        let (collection, delivery) = endpoints_of_the_fork(&mut drawn_the_other_way);
+        let rover = send_from(&mut drawn_the_other_way, collection, delivery);
+        tick(&mut drawn_the_other_way);
+
+        let also_taken = shape_of_the_route(&drawn_the_other_way, rover);
+        assert_eq!(
+            also_taken.len(),
+            taken.len(),
+            "the two networks were routed through a different number of junctions"
+        );
+        for (one, other) in also_taken.iter().zip(&taken) {
+            assert!(
+                one.distance(*other) < TOLERANCE,
+                "the two networks were routed down different ways out: {one} and {other}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_route_is_found_across_a_network_of_thousands_of_segments() {
+        let (mut app, collection, delivery) = a_large_network();
+        assert!(
+            segments_in_the_world(&mut app) > A_LARGE_NETWORK,
+            "the network is too small to say anything about a large one"
+        );
+        let rover = send_from(&mut app, collection, delivery);
+
+        tick(&mut app);
+
+        let route = route_of(&app, rover).expect("the rover was given a route");
+        assert!(
+            !route.is_empty(),
+            "a route across the network with nothing to choose in it"
+        );
+        assert!(!is_stranded(&app, rover));
     }
 
     #[test]
