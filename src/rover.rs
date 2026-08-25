@@ -709,7 +709,7 @@ mod tests {
     const ACROSS_FROM: (i32, i32) = (-2, 3);
 
     /// The tile a delivery has to turn at the junction to reach, in offset-row coordinates.
-    const ACROSS: (i32, i32) = (2, 3);
+    const ACROSS_TO: (i32, i32) = (2, 3);
 
     /// A tile far enough from either road that nothing serves it, in offset-row coordinates.
     const OFF_THE_NETWORK: (i32, i32) = (8, 8);
@@ -1785,9 +1785,9 @@ mod tests {
     fn a_crossroads_between_endpoints() -> (App, Entity, Entity) {
         let mut app = rover_app();
         lay_road_between(&mut app, COLLECTION, DELIVERY);
-        lay_road_between(&mut app, ACROSS_FROM, ACROSS);
+        lay_road_between(&mut app, ACROSS_FROM, ACROSS_TO);
         let collection = endpoint_on(&mut app, COLLECTION);
-        let across = endpoint_on(&mut app, ACROSS);
+        let across = endpoint_on(&mut app, ACROSS_TO);
         tick(&mut app);
         (app, collection, across)
     }
@@ -1922,7 +1922,7 @@ mod tests {
     fn a_rover_routed_through_a_junction_delivers_down_the_road_its_route_names() {
         let (mut app, collection, across) = a_crossroads_between_endpoints();
         let arriving = arriving_from(&mut app, COLLECTION);
-        let turn = way_out_towards(&app, arriving, ACROSS);
+        let turn = way_out_towards(&app, arriving, ACROSS_TO);
         set_off_from(&mut app, collection, across, vec![turn]);
 
         tick_delivered_on(&mut app, across).expect("the delivery lands");
