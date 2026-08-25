@@ -3,8 +3,8 @@ use crate::common::initialize::{initialize_system, Initialize, NeedsInitializati
 use crate::diagnostics::DebugGizmos;
 use crate::map::MAP_TILE_SIZE;
 use crate::road::{
-    EndsAtJunction, JunctionLegs, JunctionPolicy, NextSegment, RoadEndpoint, RoadSegment,
-    SegmentCut,
+    EndsAtJunction, JunctionLegs, JunctionPolicy, NextSegment, PlaceOnTheRoad, RoadEndpoint,
+    RoadSegment, RoadsLaid, SegmentCut,
 };
 use crate::simulation::{Simulation, Ticks};
 use bevy::ecs::system::SystemParam;
@@ -126,6 +126,15 @@ pub struct Route {
 #[derive(Component)]
 pub struct Stranded;
 
+/// A rover whose stretch of road was removed, holding the place it was standing at.
+///
+/// A place is a distance along an arc, and it is the only part of where a rover stood that
+/// outlives the segment covering it. Removing an arc takes the whole road apart and lays the
+/// stretches either side of it again on the next frame, so a rover on ground the removal did not
+/// touch is off the road until then and back on the same ground afterwards.
+#[derive(Component)]
+struct OffTheRoad(PlaceOnTheRoad);
+
 #[derive(SystemParam)]
 struct RoverInitializeParams<'w, 's> {
     query: Query<'w, 's, &'static mut Visibility, With<Rover>>,
@@ -137,8 +146,14 @@ struct RoverInitializeParams<'w, 's> {
 impl Plugin for RoverPlugin {
     fn build(&self, app: &mut App) {
         app.add_observer(hand_the_rovers_beyond_a_cut_the_stretch_beyond_it)
-            .add_observer(take_the_rovers_off_a_removed_segment)
-            .add_systems(PreUpdate, initialize_system::<Rover, RoverInitializeParams>)
+            .add_observer(lift_the_rovers_off_a_removed_segment)
+            .add_systems(
+                PreUpdate,
+                (
+                    initialize_system::<Rover, RoverInitializeParams>,
+                    put_the_rovers_back_on_the_road_that_survived.after(RoadsLaid),
+                ),
+            )
             .add_systems(
                 FixedUpdate,
                 (
@@ -297,22 +312,57 @@ fn hand_the_rovers_beyond_a_cut_the_stretch_beyond_it(
     }
 }
 
-/// Take every rover standing on a removed segment out of the world with it.
+/// Lift every rover standing on a removed segment off the road, keeping the place it stood at.
 ///
-/// A road bulldozed under traffic takes the traffic with it, load and all. The alternatives are a
-/// rover left standing where no road runs, which is a place nothing can drive out of, and refusing
-/// the player an edit their network is standing in the way of; both cost more than they buy, and
-/// only this one keeps every rover on a segment that exists. Clearing a jam by removing the road
-/// under it is then paid for in rovers rather than free (invariant 1).
-fn take_the_rovers_off_a_removed_segment(
+/// The segment goes and the place does not, which is what leaves a rover something to be put back
+/// down on. It is taken while the segment is still there to be read, because a distance along an
+/// arc says nothing on its own once the arc it was measured against has gone.
+fn lift_the_rovers_off_a_removed_segment(
     removed: On<Remove, RoadSegment>,
     rovers: Query<(Entity, &Rover)>,
+    segments: Query<&RoadSegment>,
     mut commands: Commands,
 ) {
+    let Ok(going) = segments.get(removed.entity) else {
+        return;
+    };
     for (rover, standing) in &rovers {
         if standing.segment == removed.entity {
-            commands.entity(rover).insert(Destroy);
+            commands
+                .entity(rover)
+                .insert(OffTheRoad(going.place_at(standing.along)));
         }
+    }
+}
+
+/// Put every rover the road went out from under back on the stretch of it that survived.
+///
+/// A road bulldozed under traffic takes the traffic with it, load and all, so clearing a jam by
+/// removing the road under it is paid for in rovers rather than free (invariant 1). What it must
+/// not take is the traffic on the stretches it left standing: a removal lays those again exactly
+/// as they were, so the ground a rover held is either back to the bit or gone with the arc, and
+/// which of the two it is is the question of whether any segment covers it (invariant 6).
+///
+/// It runs once the frame's roads are laid, which is what separates a stretch that has gone from
+/// one not laid yet, and before the tick, so a rover put back loses none of its journey.
+fn put_the_rovers_back_on_the_road_that_survived(
+    mut commands: Commands,
+    mut lifted: Query<(Entity, &mut Rover, &OffTheRoad)>,
+    segments: Query<(Entity, &RoadSegment)>,
+) {
+    for (entity, mut rover, stood) in &mut lifted {
+        let standing = segments
+            .iter()
+            .find(|(_, segment)| segment.covers(&stood.0))
+            .map(|(segment, _)| segment);
+        let Some(segment) = standing else {
+            commands.entity(entity).insert(Destroy);
+            continue;
+        };
+
+        rover.segment = segment;
+        rover.along = stood.0.along();
+        commands.entity(entity).remove::<OffTheRoad>();
     }
 }
 
@@ -699,6 +749,13 @@ mod tests {
     /// route through the gap has had every chance to drive into it.
     const TICKS_PAST_THE_GAP: u32 = 128;
 
+    /// Which of `STRAIGHT`'s three arcs the removal under test takes off the road.
+    ///
+    /// The middle one, so what the removal leaves is a road either side of it: one running on from
+    /// the end the road was begun at, and one setting off along the tangent the arc that went
+    /// ended on. A rover on either of them is standing on ground the removal did not touch.
+    const MIDDLE_ARC: usize = 1;
+
     /// The tile a delivery sets off from, in offset-row coordinates.
     const COLLECTION: (i32, i32) = (0, 0);
 
@@ -724,8 +781,12 @@ mod tests {
     const TICKS_GOING_NOWHERE: u32 = 256;
 
     fn rover_app() -> App {
+        rover_app_holding(PlayerAction::Select)
+    }
+
+    fn rover_app_holding(tool: PlayerAction) -> App {
         let mut app = headless_app();
-        app.insert_state(PlayerAction::Select)
+        app.insert_state(tool)
             .insert_resource(PlayerInput::default())
             .add_plugins((
                 SimulationPlugin,
@@ -1026,6 +1087,182 @@ mod tests {
                 (segment, early, late)
             })
             .collect()
+    }
+
+    /// `STRAIGHT` laid, with the road tool in hand to take an arc of it off again.
+    fn a_road_to_edit() -> App {
+        let mut app = rover_app_holding(PlayerAction::EditRoads);
+        lay_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+        app
+    }
+
+    /// A rover early and late on every segment of the road, and where each of them stands.
+    ///
+    /// Every segment of both lanes, so a removal has rovers on the ground either side of the arc
+    /// it takes as well as on the ground that goes. Where each stands is read before the removal,
+    /// because that is what a removal that moved nothing has to leave alone.
+    fn rovers_all_along_and_where_they_stand(app: &mut App) -> Vec<(Entity, Vec3)> {
+        let rovers = rovers_all_along(app);
+        advance(app, SHORT_FRAME);
+        rovers
+            .iter()
+            .flat_map(|&(_, early, late)| [early, late])
+            .map(|rover| (rover, standing_at(app, rover)))
+            .collect()
+    }
+
+    /// Take the arc between `STRAIGHT`'s middle two tiles off the road, with the road tool.
+    ///
+    /// A right click is a secondary tap and a finish at once, which is what the mouse reports. The
+    /// frame after it is the one that lays the roads the removal left, and neither carries a tick,
+    /// so where a rover stands afterwards is where the removal left it rather than where it drove.
+    fn remove_the_middle_arc(app: &mut App) {
+        {
+            let mut input = app.world_mut().resource_mut::<PlayerInput>();
+            input.ground_cursor_position = Some(middle_of_the_middle_arc());
+            input.secondary_tap = true;
+            input.finish = true;
+        }
+        advance(app, SHORT_FRAME);
+        {
+            let mut input = app.world_mut().resource_mut::<PlayerInput>();
+            input.secondary_tap = false;
+            input.finish = false;
+        }
+        advance(app, SHORT_FRAME);
+    }
+
+    /// Half way between `STRAIGHT`'s middle two tiles, which is the middle of the arc joining them.
+    fn middle_of_the_middle_arc() -> Vec3 {
+        let run = tiles(&STRAIGHT);
+        (run[MIDDLE_ARC].world_position() + run[MIDDLE_ARC + 1].world_position()) / 2.
+    }
+
+    /// Whether `place` stands on the arc the removal under test takes.
+    ///
+    /// `STRAIGHT` runs along one row of the grid, so which of its arcs a place is on is which pair
+    /// of tile centres it stands between, and nothing has to be measured against a curve.
+    fn stands_on_the_middle_arc(place: Vec3) -> bool {
+        let run = tiles(&STRAIGHT);
+        let from = run[MIDDLE_ARC].world_position().x;
+        let to = run[MIDDLE_ARC + 1].world_position().x;
+        (from..=to).contains(&place.x)
+    }
+
+    /// The rovers of `stood` standing on the ground the removal under test leaves alone.
+    fn off_the_arc_that_goes(stood: &[(Entity, Vec3)]) -> Vec<(Entity, Vec3)> {
+        stood
+            .iter()
+            .copied()
+            .filter(|&(_, was)| !stands_on_the_middle_arc(was))
+            .collect()
+    }
+
+    /// The rovers of `stood` standing on the ground the removal under test takes away.
+    fn on_the_arc_that_goes(stood: &[(Entity, Vec3)]) -> Vec<(Entity, Vec3)> {
+        stood
+            .iter()
+            .copied()
+            .filter(|&(_, was)| stands_on_the_middle_arc(was))
+            .collect()
+    }
+
+    #[test]
+    fn a_rover_the_removal_left_alone_stands_exactly_where_it_stood() {
+        let mut app = a_road_to_edit();
+        let stood = rovers_all_along_and_where_they_stand(&mut app);
+        let left_alone = off_the_arc_that_goes(&stood);
+        assert!(!left_alone.is_empty(), "no rover stood clear of the arc");
+
+        remove_the_middle_arc(&mut app);
+
+        for (rover, was) in left_alone {
+            assert!(
+                app.world().entities().contains(rover),
+                "a rover went with an arc it was not standing on"
+            );
+            assert_eq!(
+                standing_at(&app, rover),
+                was,
+                "a rover moved when an arc elsewhere on its road was removed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rover_on_a_stretch_a_junction_cut_stands_exactly_where_it_stood() {
+        let mut app = a_road_to_edit();
+        cut_the_road_across(&mut app);
+        let stood = rovers_all_along_and_where_they_stand(&mut app);
+        let left_alone = off_the_arc_that_goes(&stood);
+        assert!(!left_alone.is_empty(), "no rover stood clear of the arc");
+
+        remove_the_middle_arc(&mut app);
+
+        for (rover, was) in left_alone {
+            assert!(
+                app.world().entities().contains(rover),
+                "a rover went with an arc it was not standing on"
+            );
+            assert_eq!(
+                standing_at(&app, rover),
+                was,
+                "a rover moved when the road it stood on was laid again and cut again"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rover_the_removal_left_alone_is_still_on_a_stretch_of_road() {
+        let mut app = a_road_to_edit();
+        let stood = rovers_all_along_and_where_they_stand(&mut app);
+        let left_alone = off_the_arc_that_goes(&stood);
+        assert!(!left_alone.is_empty(), "no rover stood clear of the arc");
+
+        remove_the_middle_arc(&mut app);
+
+        for (rover, _) in left_alone {
+            assert!(
+                stands_on_its_segment(&app, rover),
+                "a rover stands where no segment runs"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rover_the_removal_left_alone_drives_on() {
+        let mut app = a_road_to_edit();
+        let stood = rovers_all_along_and_where_they_stand(&mut app);
+        let (driving, was) = *off_the_arc_that_goes(&stood)
+            .first()
+            .expect("no rover stood clear of the arc");
+
+        remove_the_middle_arc(&mut app);
+        tick(&mut app);
+
+        assert_ne!(
+            standing_at(&app, driving),
+            was,
+            "a rover the removal left alone stopped driving"
+        );
+    }
+
+    #[test]
+    fn a_rover_on_the_arc_a_removal_took_leaves_the_world() {
+        let mut app = a_road_to_edit();
+        let stood = rovers_all_along_and_where_they_stand(&mut app);
+        let going = on_the_arc_that_goes(&stood);
+        assert!(!going.is_empty(), "no rover stood on the arc that goes");
+
+        remove_the_middle_arc(&mut app);
+
+        for (rover, _) in going {
+            assert!(
+                !app.world().entities().contains(rover),
+                "a rover outlived the arc it was standing on"
+            );
+        }
     }
 
     /// Put a rover `fraction` of the way along `segment`.

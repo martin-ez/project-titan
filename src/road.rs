@@ -148,6 +148,14 @@ const CROSSING_TOLERANCE: f32 = 1e-3;
 /// to the first thing they build.
 pub struct RoadPlugin;
 
+/// The point in a frame by which the roads spawned have their lanes, segments and junctions.
+///
+/// A road is a record of nodes when it is spawned and is laid on the frame after, so what runs
+/// before this cannot tell a stretch of road that has gone from one that has not been laid yet.
+/// Anything holding a place on a road the player edited has to wait for it.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RoadsLaid;
+
 /// A road the player placed: the nodes it runs through, in the order they were clicked.
 ///
 /// The nodes are the road. Its arcs, the lanes over them and every world position a rover ever
@@ -206,6 +214,20 @@ pub struct RoadSegment {
     arc: Arc,
     from: f32,
     to: f32,
+}
+
+/// A place on the network, which is a distance along one of the arcs a road was laid as.
+///
+/// It outlives the segment covering it, and that is what it is for: a road taken apart by a
+/// removal is laid again as the stretches either side of the arc that went, and those derive the
+/// arcs they already had rather than a curve refitted through the same nodes (invariant 3). The
+/// ground under a place is therefore either back to the bit or gone, so whatever was standing on
+/// it is put back by asking which segment covers it rather than by measuring anything
+/// (invariant 6).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlaceOnTheRoad {
+    arc: Arc,
+    along: f32,
 }
 
 /// The segment a rover leaving this one drives onto next.
@@ -373,7 +395,8 @@ impl Plugin for RoadPlugin {
                     cut_the_roads_where_they_cross,
                     join_the_legs_at_the_junctions,
                 )
-                    .chain(),
+                    .chain()
+                    .in_set(RoadsLaid),
             )
             .add_systems(
                 Update,
@@ -571,6 +594,19 @@ impl RoadSegment {
         self.to
     }
 
+    /// The place on the network a rover standing `along` this segment's arc is holding.
+    pub fn place_at(&self, along: f32) -> PlaceOnTheRoad {
+        PlaceOnTheRoad {
+            arc: self.arc,
+            along,
+        }
+    }
+
+    /// Whether this segment is the stretch of road covering `place`.
+    pub fn covers(&self, place: &PlaceOnTheRoad) -> bool {
+        self.arc == place.arc && (self.from..=self.to).contains(&place.along)
+    }
+
     /// Which way a rover standing `along` this segment's arc is pointing.
     fn heading_at(&self, along: f32) -> Vec3 {
         self.arc.tangent_at(along.clamp(self.from, self.to))
@@ -591,6 +627,13 @@ impl RoadSegment {
     pub fn speed_limit(&self) -> f32 {
         let radius = self.arc.curvature.abs().recip();
         STRAIGHT_SPEED_LIMIT * (radius / COMFORTABLE_RADIUS).sqrt().min(1.)
+    }
+}
+
+impl PlaceOnTheRoad {
+    /// How far along its arc this place stands, which is the distance a rover holding it has run.
+    pub fn along(&self) -> f32 {
+        self.along
     }
 }
 
