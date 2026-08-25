@@ -7,6 +7,7 @@
 //! fixed tick per frame, which is the only footing invariant 2 leaves a simulation test to assert
 //! from.
 
+use crate::simulation::Simulation;
 use bevy::asset::AssetPlugin;
 use bevy::gizmos::GizmoAsset;
 use bevy::input::keyboard::{Key, KeyboardInput, NativeKey};
@@ -16,6 +17,13 @@ use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
 use bevy::time::TimeUpdateStrategy;
 use std::time::Duration;
+
+/// How many frames a traced run may spend on one tick before it has plainly stopped ticking.
+const FRAMES_ALLOWED_A_TICK: usize = 64;
+
+/// What a traced run has seen so far, one reading per tick.
+#[derive(Resource)]
+struct Traced<T: Send + Sync + 'static>(Vec<T>);
 
 /// An `App` carrying what a plugin needs to run, and nothing that opens a window.
 pub fn headless_app() -> App {
@@ -101,4 +109,50 @@ fn key_message(key_code: KeyCode, state: ButtonState) -> KeyboardInput {
         repeat: false,
         window: Entity::PLACEHOLDER,
     }
+}
+
+/// Run `app` until the simulation has carried `ticks` ticks, reading it on each of them.
+///
+/// The reading is taken on the tick rather than on the frame, so two runs whose frames divide the
+/// same ticks differently still line up entry for entry — which is what lets a run at one frame
+/// rate be compared with a run at another (invariant 2). Frame lengths cycle through `frames`, so
+/// one length is a steady rate and several are a ragged one.
+///
+/// The app is handed over already built, so the tick that lays a road is not a tick of the run.
+pub fn trace<T: Send + Sync + 'static>(
+    mut app: App,
+    frames: &[Duration],
+    ticks: usize,
+    observe: fn(&World) -> T,
+) -> Vec<T> {
+    app.insert_resource(Traced::<T>(Vec::new()));
+    app.add_systems(
+        FixedUpdate,
+        (move |world: &mut World| {
+            let seen = observe(world);
+            world.resource_mut::<Traced<T>>().0.push(seen);
+        })
+        .after(Simulation),
+    );
+
+    let mut lengths = frames.iter().copied().cycle();
+    for _ in 0..ticks * FRAMES_ALLOWED_A_TICK {
+        if app.world().resource::<Traced<T>>().0.len() >= ticks {
+            break;
+        }
+        advance(&mut app, lengths.next().expect("a run has a frame length"));
+    }
+
+    let mut traced = app
+        .world_mut()
+        .remove_resource::<Traced<T>>()
+        .expect("the run recorded what it saw")
+        .0;
+    assert!(
+        traced.len() >= ticks,
+        "the run carried {} of the {ticks} ticks asked of it",
+        traced.len()
+    );
+    traced.truncate(ticks);
+    traced
 }
