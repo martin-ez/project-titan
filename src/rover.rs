@@ -596,7 +596,7 @@ mod tests {
     use crate::map::{HexCoordinates, LatticeNode, MAP_TILE_INRADIUS};
     use crate::road::{EndsAtJunction, JunctionLegs, Road, RoadEndpoint, RoadPlugin, ServedBy};
     use crate::simulation::{SimulationPlugin, Ticks};
-    use crate::testing::{advance, headless_app, tick};
+    use crate::testing::{advance, headless_app, tick, trace};
     use std::time::Duration;
 
     /// How closely two world positions have to agree to be the same place.
@@ -722,6 +722,36 @@ mod tests {
 
     /// How many ticks a rover that will not arrive is driven for before it is asked where it got to.
     const TICKS_GOING_NOWHERE: u32 = 256;
+
+    /// A frame carrying exactly one tick, which is the rate every other run is compared against.
+    ///
+    /// The timestep is 15625 µs, and 15625 is five to the sixth, so each frame length below
+    /// divides it exactly and hundreds of them accumulate no drift for a comparison to trip on.
+    const A_TICK_A_FRAME: [Duration; 1] = [Duration::from_micros(15_625)];
+
+    /// Five frames to the tick, four of them carrying none.
+    const FIVE_FRAMES_A_TICK: [Duration; 1] = [Duration::from_micros(3_125)];
+
+    /// One frame to four ticks, which is a machine too slow to draw the world every tick.
+    const FOUR_TICKS_A_FRAME: [Duration; 1] = [Duration::from_micros(62_500)];
+
+    /// Frame lengths no clock hands out twice, one of them too short to carry a tick at all.
+    const RAGGED_FRAMES: [Duration; 5] = [
+        Duration::from_micros(3_125),
+        Duration::from_micros(100),
+        Duration::from_micros(46_875),
+        Duration::from_micros(15_625),
+        Duration::from_micros(625),
+    ];
+
+    /// How many ticks two traces are compared over.
+    ///
+    /// Long enough for a rover to reach the junction, be let through it and drive on down the far
+    /// road, which is the stretch of a journey where the tick has anything to decide.
+    const TICKS_TRACED: usize = 400;
+
+    /// Where along its segment a rover waiting at the junction ahead of it stands.
+    const AT_THE_JUNCTION: f32 = 1.;
 
     fn rover_app() -> App {
         let mut app = headless_app();
@@ -2015,5 +2045,180 @@ mod tests {
         }
 
         assert_eq!(delivered, Some(on_the_tick));
+    }
+
+    /// Where one rover stands and what it is doing, as the tick left it.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Standing {
+        segment: Entity,
+        along: f32,
+        waiting: bool,
+        stranded: bool,
+        load: u32,
+    }
+
+    /// The traffic on the map, in an order nothing about how the world stores it can decide.
+    ///
+    /// Sorted by where a rover is rather than by which entity it is, so two runs that spawned the
+    /// same rovers in a different order still compare entry for entry, and a rover picking up a
+    /// component cannot reorder the reading by moving to another archetype.
+    fn traffic(world: &World) -> Vec<Standing> {
+        let mut standing: Vec<Standing> = world
+            .iter_entities()
+            .filter_map(|entity| {
+                let rover = entity.get::<Rover>()?;
+                Some(Standing {
+                    segment: rover.segment,
+                    along: rover.along,
+                    waiting: entity.contains::<WaitingAtJunction>(),
+                    stranded: entity.contains::<Stranded>(),
+                    load: entity.get::<Cargo>().map_or(0, |cargo| cargo.quantity),
+                })
+            })
+            .collect();
+        standing.sort_by(|one, other| {
+            one.segment
+                .cmp(&other.segment)
+                .then(one.along.total_cmp(&other.along))
+        });
+        standing
+    }
+
+    /// A crossroads with a delivery running through it and a rover coming the other way.
+    ///
+    /// Both roads carry a rover into the junction, so the tick has a choice to make, and the one
+    /// on a route has a load to hand over on the far side of that choice.
+    fn a_crossroads_under_traffic() -> App {
+        let (mut app, collection, across) = a_crossroads_between_endpoints();
+        let arriving = arriving_from(&mut app, COLLECTION);
+        let turn = way_out_towards(&app, arriving, ACROSS_TO);
+        set_off_from(&mut app, collection, across, vec![turn]);
+
+        let crossing = arriving_from(&mut app, ACROSS_FROM);
+        let sets_off = place_along(&app, crossing, 0.);
+        spawn_rover(&mut app, crossing, sets_off);
+        app
+    }
+
+    /// A straight road with a rover set down `along` the segment it sets off from.
+    fn a_rover_set_down_at(along: f32) -> App {
+        let mut app = road_app();
+        let segment = segment_from(&mut app, tiles(&STRAIGHT)[0]);
+        spawn_rover(&mut app, segment, along);
+        app
+    }
+
+    /// A crossroads holding a rover at the end of the leg reaching it from each tile in turn.
+    ///
+    /// Both are set down where their segment ends, so both are marked as waiting on the same tick
+    /// with the same arrival and neither has waited longer than the other. Which of them goes is
+    /// a tie, and the order they are spawned in is the only thing two runs of this differ by.
+    fn two_rovers_held_at_a_junction(first: (i32, i32), second: (i32, i32)) -> App {
+        let (mut app, ..) = a_crossroads_between_endpoints();
+        for approach in [first, second] {
+            let leg = arriving_from(&mut app, approach);
+            let waits_at = place_along(&app, leg, AT_THE_JUNCTION);
+            spawn_rover(&mut app, leg, waits_at);
+        }
+        app
+    }
+
+    #[test]
+    fn a_trace_tells_two_worlds_that_set_off_differently_apart() {
+        let early = a_rover_set_down_at(EARLY_ALONG);
+        let late = a_rover_set_down_at(LATE_ALONG);
+
+        let early = trace(early, &A_TICK_A_FRAME, TICKS_TRACED, traffic);
+
+        assert_ne!(early, trace(late, &A_TICK_A_FRAME, TICKS_TRACED, traffic));
+    }
+
+    #[test]
+    fn the_same_world_run_twice_gives_the_same_traffic() {
+        let once = trace(
+            a_crossroads_under_traffic(),
+            &A_TICK_A_FRAME,
+            TICKS_TRACED,
+            traffic,
+        );
+
+        let again = trace(
+            a_crossroads_under_traffic(),
+            &A_TICK_A_FRAME,
+            TICKS_TRACED,
+            traffic,
+        );
+
+        assert_eq!(once, again);
+    }
+
+    #[test]
+    fn a_world_drawn_five_times_a_tick_gives_the_same_traffic() {
+        let steady = trace(
+            a_crossroads_under_traffic(),
+            &A_TICK_A_FRAME,
+            TICKS_TRACED,
+            traffic,
+        );
+
+        let often = trace(
+            a_crossroads_under_traffic(),
+            &FIVE_FRAMES_A_TICK,
+            TICKS_TRACED,
+            traffic,
+        );
+
+        assert_eq!(steady, often);
+    }
+
+    #[test]
+    fn a_world_drawn_once_in_four_ticks_gives_the_same_traffic() {
+        let steady = trace(
+            a_crossroads_under_traffic(),
+            &A_TICK_A_FRAME,
+            TICKS_TRACED,
+            traffic,
+        );
+
+        let seldom = trace(
+            a_crossroads_under_traffic(),
+            &FOUR_TICKS_A_FRAME,
+            TICKS_TRACED,
+            traffic,
+        );
+
+        assert_eq!(steady, seldom);
+    }
+
+    #[test]
+    fn a_world_drawn_on_ragged_frames_gives_the_same_traffic() {
+        let steady = trace(
+            a_crossroads_under_traffic(),
+            &A_TICK_A_FRAME,
+            TICKS_TRACED,
+            traffic,
+        );
+
+        let ragged = trace(
+            a_crossroads_under_traffic(),
+            &RAGGED_FRAMES,
+            TICKS_TRACED,
+            traffic,
+        );
+
+        assert_eq!(steady, ragged);
+    }
+
+    #[test]
+    fn a_tie_at_a_junction_outlives_the_order_the_rovers_were_spawned_in() {
+        let one_way_round = two_rovers_held_at_a_junction(COLLECTION, ACROSS_FROM);
+        let the_other = two_rovers_held_at_a_junction(ACROSS_FROM, COLLECTION);
+
+        let one_way_round = trace(one_way_round, &A_TICK_A_FRAME, TICKS_TRACED, traffic);
+
+        assert_eq!(
+            one_way_round,
+            trace(the_other, &A_TICK_A_FRAME, TICKS_TRACED, traffic)
+        );
     }
 }
