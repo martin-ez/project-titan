@@ -335,6 +335,7 @@ fn key_label(key: KeyCode) -> String {
         KeyCode::KeyD => "D",
         KeyCode::KeyQ => "Q",
         KeyCode::KeyE => "E",
+        KeyCode::KeyR => "R",
         KeyCode::ShiftLeft => "Shift",
         KeyCode::ControlLeft => "Ctrl",
         KeyCode::Space => "Space",
@@ -362,6 +363,7 @@ fn mouse_label(button: MouseButton) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::TURN_KEY;
     use crate::testing::{headless_app, press_key, release_key, tick};
 
     fn legend_app() -> App {
@@ -530,26 +532,6 @@ mod tests {
     }
 
     #[test]
-    fn a_bound_key_is_named_as_it_is_printed_on_the_keyboard() {
-        let mut app = legend_app();
-        declare(
-            &mut app,
-            [Binding {
-                input: BindingInput::Key(KeyCode::KeyQ),
-                action: "Choose the type before this one",
-                context: BindingContext::Always,
-            }],
-        );
-        tick(&mut app);
-        show_a_legend(&mut app);
-
-        let legend = shown_legend(&mut app);
-
-        assert!(legend.contains('Q'), "{legend}");
-        assert!(!legend.contains("KeyQ"), "{legend}");
-    }
-
-    #[test]
     fn the_panel_is_not_sized_by_the_type_the_player_chose() {
         let mut app = building_legend_app();
         tick(&mut app);
@@ -654,11 +636,28 @@ mod tests {
         let mut app = legend_app();
         declare(
             &mut app,
-            [Binding {
-                input: BindingInput::Key(KeyCode::ShiftLeft),
-                action: "Orbit the camera",
-                context: BindingContext::Always,
-            }],
+            [
+                Binding {
+                    input: BindingInput::Key(KeyCode::ShiftLeft),
+                    action: "Orbit the camera",
+                    context: BindingContext::Always,
+                },
+                Binding {
+                    input: BindingInput::Key(KeyCode::KeyQ),
+                    action: "Choose the type before this one",
+                    context: BindingContext::Always,
+                },
+                Binding {
+                    input: BindingInput::Key(KeyCode::KeyE),
+                    action: "Choose the type after this one",
+                    context: BindingContext::Always,
+                },
+                Binding {
+                    input: BindingInput::Key(TURN_KEY),
+                    action: "Turn the building you are about to place",
+                    context: BindingContext::Always,
+                },
+            ],
         );
         tick(&mut app);
         show_a_legend(&mut app);
@@ -667,6 +666,9 @@ mod tests {
 
         assert!(legend.contains("Shift"), "{legend}");
         assert!(!legend.contains("ShiftLeft"), "{legend}");
+        assert!(!legend.contains("KeyQ"), "{legend}");
+        assert!(!legend.contains("KeyE"), "{legend}");
+        assert!(!legend.contains("KeyR"), "{legend}");
     }
 
     #[test]
