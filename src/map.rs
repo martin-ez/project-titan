@@ -290,6 +290,32 @@ impl TileCorner {
         self.step_from(LatticeNode::from_tile(tile))
     }
 
+    /// The next corner round the tile, in the order `ALL` comes round it.
+    pub fn next_round(self) -> Self {
+        self.turned_to(Self::NorthEast)
+    }
+
+    /// The corner standing as far round from `facing` as this one stands from due north.
+    ///
+    /// A layout is written against a thing facing due north, so turning that thing to face
+    /// `facing` carries each corner it named to the corner this answers. Both are whole sixths of
+    /// a turn on a lattice of six, so the arithmetic is exact and a turn and its undoing land back
+    /// on the corner they started from (invariant 3).
+    pub fn turned_to(self, facing: Self) -> Self {
+        Self::ALL[(self.sixths() + facing.sixths()) % Self::ALL.len()]
+    }
+
+    fn sixths(self) -> usize {
+        match self {
+            Self::North => 0,
+            Self::NorthEast => 1,
+            Self::SouthEast => 2,
+            Self::South => 3,
+            Self::SouthWest => 4,
+            Self::NorthWest => 5,
+        }
+    }
+
     fn step_from(self, node: LatticeNode) -> LatticeNode {
         let (di, dj) = match self {
             Self::North => (0, 1),
@@ -548,6 +574,51 @@ mod tests {
                 (side_of(strayed.x), side_of(strayed.z)),
                 (east, north),
                 "{corner:?} lies {strayed} from the middle of {tile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn turning_a_corner_to_due_north_leaves_it_where_it_started() {
+        for corner in TileCorner::ALL {
+            assert_eq!(corner.turned_to(TileCorner::North), corner);
+        }
+    }
+
+    #[test]
+    fn a_corner_taken_six_times_round_is_the_corner_it_started_on() {
+        for corner in TileCorner::ALL {
+            let mut turned = corner;
+            for _ in 0..TileCorner::ALL.len() {
+                turned = turned.next_round();
+            }
+
+            assert_eq!(turned, corner);
+        }
+    }
+
+    #[test]
+    fn turning_to_the_next_corner_round_takes_every_corner_one_step_round() {
+        for (corner, next) in TileCorner::ALL
+            .iter()
+            .zip(TileCorner::ALL.iter().cycle().skip(1))
+        {
+            assert_eq!(corner.turned_to(TileCorner::North.next_round()), *next);
+        }
+    }
+
+    #[test]
+    fn a_facing_moves_the_six_corners_onto_six_corners_again() {
+        for facing in TileCorner::ALL {
+            let turned: HashSet<TileCorner> = TileCorner::ALL
+                .map(|corner| corner.turned_to(facing))
+                .into_iter()
+                .collect();
+
+            assert_eq!(
+                turned.len(),
+                TileCorner::ALL.len(),
+                "{facing:?} folded two corners together"
             );
         }
     }
