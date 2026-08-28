@@ -1068,8 +1068,10 @@ mod tests {
         facing: TileCorner,
     ) {
         let standing = port_corners(app, building, tile_at(offset));
+        let named: Vec<(TileCorner, Port)> = kind.ports().collect();
+        assert!(!named.is_empty(), "the type names no ports to look for");
 
-        for (corner, port) in kind.ports() {
+        for (corner, port) in named {
             let wanted = corner.turned_to(facing);
             assert!(
                 standing.contains(&(port, wanted)),
