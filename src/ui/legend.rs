@@ -132,7 +132,12 @@ fn open_the_legend(
     chosen: Option<Res<ChosenBuildingType>>,
 ) {
     let held = held_tool(held.as_deref());
-    spawn_legend(&mut commands, &bindings, held, placing(chosen.as_deref(), held));
+    spawn_legend(
+        &mut commands,
+        &bindings,
+        held,
+        placing(chosen.as_deref(), held),
+    );
 }
 
 fn toggle_the_legend(
@@ -515,6 +520,63 @@ mod tests {
             .expect("the binding is named");
 
         assert!(heading < row, "{legend}");
+    }
+
+    /// A legend over a game holding the building tool, which is what names a type to place.
+    fn building_legend_app() -> App {
+        let mut app = headless_app();
+        app.insert_state(PlayerAction::EditBuildings)
+            .init_resource::<ChosenBuildingType>()
+            .add_plugins(LegendPlugin);
+        declare(
+            &mut app,
+            [Binding {
+                input: BindingInput::Mouse(MouseButton::Left),
+                action: "Put a building on the tile",
+                context: BindingContext::Tool(PlayerAction::EditBuildings),
+            }],
+        );
+        app
+    }
+
+    #[test]
+    fn the_legend_names_the_type_the_building_tool_will_place() {
+        let mut app = building_legend_app();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        let legend = shown_legend(&mut app);
+
+        let placing = app
+            .world()
+            .resource::<ChosenBuildingType>()
+            .chosen()
+            .label();
+        assert!(legend.contains(&placing), "{legend}");
+    }
+
+    #[test]
+    fn the_legend_follows_the_player_stepping_to_another_type() {
+        let mut app = building_legend_app();
+        tick(&mut app);
+        show_a_legend(&mut app);
+        let before = app
+            .world()
+            .resource::<ChosenBuildingType>()
+            .chosen()
+            .label();
+
+        app.world_mut().resource_mut::<ChosenBuildingType>().step(1);
+        tick(&mut app);
+
+        let after = app
+            .world()
+            .resource::<ChosenBuildingType>()
+            .chosen()
+            .label();
+        let legend = shown_legend(&mut app);
+        assert!(legend.contains(&after), "{legend}");
+        assert!(!legend.contains(&before), "{legend}");
     }
 
     #[test]

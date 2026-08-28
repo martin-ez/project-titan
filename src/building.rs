@@ -414,7 +414,8 @@ impl ChosenBuildingType {
         BuildingType::ALL[self.0]
     }
 
-    fn step(&mut self, by: isize) {
+    /// Move `by` places through the catalogue, going round rather than stopping at either end.
+    pub fn step(&mut self, by: isize) {
         let catalogue = BuildingType::ALL.len() as isize;
         self.0 = (self.0 as isize + by).rem_euclid(catalogue) as usize;
     }
@@ -721,7 +722,7 @@ mod tests {
     use crate::road::{Road, RoadPlugin};
     use crate::rover::{Cargo, Route, Rover, RoverPlugin};
     use crate::simulation::SimulationPlugin;
-    use crate::testing::{headless_app, tick};
+    use crate::testing::{headless_app, press_key, release_key, tick};
 
     /// A run of tiles whose nodes are neighbours, so the road takes those tiles and no others.
     const NEIGHBOURING: [(i32, i32); 3] = [(0, 0), (1, 0), (2, 0)];
@@ -820,26 +821,50 @@ mod tests {
 
     /// The tile whose outlet stands on the same corner as `PORTED`'s intake, in offset-row
     /// coordinates. Two buildings placed there share one node of the network.
-    const SHARING: (i32, i32) = (-1, 1);
+    const SHARING: (i32, i32) = (-1, -1);
 
-    /// A corner of `PORTED` no port of a building standing there names.
+    /// A corner of `PORTED` no port of a `MELTER` standing there names.
     const UNPORTED: TileCorner = TileCorner::South;
+
+    /// A type taking one item in and putting one out, so its two ports stand on separate corners.
+    const MELTER: BuildingType = BuildingType::Assembler(Recipe {
+        inputs: &[stack(1, Item::Raw(RawMaterial::Ice))],
+        outputs: &[stack(1, Item::Water)],
+    });
+
+    /// A type putting two items out of one, which is the shape a split reaction takes.
+    const ELECTROLYSER: BuildingType = BuildingType::Assembler(Recipe {
+        inputs: &[stack(1, Item::Water)],
+        outputs: &[stack(2, Item::Hydrogen), stack(1, Item::Oxygen)],
+    });
+
+    /// A type drawing out of the ground, which takes nothing in at all.
+    const ICE_EXTRACTOR: BuildingType = BuildingType::Extractor(RawMaterial::Ice);
 
     fn tile_at(offset: (i32, i32)) -> HexCoordinates {
         HexCoordinates::from_offset_row(offset.0, offset.1)
     }
 
-    /// The corner a building's `which` port stands on, whatever corner its layout gives it.
-    fn corner_for(which: Port) -> TileCorner {
-        BUILDING_PORTS
-            .into_iter()
-            .find(|(_, port)| *port == which)
-            .map(|(corner, _)| corner)
-            .expect("every building has both an intake and an outlet")
+    /// Hold the tool over `kind`, which the player does by stepping through the catalogue.
+    fn choose(app: &mut App, kind: BuildingType) {
+        let place = BuildingType::ALL
+            .iter()
+            .position(|held| *held == kind)
+            .expect("the type is one the catalogue offers");
+        app.world_mut().insert_resource(ChosenBuildingType(place));
     }
 
-    /// Put a building on the tile at `offset`, which the tool takes a tap to do.
-    fn place_building_at(app: &mut App, offset: (i32, i32)) -> Entity {
+    /// The corner a building of `kind` stands its `flow` port on.
+    fn corner_for(kind: BuildingType, flow: Flow) -> TileCorner {
+        kind.ports()
+            .find(|(_, port)| port.flow == flow)
+            .map(|(corner, _)| corner)
+            .expect("the type has a port moving goods that way")
+    }
+
+    /// Put a building of `kind` on the tile at `offset`, which the tool takes a tap to do.
+    fn place_building_at(app: &mut App, kind: BuildingType, offset: (i32, i32)) -> Entity {
+        choose(app, kind);
         let tile = spawn_tile(app, offset.0, offset.1);
         tap_on(app, Some(tile));
         buildings_in_the_world(app)
@@ -889,12 +914,12 @@ mod tests {
             .collect()
     }
 
-    fn port_of(app: &mut App, building: Entity, which: Port) -> Entity {
+    fn port_of(app: &mut App, building: Entity, flow: Flow) -> Entity {
         ports_of(app, building)
             .into_iter()
-            .find(|&(port, _)| port == which)
+            .find(|(port, _)| port.flow == flow)
             .map(|(_, entity)| entity)
-            .unwrap_or_else(|| panic!("the building has no {which:?}"))
+            .unwrap_or_else(|| panic!("the building has no {flow:?}"))
     }
 
     fn is_served(app: &App, port: Entity) -> bool {
@@ -911,17 +936,18 @@ mod tests {
     }
 
     #[test]
-    fn a_placed_building_has_one_port_for_each_corner_its_layout_names() {
+    fn a_placed_building_stands_the_ports_its_type_names() {
         let mut app = building_app(PlayerAction::EditBuildings);
-        let building = place_building_at(&mut app, PORTED);
+        let building = place_building_at(&mut app, MELTER, PORTED);
 
         let placed: Vec<Port> = ports_of(&mut app, building)
             .into_iter()
             .map(|(port, _)| port)
             .collect();
 
-        assert_eq!(placed.len(), BUILDING_PORTS.len());
-        for (_, port) in BUILDING_PORTS {
+        let named: Vec<Port> = MELTER.ports().map(|(_, port)| port).collect();
+        assert_eq!(placed.len(), named.len());
+        for port in named {
             assert!(placed.contains(&port), "no {port:?} among {placed:?}");
         }
     }
@@ -929,16 +955,16 @@ mod tests {
     #[test]
     fn a_road_on_the_corner_one_port_names_leaves_the_other_port_unserved() {
         let mut app = building_app(PlayerAction::EditBuildings);
-        let building = place_building_at(&mut app, PORTED);
+        let building = place_building_at(&mut app, MELTER, PORTED);
 
         lay_road_to(
             &mut app,
-            corner_for(Port::Intake).node_of(tile_at(PORTED)),
+            corner_for(MELTER, Flow::Intake).node_of(tile_at(PORTED)),
             &[PORTED],
         );
 
-        let intake = port_of(&mut app, building, Port::Intake);
-        let outlet = port_of(&mut app, building, Port::Outlet);
+        let intake = port_of(&mut app, building, Flow::Intake);
+        let outlet = port_of(&mut app, building, Flow::Outlet);
         assert!(is_served(&app, intake), "the road did not serve the intake");
         assert!(!is_served(&app, outlet), "the outlet was served too");
     }
@@ -946,7 +972,7 @@ mod tests {
     #[test]
     fn a_road_on_a_corner_no_port_names_serves_no_port_of_the_building() {
         let mut app = building_app(PlayerAction::EditBuildings);
-        let building = place_building_at(&mut app, PORTED);
+        let building = place_building_at(&mut app, MELTER, PORTED);
 
         lay_road_to(&mut app, UNPORTED.node_of(tile_at(PORTED)), &[PORTED]);
 
@@ -958,19 +984,19 @@ mod tests {
     #[test]
     fn two_buildings_sharing_a_corner_are_both_served_by_the_one_road_node_on_it() {
         let mut app = building_app(PlayerAction::EditBuildings);
-        let taking = place_building_at(&mut app, PORTED);
-        let giving = place_building_at(&mut app, SHARING);
-        let shared = corner_for(Port::Intake).node_of(tile_at(PORTED));
+        let taking = place_building_at(&mut app, MELTER, PORTED);
+        let giving = place_building_at(&mut app, MELTER, SHARING);
+        let shared = corner_for(MELTER, Flow::Intake).node_of(tile_at(PORTED));
         assert_eq!(
             shared,
-            corner_for(Port::Outlet).node_of(tile_at(SHARING)),
+            corner_for(MELTER, Flow::Outlet).node_of(tile_at(SHARING)),
             "the two buildings do not share a corner to be served on"
         );
 
         lay_road_to(&mut app, shared, &[PORTED, SHARING]);
 
-        let intake = port_of(&mut app, taking, Port::Intake);
-        let outlet = port_of(&mut app, giving, Port::Outlet);
+        let intake = port_of(&mut app, taking, Flow::Intake);
+        let outlet = port_of(&mut app, giving, Flow::Outlet);
         assert!(
             is_served(&app, intake),
             "the intake was left off the network"
@@ -1001,11 +1027,11 @@ mod tests {
     #[test]
     fn a_rover_driven_to_a_port_leaves_its_load_there_rather_than_at_the_building() {
         let mut app = delivery_app();
-        let building = place_building_at(&mut app, PORTED);
-        let intake = port_of(&mut app, building, Port::Intake);
+        let building = place_building_at(&mut app, MELTER, PORTED);
+        let intake = port_of(&mut app, building, Flow::Intake);
         lay_road_to(
             &mut app,
-            corner_for(Port::Intake).node_of(tile_at(PORTED)),
+            corner_for(MELTER, Flow::Intake).node_of(tile_at(PORTED)),
             &[PORTED],
         );
         let stops = app
@@ -1035,6 +1061,7 @@ mod tests {
     #[test]
     fn taking_a_building_off_the_map_takes_its_ports_with_it() {
         let mut app = building_app(PlayerAction::EditBuildings);
+        choose(&mut app, MELTER);
         let tile = spawn_tile(&mut app, PORTED.0, PORTED.1);
         tap_on(&mut app, Some(tile));
         let building = building_entity(&mut app).expect("the tap placed a building");
@@ -1042,7 +1069,7 @@ mod tests {
             .into_iter()
             .map(|(_, entity)| entity)
             .collect();
-        assert_eq!(ports.len(), BUILDING_PORTS.len());
+        assert_eq!(ports.len(), MELTER.ports().count());
 
         secondary_tap_on(&mut app, Some(tile));
 
@@ -1301,6 +1328,161 @@ mod tests {
         tap_on(&mut app, Some(tile));
 
         assert_eq!(buildings(&mut app), [HexCoordinates::from_offset_row(1, 1)]);
+    }
+
+    /// What `kind` moves through its ports one way, taken off the ports it stands.
+    fn items_through(kind: BuildingType, flow: Flow) -> Vec<Item> {
+        kind.ports()
+            .filter(|(_, port)| port.flow == flow)
+            .map(|(_, port)| port.item)
+            .collect()
+    }
+
+    #[test]
+    fn every_type_takes_in_each_item_its_recipe_consumes() {
+        for kind in BuildingType::ALL {
+            let taken = items_through(kind, Flow::Intake);
+            for stack in kind.recipe().inputs {
+                assert!(
+                    taken.contains(&stack.item),
+                    "{} takes {:?} in nowhere",
+                    kind.label(),
+                    stack.item
+                );
+            }
+            assert_eq!(taken.len(), kind.recipe().inputs.len());
+        }
+    }
+
+    #[test]
+    fn every_type_puts_out_each_item_its_recipe_makes() {
+        for kind in BuildingType::ALL {
+            let made = items_through(kind, Flow::Outlet);
+            for stack in kind.recipe().outputs {
+                assert!(
+                    made.contains(&stack.item),
+                    "{} puts {:?} out nowhere",
+                    kind.label(),
+                    stack.item
+                );
+            }
+            assert_eq!(made.len(), kind.recipe().outputs.len());
+        }
+    }
+
+    #[test]
+    fn a_type_making_two_things_stands_an_outlet_for_each_of_them() {
+        assert_eq!(
+            items_through(ELECTROLYSER, Flow::Outlet),
+            [Item::Hydrogen, Item::Oxygen]
+        );
+    }
+
+    #[test]
+    fn an_extractor_takes_nothing_in_and_puts_out_what_it_draws() {
+        assert_eq!(items_through(ICE_EXTRACTOR, Flow::Intake), []);
+        assert_eq!(
+            items_through(ICE_EXTRACTOR, Flow::Outlet),
+            [Item::Raw(RawMaterial::Ice)]
+        );
+    }
+
+    #[test]
+    fn no_two_ports_of_a_type_stand_on_one_corner() {
+        for kind in BuildingType::ALL {
+            let mut standing: Vec<TileCorner> = Vec::new();
+            for (corner, _) in kind.ports() {
+                assert!(
+                    !standing.contains(&corner),
+                    "{} stands two ports on {corner:?}",
+                    kind.label()
+                );
+                standing.push(corner);
+            }
+        }
+    }
+
+    #[test]
+    fn the_catalogue_offers_more_than_one_type_to_place() {
+        assert!(BuildingType::ALL.len() > 1);
+    }
+
+    #[test]
+    fn a_building_carries_the_type_the_tool_was_holding() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        let building = place_building_at(&mut app, ELECTROLYSER, PORTED);
+
+        assert_eq!(
+            app.world().entity(building).get::<BuildingType>(),
+            Some(&ELECTROLYSER)
+        );
+    }
+
+    #[test]
+    fn two_buildings_of_one_type_have_the_same_ports_and_the_same_recipe() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        let one = place_building_at(&mut app, ELECTROLYSER, PORTED);
+        let other = place_building_at(&mut app, ELECTROLYSER, (3, 3));
+
+        let ports_of_one: Vec<Port> = ports_of(&mut app, one).into_iter().map(|it| it.0).collect();
+        let ports_of_other: Vec<Port> = ports_of(&mut app, other)
+            .into_iter()
+            .map(|it| it.0)
+            .collect();
+        assert!(!ports_of_one.is_empty());
+        assert_eq!(ports_of_one, ports_of_other);
+        assert_eq!(recipe_of(&app, one), Some(ELECTROLYSER.recipe()));
+        assert_eq!(recipe_of(&app, other), Some(ELECTROLYSER.recipe()));
+    }
+
+    fn recipe_of(app: &App, building: Entity) -> Option<Recipe> {
+        app.world()
+            .entity(building)
+            .get::<BuildingType>()
+            .map(|kind| kind.recipe())
+    }
+
+    #[test]
+    fn the_tool_places_the_type_the_player_stepped_to() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        let tile = spawn_tile(&mut app, 0, 0);
+
+        press_key(&mut app, CHOOSE_KEYS[1].0);
+        tick(&mut app);
+        release_key(&mut app, CHOOSE_KEYS[1].0);
+        tap_on(&mut app, Some(tile));
+
+        let building = building_entity(&mut app).expect("the tap placed a building");
+        assert_eq!(
+            app.world().entity(building).get::<BuildingType>(),
+            Some(&BuildingType::ALL[1])
+        );
+    }
+
+    #[test]
+    fn stepping_back_from_the_first_type_goes_round_to_the_last() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+
+        press_key(&mut app, CHOOSE_KEYS[0].0);
+        tick(&mut app);
+
+        assert_eq!(
+            app.world().resource::<ChosenBuildingType>().chosen(),
+            BuildingType::ALL[BuildingType::ALL.len() - 1]
+        );
+    }
+
+    #[test]
+    fn stepping_while_another_tool_is_held_changes_nothing() {
+        let mut app = building_app(PlayerAction::EditRoads);
+
+        press_key(&mut app, CHOOSE_KEYS[1].0);
+        tick(&mut app);
+
+        assert_eq!(
+            app.world().resource::<ChosenBuildingType>().chosen(),
+            BuildingType::ALL[0]
+        );
     }
 
     #[test]
