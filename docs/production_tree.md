@@ -13,7 +13,7 @@ the world faster runs more ticks rather than longer ones, so these are the same
 rates fast-forwarded as at rest.
 
 A recipe may have more than one output. Where a reaction really splits — water
-into hydrogen and oxygen, carbon dioxide into carbon and dioxygen — one recipe
+into hydrogen and oxygen, carbon dioxide into carbon and oxygen — one recipe
 produces both, and a building that makes the one makes the other whether the
 player wants it or not. So a byproduct with nowhere to go is a jam like any
 other: a full output port stops the building that filled it, and a line drawing
@@ -32,14 +32,16 @@ bottom of this file a count rather than an impression.
 
 The picture above labels the Dome Habitat Panel "Drone Habitat Panel", and names
 Refined Cobalt by its process, "Refine Cobalt (Co)". The names in this file are
-the ones to use.
+the ones to use. It also draws Oxygen and Dioxygen as two items, and they are
+one here: the same substance twice cannot close, and folding them together is
+what lets the oxygen a carbon plant hands back feed the plant that spent it.
 
 ## Items by tier
 
 |  | Tier 1 | Tier 2 | Tier 3 | Tier 4 |
 | --- | --- | --- | --- | --- |
 | Raw materials | Ice | Carbon Monoxide, Nitrogen | Silicon | Cobalt Ore |
-| Intermediate products | Water, Hydrogen, Oxygen | Carbon Dioxide, Dioxygen, Carbon, Ammonia | Silicon Wafer, Glass, Silicon Carbide, Activated Charcoal | Refined Cobalt, Electronics, Hydrocarbon Polymer |
+| Intermediate products | Water, Hydrogen, Oxygen | Carbon Dioxide, Carbon, Ammonia | Silicon Wafer, Glass, Silicon Carbide, Activated Charcoal | Refined Cobalt, Electronics, Hydrocarbon Polymer |
 | Assemblies | | | Fertilized Soil | Battery, Solar Panel, Dome Habitat Panel |
 
 The final assembly, which nothing consumes, is the **Hydroponics Bay**.
@@ -71,7 +73,7 @@ input, so these are the recipes with nothing on their left.
 | Inputs | Outputs | Ticks |
 | --- | --- | --- |
 | 2 Carbon Monoxide + 1 Oxygen | 1 Carbon Dioxide | 64 |
-| 1 Carbon Dioxide | 1 Carbon + 1 Dioxygen | 64 |
+| 1 Carbon Dioxide | 1 Carbon + 1 Oxygen | 64 |
 | 1 Nitrogen + 3 Hydrogen | 1 Ammonia | 64 |
 
 ### Tier 3
@@ -79,7 +81,7 @@ input, so these are the recipes with nothing on their left.
 | Inputs | Outputs | Ticks |
 | --- | --- | --- |
 | 1 Silicon | 1 Silicon Wafer | 128 |
-| 2 Silicon | 1 Glass | 128 |
+| 1 Silicon + 2 Oxygen | 1 Glass | 128 |
 | 1 Silicon + 1 Carbon | 1 Silicon Carbide | 128 |
 | 2 Carbon | 1 Activated Charcoal | 128 |
 | 4 Water + 4 Ammonia + 2 Activated Charcoal | 1 Fertilized Soil | 256 |
@@ -104,21 +106,21 @@ input, so these are the recipes with nothing on their left.
 ## A balanced chain
 
 One Hydroponics Bay every 1024 ticks, with every building running without
-starving and without idling, is fifty-one buildings. Each row's output is
-exactly what the rows above it consume, so a row's count is its demand divided
-by what one building of it produces — which is why none of them is a fraction.
+starving and without idling, is fifty buildings. Each row's output is exactly
+what the rows above it consume, so a row's count is its demand divided by what
+one building of it produces — which is why none of them is a fraction.
 
 | Recipe | Buildings | Runs per 1024 ticks |
 | --- | --- | --- |
 | Ice | 2 | 64 |
 | Carbon Monoxide | 6 | 96 |
 | Nitrogen | 1 | 16 |
-| Silicon | 4 | 32 |
+| Silicon | 3 | 24 |
 | Cobalt Ore | 6 | 24 |
 | Water | 2 | 64 |
 | Hydrogen + Oxygen | 3 | 48 |
 | Carbon Dioxide | 3 | 48 |
-| Carbon + Dioxygen | 3 | 48 |
+| Carbon + Oxygen | 3 | 48 |
 | Ammonia | 1 | 16 |
 | Silicon Wafer | 1 | 8 |
 | Glass | 1 | 8 |
@@ -132,17 +134,19 @@ by what one building of it produces — which is why none of them is a fraction.
 | Solar Panel | 1 | 2 |
 | Dome Habitat Panel | 2 | 4 |
 | Hydroponics Bay | 1 | 1 |
-| **Total** | **51** | |
+| **Total** | **50** | |
 
-Both byproducts come out even, which is the property worth keeping if these
-numbers are ever retuned. The 48 Oxygen the electrolysers make is exactly what
-the carbon dioxide plants take, so a chain built to this table backs up nowhere:
-the only thing it produces that it does not consume is Dioxygen, and that is
-what the atmosphere objective is for.
+Oxygen is a loop rather than a line, and that is the shape worth keeping if
+these numbers are ever retuned. Making carbon dioxide spends it and taking the
+carbon back out hands it straight back, so the loop pays for itself; what the
+electrolysers add on top is surplus. Of the 96 units made per 1024 ticks the
+chain consumes 64, and the 32 left over are what the atmosphere objective is
+for. Nothing else the chain makes goes unused.
 
-A chain built to any other shape will not be so lucky, and that is the point of
-the rule rather than a flaw in it. Draw more hydrogen than this and the oxygen
-piles up behind it; take the carbon and the dioxygen has to go somewhere.
+A chain built to any other shape will not come out so even, and that is the
+point of the rule rather than a flaw in it. Draw more hydrogen than this and the
+oxygen piles up behind it; take the carbon and the oxygen comes back whether
+there is anywhere to put it or not.
 
 ## Terraforming objectives
 
@@ -151,9 +155,9 @@ produces what serves them, and how a planet measures its progress towards one is
 not settled here.
 
 - **Build Habitat** — Dome Habitat Panel.
-- **Atmosphere (O2 + CO2)** — Dioxygen and Carbon Dioxide, released rather than
-  assembled into anything. Dioxygen is the one product nothing else consumes,
-  and every chain that takes carbon out of the air makes it whether it wants it
+- **Atmosphere (O2 + CO2)** — Oxygen and Carbon Dioxide, released rather than
+  assembled into anything. Oxygen is the one thing the chain makes more of than
+  it uses, and a chain taking carbon out of the air makes it whether it wants it
   or not, so it has to go somewhere.
 - **Temperature** — nothing in the tree serves this one yet.
 - **Water** — Water.
