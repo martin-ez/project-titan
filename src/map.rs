@@ -30,8 +30,6 @@ const NODE_BASIS_X: f32 = MAP_TILE_SIZE * SQRT_3 / 4.;
 /// How far it is from the middle of a tile to the middle of any of its six edges.
 pub const MAP_TILE_INRADIUS: f32 = MAP_TILE_WIDTH / 2.;
 
-const NEIGHBOUR_STEPS: [(i32, i32); 6] = [(1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)];
-
 /// How far the debug view lifts the mark on a deposit, so it does not fight the tile it lies on.
 const GIZMO_LIFT: Vec3 = Vec3::new(0., 0.1, 0.);
 
@@ -105,6 +103,21 @@ pub struct HexCoordinates {
 pub struct LatticeNode {
     i: i32,
     j: i32,
+}
+
+/// One of the six corners of a tile, named by the way it lies from the tile's middle.
+///
+/// A tile is pointy-topped, so two of its corners face due north and south and the other four sit
+/// off its sides. Nothing on the map is turned before it is placed, so a corner named here is the
+/// same corner of every tile there is.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TileCorner {
+    North,
+    NorthEast,
+    SouthEast,
+    South,
+    SouthWest,
+    NorthWest,
 }
 
 /// One tile of the grid, standing where its coordinates put it.
@@ -226,7 +239,7 @@ impl LatticeNode {
     pub fn nearest_on(tile: HexCoordinates, position: Vec3) -> Self {
         let centre = Self::from_tile(tile);
         centre
-            .corners()
+            .around()
             .into_iter()
             .chain(std::iter::once(centre))
             .min_by(|node, other| {
@@ -236,16 +249,60 @@ impl LatticeNode {
             .unwrap_or(centre)
     }
 
-    /// The six nodes standing on the corners of `tile`.
-    pub fn corners_of(tile: HexCoordinates) -> [Self; 6] {
-        Self::from_tile(tile).corners()
+    /// The three tiles this node is a corner of, or nothing when it is a tile's own middle.
+    ///
+    /// The three are found by arithmetic rather than by measuring what is near: a node is a
+    /// middle when `i - j` divides by three, so the tiles sharing a corner are whichever of the
+    /// six nodes around it are middles, and there are always three of them (invariant 3).
+    pub fn tiles_sharing(&self) -> Option<[HexCoordinates; 3]> {
+        let mut sharing = self
+            .around()
+            .into_iter()
+            .filter_map(|node| node.middle_of());
+        Some([sharing.next()?, sharing.next()?, sharing.next()?])
     }
 
-    fn corners(&self) -> [Self; 6] {
-        [(1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1)].map(|(di, dj)| Self {
-            i: self.i + di,
-            j: self.j + dj,
+    fn middle_of(&self) -> Option<HexCoordinates> {
+        ((self.i - self.j).rem_euclid(3) == 0).then(|| HexCoordinates {
+            q: (self.i - self.j) / 3,
+            r: (self.i + 2 * self.j) / 3,
         })
+    }
+
+    fn around(&self) -> [Self; 6] {
+        TileCorner::ALL.map(|corner| corner.step_from(*self))
+    }
+}
+
+impl TileCorner {
+    /// The six corners of a tile, in the order they come round it from due north.
+    pub const ALL: [Self; 6] = [
+        Self::North,
+        Self::NorthEast,
+        Self::SouthEast,
+        Self::South,
+        Self::SouthWest,
+        Self::NorthWest,
+    ];
+
+    /// The lattice node this corner of `tile` stands on.
+    pub fn node_of(self, tile: HexCoordinates) -> LatticeNode {
+        self.step_from(LatticeNode::from_tile(tile))
+    }
+
+    fn step_from(self, node: LatticeNode) -> LatticeNode {
+        let (di, dj) = match self {
+            Self::North => (0, 1),
+            Self::NorthEast => (1, 0),
+            Self::SouthEast => (1, -1),
+            Self::South => (0, -1),
+            Self::SouthWest => (-1, 0),
+            Self::NorthWest => (-1, 1),
+        };
+        LatticeNode {
+            i: node.i + di,
+            j: node.j + dj,
+        }
     }
 }
 
@@ -287,14 +344,6 @@ impl HexCoordinates {
             q: rounded_q as i32,
             r: rounded_r as i32,
         }
-    }
-
-    /// The six tiles sharing an edge with this one.
-    pub fn neighbours(&self) -> [Self; 6] {
-        NEIGHBOUR_STEPS.map(|(dq, dr)| Self {
-            q: self.q + dq,
-            r: self.r + dr,
-        })
     }
 
     /// Where on the ground plane these coordinates put the middle of a tile.
@@ -447,32 +496,16 @@ mod tests {
     }
 
     #[test]
-    fn the_six_neighbours_of_a_tile_stand_one_tile_width_away() {
-        const TOLERANCE: f32 = 1e-3;
-
-        let centre = HexCoordinates::from_offset_row(2, 3);
-        let neighbours: HashSet<HexCoordinates> = centre.neighbours().into_iter().collect();
-
-        for neighbour in centre.neighbours() {
-            let distance = neighbour.world_position().distance(centre.world_position());
-
-            assert!(
-                (distance - MAP_TILE_WIDTH).abs() < TOLERANCE,
-                "{neighbour:?} stands {distance} from {centre:?}, not {MAP_TILE_WIDTH}"
-            );
-        }
-
-        assert_eq!(neighbours.len(), NEIGHBOUR_STEPS.len());
-    }
-
-    #[test]
     fn the_six_corners_of_a_tile_stand_at_the_corners_of_its_hexagon() {
         const TOLERANCE: f32 = 1e-3;
 
         let tile = HexCoordinates::from_offset_row(2, 3);
-        let corners: HashSet<LatticeNode> = LatticeNode::corners_of(tile).into_iter().collect();
+        let corners: HashSet<LatticeNode> = TileCorner::ALL
+            .map(|corner| corner.node_of(tile))
+            .into_iter()
+            .collect();
 
-        for corner in LatticeNode::corners_of(tile) {
+        for corner in TileCorner::ALL.map(|corner| corner.node_of(tile)) {
             let distance = corner.world_position().distance(tile.world_position());
             let across_corners = MAP_TILE_SIZE / 2.;
 
@@ -483,6 +516,69 @@ mod tests {
         }
 
         assert_eq!(corners.len(), 6);
+    }
+
+    /// Which side of the middle a corner lies on, along one axis, with `+x` east and `+z` north.
+    fn side_of(reach: f32) -> i32 {
+        const TOLERANCE: f32 = 1e-3;
+
+        if reach.abs() < TOLERANCE {
+            0
+        } else {
+            reach.signum() as i32
+        }
+    }
+
+    #[test]
+    fn a_corner_named_for_a_direction_stands_that_way_from_the_middle_of_its_tile() {
+        let tile = HexCoordinates::from_offset_row(2, 3);
+        let middle = tile.world_position();
+
+        for (corner, east, north) in [
+            (TileCorner::North, 0, 1),
+            (TileCorner::NorthEast, 1, 1),
+            (TileCorner::SouthEast, 1, -1),
+            (TileCorner::South, 0, -1),
+            (TileCorner::SouthWest, -1, -1),
+            (TileCorner::NorthWest, -1, 1),
+        ] {
+            let strayed = corner.node_of(tile).world_position() - middle;
+
+            assert_eq!(
+                (side_of(strayed.x), side_of(strayed.z)),
+                (east, north),
+                "{corner:?} lies {strayed} from the middle of {tile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_three_tiles_sharing_a_corner_each_name_it_as_a_corner_of_their_own() {
+        let tile = HexCoordinates::from_offset_row(2, 3);
+
+        for corner in TileCorner::ALL {
+            let node = corner.node_of(tile);
+            let sharing = node
+                .tiles_sharing()
+                .expect("a corner is shared by three tiles");
+
+            assert!(sharing.contains(&tile), "{corner:?} left out its own tile");
+            for shared in sharing {
+                assert!(
+                    TileCorner::ALL
+                        .iter()
+                        .any(|named| named.node_of(shared) == node),
+                    "{shared:?} shares {corner:?} of {tile:?} without naming it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_middle_of_a_tile_is_shared_by_no_tiles_at_all() {
+        let tile = HexCoordinates::from_offset_row(2, 3);
+
+        assert!(LatticeNode::from_tile(tile).tiles_sharing().is_none());
     }
 
     #[test]
