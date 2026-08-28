@@ -2078,7 +2078,7 @@ mod tests {
             built_on,
             built_on.world_position() + Vec3::Z * MAP_TILE_SIZE,
         );
-        let endpoint = app.world_mut().spawn(RoadEndpoint::on(built_on)).id();
+        let endpoint = app.world_mut().spawn(RoadEndpoint::at(corner)).id();
         app.world_mut().spawn(Road {
             nodes: vec![
                 LatticeNode::from_tile(HexCoordinates::from_offset_row(0, 1)),
@@ -2138,17 +2138,17 @@ mod tests {
         });
     }
 
-    /// An endpoint on `offset`'s tile, standing in for whatever is built there.
-    fn endpoint_on(app: &mut App, offset: (i32, i32)) -> Entity {
-        app.world_mut().spawn(RoadEndpoint::on(tile(offset))).id()
+    /// An endpoint on a tile's corner, standing in for a port of whatever is built there.
+    fn endpoint_at(app: &mut App, corner: LatticeNode) -> Entity {
+        app.world_mut().spawn(RoadEndpoint::at(corner)).id()
     }
 
     /// One road, and an endpoint at either end of it.
     fn a_road_between_endpoints() -> (App, Entity, Entity) {
         let mut app = rover_app();
         lay_road_between(&mut app, COLLECTION, DELIVERY);
-        let collection = endpoint_on(&mut app, COLLECTION);
-        let delivery = endpoint_on(&mut app, DELIVERY);
+        let collection = endpoint_at(&mut app, corner_facing(COLLECTION, DELIVERY));
+        let delivery = endpoint_at(&mut app, corner_facing(DELIVERY, COLLECTION));
         tick(&mut app);
         (app, collection, delivery)
     }
@@ -2158,8 +2158,8 @@ mod tests {
         let mut app = rover_app();
         lay_road_between(&mut app, COLLECTION, DELIVERY);
         lay_road_between(&mut app, ACROSS_FROM, ACROSS_TO);
-        let collection = endpoint_on(&mut app, COLLECTION);
-        let across = endpoint_on(&mut app, ACROSS_TO);
+        let collection = endpoint_at(&mut app, corner_facing(COLLECTION, DELIVERY));
+        let across = endpoint_at(&mut app, corner_facing(ACROSS_TO, ACROSS_FROM));
         tick(&mut app);
         (app, collection, across)
     }
@@ -2240,8 +2240,11 @@ mod tests {
 
     /// An endpoint at either end of the fork, once its roads are laid.
     fn endpoints_of_the_fork(app: &mut App) -> (Entity, Entity) {
-        let collection = endpoint_on(app, FORK_FROM);
-        let delivery = endpoint_on(app, FORK_TO);
+        let collection = endpoint_at(app, corner_facing(FORK_FROM, THE_STEM[0]));
+        let delivery = endpoint_at(
+            app,
+            corner_facing(FORK_TO, THE_RUN_OUT[THE_RUN_OUT.len() - 1]),
+        );
         tick(app);
         (collection, delivery)
     }
@@ -2302,8 +2305,14 @@ mod tests {
             lay_road_between(&mut app, (ROAD_BEGINS_AT, at), (ROAD_ENDS_AT, at));
             lay_road_between(&mut app, (at, ROAD_BEGINS_AT), (at, ROAD_ENDS_AT));
         }
-        let collection = endpoint_on(&mut app, (ROAD_BEGINS_AT, 0));
-        let delivery = endpoint_on(&mut app, (ROAD_ENDS_AT, far));
+        let collection = endpoint_at(
+            &mut app,
+            corner_facing((ROAD_BEGINS_AT, 0), (ROAD_ENDS_AT, 0)),
+        );
+        let delivery = endpoint_at(
+            &mut app,
+            corner_facing((ROAD_ENDS_AT, far), (ROAD_BEGINS_AT, far)),
+        );
         tick(&mut app);
         (app, collection, delivery)
     }
@@ -2470,7 +2479,7 @@ mod tests {
     #[test]
     fn a_rover_routed_to_an_endpoint_no_road_reaches_is_stranded() {
         let (mut app, collection, _) = a_road_between_endpoints();
-        let nowhere = endpoint_on(&mut app, OFF_THE_NETWORK);
+        let nowhere = endpoint_at(&mut app, corner_facing(OFF_THE_NETWORK, COLLECTION));
         let rover = set_off_from(&mut app, collection, nowhere, Vec::new());
         let set_off = place_of(&app, rover);
 
@@ -2540,7 +2549,7 @@ mod tests {
     #[test]
     fn a_rover_sent_to_an_endpoint_no_road_reaches_is_stranded_rather_than_routed() {
         let (mut app, collection, _) = a_road_between_endpoints();
-        let nowhere = endpoint_on(&mut app, OFF_THE_NETWORK);
+        let nowhere = endpoint_at(&mut app, corner_facing(OFF_THE_NETWORK, COLLECTION));
         let rover = send_from(&mut app, collection, nowhere);
 
         tick(&mut app);
@@ -2556,7 +2565,7 @@ mod tests {
     fn a_rover_sent_across_a_gap_in_the_network_is_stranded_rather_than_half_routed() {
         let (mut app, collection, _) = a_road_between_endpoints();
         lay_road_between(&mut app, ELSEWHERE_FROM, ELSEWHERE_TO);
-        let elsewhere = endpoint_on(&mut app, ELSEWHERE_TO);
+        let elsewhere = endpoint_at(&mut app, corner_facing(ELSEWHERE_TO, ELSEWHERE_FROM));
         tick(&mut app);
         let rover = send_from(&mut app, collection, elsewhere);
 

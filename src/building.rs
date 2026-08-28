@@ -4,7 +4,7 @@ use crate::common::initialize::{initialize_system, Initialize, NeedsInitializati
 use crate::diagnostics::DebugGizmos;
 use crate::input::{PlayerAction, PlayerInput};
 use crate::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
-use crate::map::{HexCoordinates, MapTile, MAP_TILE_INRADIUS, MAP_TILE_SIZE};
+use crate::map::{HexCoordinates, MapTile, TileCorner, MAP_TILE_INRADIUS, MAP_TILE_SIZE};
 use crate::road::{RoadEndpoint, RoadTiles};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -22,6 +22,26 @@ const REFUSED_COLOUR: Color = Color::srgb(0.95, 0.3, 0.3);
 /// How far the cross on a refused tile reaches, as a share of the tile's inradius.
 const REFUSED_MARK: f32 = 0.5;
 
+/// How far into the tile a port's arrow reaches, as a share of the tile's inradius.
+const PORT_MARK: f32 = 0.4;
+
+/// The colour a port taking goods off the road is drawn in
+const INTAKE_COLOUR: Color = Color::srgb(0.4, 0.75, 0.95);
+
+/// The colour a port handing goods to the road is drawn in
+const OUTLET_COLOUR: Color = Color::srgb(0.95, 0.8, 0.35);
+
+/// Which corner of its tile each port of a building stands on, and which way it moves goods.
+///
+/// One layout, there being one thing the tool puts down. A building carries no orientation, so
+/// every one placed has its intake and its outlet on these same two corners — and a building
+/// standing north-west of another has its outlet on the very corner that other one takes goods in
+/// on, which is density the player earns by placing well.
+const BUILDING_PORTS: [(TileCorner, Port); 2] = [
+    (TileCorner::North, Port::Intake),
+    (TileCorner::SouthEast, Port::Outlet),
+];
+
 pub struct BuildingPlugin;
 
 /// A building, standing on the tile whose coordinates it carries.
@@ -34,6 +54,19 @@ pub struct BuildingPlugin;
 )]
 struct Building {
     coordinates: HexCoordinates,
+}
+
+/// One place a building hands goods to the road or takes them from it, on a corner of its tile.
+///
+/// A port is an entity of its own and a child of the building, an entity carrying one
+/// `RoadEndpoint` and a building having several ports. That is also what makes it the thing a
+/// rover is sent to, so a delivery names the door it is for rather than the building it is at.
+#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Port {
+    /// Goods a rover brought, handed over here for the building to take in.
+    Intake,
+    /// Goods the building has made, standing here until a rover takes them away.
+    Outlet,
 }
 
 /// Which building stands on each tile of the map.
@@ -103,6 +136,7 @@ impl Plugin for BuildingPlugin {
                 (
                     (place_building_system, remove_building_system).chain(),
                     draw_the_refused_tile,
+                    draw_the_ports,
                 ),
             );
     }
@@ -159,9 +193,13 @@ fn place_building_system(
             Building {
                 coordinates: tile.coordinates,
             },
-            RoadEndpoint::on(tile.coordinates),
             Visibility::Hidden,
         ))
+        .with_children(|ports| {
+            for (corner, port) in BUILDING_PORTS {
+                ports.spawn((port, RoadEndpoint::at(corner.node_of(tile.coordinates))));
+            }
+        })
         .id();
     buildings.claim(tile.coordinates, building);
 }
@@ -227,6 +265,32 @@ fn draw_the_refused_tile(
     }
 }
 
+/// Draw which way each port moves goods: in off the road, or out onto it.
+///
+/// The two ports of a building otherwise look alike, each a mark on a corner, and which of them a
+/// rover should be sent to is the whole of what tells them apart (invariant 5).
+fn draw_the_ports(
+    mut gizmos: Gizmos<DebugGizmos>,
+    buildings: Query<&Building>,
+    ports: Query<(&Port, &RoadEndpoint, &ChildOf)>,
+) {
+    for (port, endpoint, of) in &ports {
+        let Ok(building) = buildings.get(of.0) else {
+            continue;
+        };
+        let standing = endpoint.standing_on().world_position() + GIZMO_LIFT;
+        let middle = building.coordinates.world_position() + GIZMO_LIFT;
+        let reach =
+            standing + (middle - standing).normalize_or_zero() * MAP_TILE_INRADIUS * PORT_MARK;
+
+        let (from, to, colour) = match port {
+            Port::Intake => (standing, reach, INTAKE_COLOUR),
+            Port::Outlet => (reach, standing, OUTLET_COLOUR),
+        };
+        gizmos.arrow(from, to, colour);
+    }
+}
+
 impl Initialize<BuildingInitializeParams<'_, '_>> for Building {
     fn initialize(&mut self, entity: &Entity, params: &mut BuildingInitializeParams) -> Result {
         let (mut transform, mut visibility) = params.query.get_mut(*entity)?;
@@ -256,6 +320,8 @@ mod tests {
     use crate::diagnostics::DebugGizmosPlugin;
     use crate::map::LatticeNode;
     use crate::road::{Road, RoadPlugin};
+    use crate::rover::{Cargo, Route, Rover, RoverPlugin};
+    use crate::simulation::SimulationPlugin;
     use crate::testing::{headless_app, tick};
 
     /// A run of tiles whose nodes are neighbours, so the road takes those tiles and no others.
@@ -350,15 +416,240 @@ mod tests {
         assert_eq!(buildings(&mut app), [HexCoordinates::from_offset_row(2, 3)]);
     }
 
+    /// The tile the ports under test stand on, in offset-row coordinates.
+    const PORTED: (i32, i32) = (0, 0);
+
+    /// The tile whose outlet stands on the same corner as `PORTED`'s intake, in offset-row
+    /// coordinates. Two buildings placed there share one node of the network.
+    const SHARING: (i32, i32) = (-1, 1);
+
+    /// A corner of `PORTED` no port of a building standing there names.
+    const UNPORTED: TileCorner = TileCorner::South;
+
+    fn tile_at(offset: (i32, i32)) -> HexCoordinates {
+        HexCoordinates::from_offset_row(offset.0, offset.1)
+    }
+
+    /// The corner a building's `which` port stands on, whatever corner its layout gives it.
+    fn corner_for(which: Port) -> TileCorner {
+        BUILDING_PORTS
+            .into_iter()
+            .find(|(_, port)| *port == which)
+            .map(|(corner, _)| corner)
+            .expect("every building has both an intake and an outlet")
+    }
+
+    /// Put a building on the tile at `offset`, which the tool takes a tap to do.
+    fn place_building_at(app: &mut App, offset: (i32, i32)) -> Entity {
+        let tile = spawn_tile(app, offset.0, offset.1);
+        tap_on(app, Some(tile));
+        buildings_in_the_world(app)
+            .into_iter()
+            .find(|&building| {
+                app.world()
+                    .entity(building)
+                    .get::<Building>()
+                    .is_some_and(|standing| standing.coordinates == tile_at(offset))
+            })
+            .expect("the tap placed a building")
+    }
+
+    /// Lay a road ending on `node`, setting off from a tile sharing it that is built on by none
+    /// of `built_on`, so a road never has to run over a tile a building already holds.
+    fn lay_road_to(app: &mut App, node: LatticeNode, built_on: &[(i32, i32)]) {
+        let held: Vec<HexCoordinates> = built_on.iter().copied().map(tile_at).collect();
+        let from = node
+            .tiles_sharing()
+            .expect("a corner is shared by three tiles")
+            .into_iter()
+            .find(|tile| !held.contains(tile))
+            .expect("a corner has a tile no building stands on");
+        app.world_mut().spawn(Road {
+            nodes: vec![LatticeNode::from_tile(from), node],
+            leaving: None,
+            one_way: false,
+        });
+        tick(app);
+    }
+
+    fn ports_of(app: &mut App, building: Entity) -> Vec<(Port, Entity)> {
+        let children: Vec<Entity> = app
+            .world()
+            .entity(building)
+            .get::<Children>()
+            .map(|children| children.iter().collect())
+            .unwrap_or_default();
+        children
+            .into_iter()
+            .filter_map(|child| {
+                app.world()
+                    .entity(child)
+                    .get::<Port>()
+                    .map(|port| (*port, child))
+            })
+            .collect()
+    }
+
+    fn port_of(app: &mut App, building: Entity, which: Port) -> Entity {
+        ports_of(app, building)
+            .into_iter()
+            .find(|&(port, _)| port == which)
+            .map(|(_, entity)| entity)
+            .unwrap_or_else(|| panic!("the building has no {which:?}"))
+    }
+
+    fn is_served(app: &App, port: Entity) -> bool {
+        app.world()
+            .entity(port)
+            .get::<RoadEndpoint>()
+            .and_then(RoadEndpoint::served_by)
+            .is_some()
+    }
+
+    fn buildings_in_the_world(app: &mut App) -> Vec<Entity> {
+        let mut query = app.world_mut().query_filtered::<Entity, With<Building>>();
+        query.iter(app.world()).collect()
+    }
+
     #[test]
-    fn a_placed_building_gets_an_endpoint_to_meet_the_road_network_on() {
+    fn a_placed_building_has_one_port_for_each_corner_its_layout_names() {
         let mut app = building_app(PlayerAction::EditBuildings);
-        let tile = spawn_tile(&mut app, 2, 3);
+        let building = place_building_at(&mut app, PORTED);
 
+        let placed: Vec<Port> = ports_of(&mut app, building)
+            .into_iter()
+            .map(|(port, _)| port)
+            .collect();
+
+        assert_eq!(placed.len(), BUILDING_PORTS.len());
+        for (_, port) in BUILDING_PORTS {
+            assert!(placed.contains(&port), "no {port:?} among {placed:?}");
+        }
+    }
+
+    #[test]
+    fn a_road_on_the_corner_one_port_names_leaves_the_other_port_unserved() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        let building = place_building_at(&mut app, PORTED);
+
+        lay_road_to(
+            &mut app,
+            corner_for(Port::Intake).node_of(tile_at(PORTED)),
+            &[PORTED],
+        );
+
+        let intake = port_of(&mut app, building, Port::Intake);
+        let outlet = port_of(&mut app, building, Port::Outlet);
+        assert!(is_served(&app, intake), "the road did not serve the intake");
+        assert!(!is_served(&app, outlet), "the outlet was served too");
+    }
+
+    #[test]
+    fn a_road_on_a_corner_no_port_names_serves_no_port_of_the_building() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        let building = place_building_at(&mut app, PORTED);
+
+        lay_road_to(&mut app, UNPORTED.node_of(tile_at(PORTED)), &[PORTED]);
+
+        for (port, entity) in ports_of(&mut app, building) {
+            assert!(!is_served(&app, entity), "{port:?} was served all the same");
+        }
+    }
+
+    #[test]
+    fn two_buildings_sharing_a_corner_are_both_served_by_the_one_road_node_on_it() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        let taking = place_building_at(&mut app, PORTED);
+        let giving = place_building_at(&mut app, SHARING);
+        let shared = corner_for(Port::Intake).node_of(tile_at(PORTED));
+        assert_eq!(
+            shared,
+            corner_for(Port::Outlet).node_of(tile_at(SHARING)),
+            "the two buildings do not share a corner to be served on"
+        );
+
+        lay_road_to(&mut app, shared, &[PORTED, SHARING]);
+
+        let intake = port_of(&mut app, taking, Port::Intake);
+        let outlet = port_of(&mut app, giving, Port::Outlet);
+        assert!(
+            is_served(&app, intake),
+            "the intake was left off the network"
+        );
+        assert!(
+            is_served(&app, outlet),
+            "the outlet was left off the network"
+        );
+    }
+
+    /// How much a rover carries to a port in these tests.
+    const LOAD: u32 = 3;
+
+    /// A building app that also drives rovers, so a delivery can be run to a port and land.
+    fn delivery_app() -> App {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        app.add_plugins((SimulationPlugin, RoverPlugin));
+        app
+    }
+
+    fn load_at(app: &App, entity: Entity) -> Option<u32> {
+        app.world()
+            .entity(entity)
+            .get::<Cargo>()
+            .map(|held| held.quantity)
+    }
+
+    #[test]
+    fn a_rover_driven_to_a_port_leaves_its_load_there_rather_than_at_the_building() {
+        let mut app = delivery_app();
+        let building = place_building_at(&mut app, PORTED);
+        let intake = port_of(&mut app, building, Port::Intake);
+        lay_road_to(
+            &mut app,
+            corner_for(Port::Intake).node_of(tile_at(PORTED)),
+            &[PORTED],
+        );
+        let stops = app
+            .world()
+            .entity(intake)
+            .get::<RoadEndpoint>()
+            .and_then(RoadEndpoint::served_by)
+            .expect("the road serves the intake");
+        app.world_mut().spawn((
+            Rover {
+                segment: stops.segment,
+                along: stops.along,
+            },
+            Cargo { quantity: LOAD },
+            Route {
+                destination: intake,
+                ways_out: Vec::new(),
+            },
+        ));
+
+        tick(&mut app);
+
+        assert_eq!(load_at(&app, intake), Some(LOAD));
+        assert_eq!(load_at(&app, building), None);
+    }
+
+    #[test]
+    fn taking_a_building_off_the_map_takes_its_ports_with_it() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        let tile = spawn_tile(&mut app, PORTED.0, PORTED.1);
         tap_on(&mut app, Some(tile));
-
         let building = building_entity(&mut app).expect("the tap placed a building");
-        assert!(app.world().entity(building).contains::<RoadEndpoint>());
+        let ports: Vec<Entity> = ports_of(&mut app, building)
+            .into_iter()
+            .map(|(_, entity)| entity)
+            .collect();
+        assert_eq!(ports.len(), BUILDING_PORTS.len());
+
+        secondary_tap_on(&mut app, Some(tile));
+
+        for port in ports {
+            assert!(!still_there(&app, port), "a port outlived its building");
+        }
     }
 
     #[test]
