@@ -1,92 +1,154 @@
-**Warning: This is a work in progress.** It will likely evolve as I develop and play test the game.
+**Warning: This is a work in progress.** It will likely evolve as I develop and
+play test the game.
 
 # ![Production Tree](../assets/docs/production_tree.png)
 
-<table>
-<tr>
-<th></th>
-<th> Tier 1 </th>
-<th> Tier 2 </th>
-<th> Tier 3 </th>
-<th> Tier 4 </th>
-</tr>
+## How to read this
 
-<tr>
-<th> Raw Materials </th>
-<td> 
+Every item below is made by exactly one recipe, and every recipe names its
+inputs, its single output, and the time one run of it takes. Time is ticks,
+because a tick is the unit game time is measured in. Sixty-four of them are a
+second of real time at normal speed, and nothing here depends on that: running
+the world faster runs more ticks rather than longer ones, so these are the same
+rates fast-forwarded as at rest.
 
-- Ice
+A recipe has one output. Where a reaction really splits into two products —
+electrolysing water into hydrogen and oxygen — the tree carries two recipes over
+the same input and the player builds whichever they need. The quantities are
+therefore a game economy rather than a mass balance: nothing here conserves
+atoms, and the chemistry is flavour behind the names rather than a claim.
 
-</td>
-<td> 
+Run times rise with tier — 32, 64, 128 and 256 ticks from tier 1 to tier 4 —
+doubling for an assembly and doubling again for the final assembly. Within that
+ladder the quantities are chosen so that a chain sustaining one Hydroponics Bay
+uses a whole number of every building, which is what makes the balance at the
+bottom of this file a count rather than an impression.
 
-- Carbon Monoxide
-- Nitrogen
+The picture above labels the Dome Habitat Panel "Drone Habitat Panel", and names
+Refined Cobalt by its process, "Refine Cobalt (Co)". The names in this file are
+the ones to use.
 
-</td>
-<td> 
+## Items by tier
 
-- Silicon
+|  | Tier 1 | Tier 2 | Tier 3 | Tier 4 |
+| --- | --- | --- | --- | --- |
+| Raw materials | Ice | Carbon Monoxide, Nitrogen | Silicon | Cobalt Ore |
+| Intermediate products | Water, Hydrogen, Oxygen | Carbon Dioxide, Dioxygen, Carbon, Ammonia | Silicon Wafer, Glass, Silicon Carbide, Activated Charcoal | Refined Cobalt, Electronics, Hydrocarbon Polymer |
+| Assemblies | | | Fertilized Soil | Battery, Solar Panel, Dome Habitat Panel |
 
-</td>
-<td> 
+The final assembly, which nothing consumes, is the **Hydroponics Bay**.
 
-- Cobalt Ore
+## Recipes
 
-</td>
-</tr>
-<tr>
-<th>Intermediate Products</th>
-<td>
+### Extraction
 
-- Water
-- Hydrogen
-- Oxygen
+A raw material is drawn from a deposit under the building rather than from an
+input, so these are the recipes with nothing on their left.
 
-</td>
-<td>
+| Inputs | Output | Ticks |
+| --- | --- | --- |
+| — | 1 Ice | 32 |
+| — | 1 Carbon Monoxide | 64 |
+| — | 1 Nitrogen | 64 |
+| — | 1 Silicon | 128 |
+| — | 1 Cobalt Ore | 256 |
 
-- Carbon Dioxide
-- Dioxygen
-- Carbon
-- Ammonia
+### Tier 1
 
-</td>
-<td>
+| Inputs | Output | Ticks |
+| --- | --- | --- |
+| 1 Ice | 1 Water | 32 |
+| 1 Water | 2 Hydrogen | 64 |
+| 2 Water | 1 Oxygen | 64 |
 
-- Silicon Wafer
-- Glass
-- Silicon Carbide
-- Activated Charcoal
+### Tier 2
 
-</td>
-<td>
+| Inputs | Output | Ticks |
+| --- | --- | --- |
+| 2 Carbon Monoxide + 1 Oxygen | 1 Carbon Dioxide | 64 |
+| 2 Carbon Dioxide | 1 Dioxygen | 64 |
+| 1 Carbon Dioxide | 1 Carbon | 64 |
+| 1 Nitrogen + 3 Hydrogen | 1 Ammonia | 64 |
 
-- Refined Cobalt
-- Electronics
-- Hydrocarbon Polymer
+### Tier 3
 
-</td>
-</tr>
-<tr>
-<th>Assemblies</th>
-<td></td>
-<td></td>
-<td>
+| Inputs | Output | Ticks |
+| --- | --- | --- |
+| 1 Silicon | 1 Silicon Wafer | 128 |
+| 2 Silicon | 1 Glass | 128 |
+| 1 Silicon + 1 Carbon | 1 Silicon Carbide | 128 |
+| 2 Carbon | 1 Activated Charcoal | 128 |
+| 4 Water + 4 Ammonia + 2 Activated Charcoal | 1 Fertilized Soil | 256 |
 
-- Fertilized Soil
+### Tier 4
 
-</td>
-<td>
+| Inputs | Output | Ticks |
+| --- | --- | --- |
+| 2 Cobalt Ore | 1 Refined Cobalt | 256 |
+| 1 Silicon Wafer + 1 Refined Cobalt | 1 Electronics | 256 |
+| 2 Carbon + 4 Hydrogen | 1 Hydrocarbon Polymer | 256 |
+| 1 Refined Cobalt + 1 Silicon Carbide + 1 Hydrocarbon Polymer | 1 Battery | 512 |
+| 2 Silicon Wafer + 2 Electronics + 2 Battery | 1 Solar Panel | 512 |
+| 2 Glass + 1 Battery + 1 Hydrocarbon Polymer | 1 Dome Habitat Panel | 512 |
 
-- Battery
-- Solar Panel
-- Dome Habitat Panel
+### Final assembly
 
-</td>
-</tr>
-</table>
+| Inputs | Output | Ticks |
+| --- | --- | --- |
+| 2 Solar Panel + 4 Dome Habitat Panel + 4 Fertilized Soil | 1 Hydroponics Bay | 1024 |
 
-## Final Assemblies
+## A balanced chain
 
-- Hydroponics Bay
+One Hydroponics Bay every 1024 ticks, with every building running without
+starving and without idling, is sixty buildings. Each row's output is exactly
+what the rows above it consume, so a row's count is its demand divided by what
+one building of it produces — which is why none of them is a fraction.
+
+| Recipe | Buildings | Units per 1024 ticks |
+| --- | --- | --- |
+| Ice | 5 | 160 |
+| Carbon Monoxide | 6 | 96 |
+| Nitrogen | 1 | 16 |
+| Silicon | 4 | 32 |
+| Cobalt Ore | 6 | 24 |
+| Water | 5 | 160 |
+| Hydrogen | 3 | 96 |
+| Oxygen | 3 | 48 |
+| Carbon Dioxide | 3 | 48 |
+| Carbon | 3 | 48 |
+| Ammonia | 1 | 16 |
+| Silicon Wafer | 1 | 8 |
+| Glass | 1 | 8 |
+| Silicon Carbide | 1 | 8 |
+| Activated Charcoal | 1 | 8 |
+| Refined Cobalt | 3 | 12 |
+| Electronics | 1 | 4 |
+| Hydrocarbon Polymer | 3 | 12 |
+| Fertilized Soil | 1 | 4 |
+| Battery | 4 | 8 |
+| Solar Panel | 1 | 2 |
+| Dome Habitat Panel | 2 | 4 |
+| Hydroponics Bay | 1 | 1 |
+| **Total** | **60** | |
+
+Dioxygen is absent because nothing in the chain consumes it. It is made to be
+released into the atmosphere, which is what the objectives below are about.
+
+## Terraforming objectives
+
+What the tree is climbed for. These are goals rather than items: the tree
+produces what serves them, and how a planet measures its progress towards one is
+not settled here.
+
+- **Build Habitat** — Dome Habitat Panel.
+- **Atmosphere (O2 + CO2)** — Dioxygen and Carbon Dioxide, released rather than
+  assembled into anything. Dioxygen is the one product nothing else consumes.
+- **Temperature** — nothing in the tree serves this one yet.
+- **Water** — Water.
+- **Plants and food** — Hydroponics Bay.
+
+## Alternatives considered
+
+Drawn beside the tree in the picture rather than in it, and carried here so that
+picking one up later is a decision rather than a rediscovery: Methane, Ozone,
+Carbon Fiber, Fiber Glass, and an Antenna.
