@@ -123,27 +123,25 @@ ladder the quantities are chosen so that a chain sustaining one Hydroponics Bay
 uses a whole number of every building, which is what makes the balance at the
 bottom of this file a count rather than an impression.
 
-## Where this departs from the sketch
+## Three shapes worth keeping
 
-`assets/docs/production_tree.png` is the drawing this tree grew out of. The
-diagram above has moved past it in three places and reconciles two names; where
-the two disagree, this file is the one to believe.
+Each of these was chosen against an obvious alternative, and each is easy to
+undo by accident while retuning the numbers.
 
-It labels the Dome Habitat Panel "Drone Habitat Panel", and names Refined Cobalt
-by its process, "Refine Cobalt (Co)". The names in this file are the ones to
-use.
+Oxygen is one item rather than two. Splitting breathable oxygen from the kind a
+reaction consumes reads well until the loop is drawn: the same substance twice
+cannot close, and one item is what lets the oxygen a carbon plant hands back
+feed the plant that spent it.
 
-It draws Oxygen and Dioxygen as two items, and they are one here. The same
-substance twice cannot close, and folding them together is what lets the oxygen
-a carbon plant hands back feed the plant that spent it.
+Glass is silica, so it takes oxygen as well as silicon. Silicon alone is cheaper
+to write and makes the silicon branch self-contained, which is exactly the
+problem — the oxygen is what ties it to the ice branch and gives the two halves
+of the map a reason to meet.
 
-It makes glass out of silicon alone. Glass is silica, so it takes oxygen as
-well, which is what ties the ice branch to the silicon branch.
-
-Where it draws a Solar Panel, this tree builds a Fuel Cell. Sunlight is a thin
-thing to plan a base around under an atmosphere thick enough to need
-terraforming, and a cell runs on what the tree already makes. What the tree has
-no notion of is power itself: a Fuel Cell is a part the Hydroponics Bay is built
+The Hydroponics Bay is powered by a Fuel Cell rather than a solar panel.
+Sunlight is a thin thing to plan a base around under an atmosphere thick enough
+to need terraforming, and a cell runs on what the tree already makes. What the
+tree has no notion of is power itself: a Fuel Cell is a part the Bay is built
 from, and once it is standing nothing generates or draws anything.
 
 ## Items by tier
@@ -275,6 +273,6 @@ not settled here.
 
 ## Alternatives considered
 
-Drawn beside the tree in the picture rather than in it, and carried here so that
-picking one up later is a decision rather than a rediscovery: Methane, Ozone,
-Carbon Fiber, Fiber Glass, and an Antenna.
+Parked beside the tree rather than built into it, and kept here so that picking
+one up later is a decision rather than a rediscovery: Methane, Ozone, Carbon
+Fiber, Fiber Glass, and an Antenna.
