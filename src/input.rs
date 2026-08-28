@@ -38,6 +38,12 @@ const MOVEMENT_KEYS: [(KeyCode, Vec3, &str); 4] = [
 /// Key binding for finishing what the player is placing
 const FINISH_KEY: KeyCode = KeyCode::Escape;
 
+/// Key binding for turning what the player is about to place.
+///
+/// Declared as a binding by whichever tool turning means something to, rather than here, since it
+/// does nothing under the others.
+pub const TURN_KEY: KeyCode = KeyCode::KeyR;
+
 pub struct PlayerInputPlugin;
 
 /// The current desired action of the player, controlled by the UI or keyboard shortcuts
@@ -98,6 +104,8 @@ pub struct PlayerInput {
     pub secondary_tap: bool,
     /// Whether the player just asked to finish placing what they are part way through
     pub finish: bool,
+    /// Whether the player just asked to turn what they are about to place
+    pub turn: bool,
 }
 
 #[derive(Component)]
@@ -232,6 +240,7 @@ fn update_player_input(
     player_input.tap = mouse_input.just_pressed(MouseButton::Left);
     player_input.secondary_tap = mouse_input.just_pressed(MouseButton::Right);
     player_input.finish = player_input.secondary_tap || input.just_pressed(FINISH_KEY);
+    player_input.turn = input.just_pressed(TURN_KEY);
 
     let Some(camera) = &cursor.camera else {
         player_input.movement_vector = Vec3::ZERO;
@@ -593,6 +602,28 @@ mod tests {
         tick(&mut app);
 
         assert!(!player_input(&app).finish);
+    }
+
+    #[test]
+    fn pressing_the_turn_key_is_reported_as_turning() {
+        let mut app = input_app();
+        tick(&mut app);
+
+        press_key(&mut app, TURN_KEY);
+        tick(&mut app);
+
+        assert!(player_input(&app).turn);
+    }
+
+    #[test]
+    fn holding_the_turn_key_down_turns_only_once() {
+        let mut app = input_app();
+        press_key(&mut app, TURN_KEY);
+        tick(&mut app);
+
+        tick(&mut app);
+
+        assert!(!player_input(&app).turn);
     }
 
     #[test]
