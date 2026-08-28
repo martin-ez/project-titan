@@ -2,8 +2,10 @@ use crate::common::cleanup::Destroy;
 use crate::common::cursor::CursorSurface;
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use crate::diagnostics::DebugGizmos;
-use crate::input::{PlayerAction, PlayerInput};
-use crate::map::{HexCoordinates, MapTile, TileCorner, MAP_TILE_INRADIUS, MAP_TILE_SIZE};
+use crate::input::{PlayerAction, PlayerInput, TURN_KEY};
+use crate::map::{
+    HexCoordinates, LatticeNode, MapTile, TileCorner, MAP_TILE_INRADIUS, MAP_TILE_SIZE,
+};
 use crate::road::{RoadEndpoint, RoadTiles};
 use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
 use bevy::ecs::system::SystemParam;
@@ -31,12 +33,14 @@ const INTAKE_COLOUR: Color = Color::srgb(0.4, 0.75, 0.95);
 /// The colour a port handing goods to the road is drawn in
 const OUTLET_COLOUR: Color = Color::srgb(0.95, 0.8, 0.35);
 
+/// The facing `BUILDING_PORTS` is written against, and so the facing an unturned building has.
+const UNTURNED: TileCorner = TileCorner::North;
+
 /// Which corner of its tile each port of a building stands on, and which way it moves goods.
 ///
-/// One layout, there being one thing the tool puts down. A building carries no orientation, so
-/// every one placed has its intake and its outlet on these same two corners — and a building
-/// standing north-west of another has its outlet on the very corner that other one takes goods in
-/// on, which is density the player earns by placing well.
+/// One layout, there being one thing the tool puts down, and it is written against a building
+/// facing `UNTURNED`. Turning one before placing it carries every corner named here the same way
+/// round, so what the player chooses is where the layout points rather than what it is.
 const BUILDING_PORTS: [(TileCorner, Port); 2] = [
     (TileCorner::North, Port::Intake),
     (TileCorner::SouthEast, Port::Outlet),
@@ -80,6 +84,33 @@ pub struct BuildingTiles {
     on: HashMap<HexCoordinates, Entity>,
 }
 
+/// Which way round the building tool will put the next building down.
+///
+/// Held by the tool rather than by anything on the map, because it is a choice the player makes
+/// before there is a building to carry it. Once one is placed, where its ports stand is its
+/// facing, so turning the tool again moves nothing that is already built.
+#[derive(Resource)]
+struct PlacementFacing(TileCorner);
+
+impl Default for PlacementFacing {
+    fn default() -> Self {
+        Self(UNTURNED)
+    }
+}
+
+/// Where each port of a building on `tile` stands, given the facing it was put down at.
+///
+/// The one answer to that question, read both by the tap that places a building and by the view
+/// that shows the player where it will go, so the two cannot disagree.
+fn ports_standing(
+    facing: TileCorner,
+    tile: HexCoordinates,
+) -> impl Iterator<Item = (Port, LatticeNode)> {
+    BUILDING_PORTS
+        .into_iter()
+        .map(move |(corner, port)| (port, corner.turned_to(facing).node_of(tile)))
+}
+
 /// The roof a building offers the cursor, claiming the whole of the tile it stands on.
 fn building_surface() -> CursorSurface {
     CursorSurface {
@@ -114,6 +145,7 @@ impl BuildingTiles {
 impl Plugin for BuildingPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<BuildingTiles>()
+            .init_resource::<PlacementFacing>()
             .declare_bindings([
                 Binding {
                     input: BindingInput::Mouse(MouseButton::Left),
@@ -125,6 +157,11 @@ impl Plugin for BuildingPlugin {
                     action: "Take the building off the tile",
                     context: BindingContext::Tool(PlayerAction::EditBuildings),
                 },
+                Binding {
+                    input: BindingInput::Key(TURN_KEY),
+                    action: "Turn the building you are about to place",
+                    context: BindingContext::Tool(PlayerAction::EditBuildings),
+                },
             ])
             .add_observer(release_the_tile_of_a_removed_building)
             .add_systems(
@@ -134,9 +171,15 @@ impl Plugin for BuildingPlugin {
             .add_systems(
                 Update,
                 (
-                    (place_building_system, remove_building_system).chain(),
+                    (
+                        turn_the_building_to_place,
+                        place_building_system,
+                        remove_building_system,
+                    )
+                        .chain(),
                     draw_the_refused_tile,
                     draw_the_ports,
+                    draw_the_ports_to_place,
                 ),
             );
     }
@@ -161,6 +204,24 @@ fn release_the_tile_of_a_removed_building(
     }
 }
 
+/// Turn the building the tool is about to put down, a sixth of a turn to the press.
+///
+/// One direction is the whole of it: there are six facings, so pressing on comes back round to
+/// where it started. A building already standing does not turn — its ports would move and the
+/// roads reaching them would not, and a building that unhooks its own supply lines on a keypress
+/// is worse to play with than one that has to be taken down and put back up.
+fn turn_the_building_to_place(
+    player_input: Res<PlayerInput>,
+    action: Res<State<PlayerAction>>,
+    mut facing: ResMut<PlacementFacing>,
+) {
+    if !player_input.turn || *action.get() != PlayerAction::EditBuildings {
+        return;
+    }
+
+    facing.0 = facing.0.next_round();
+}
+
 /// Put a building on the tile the cursor is over, when the player taps holding the building tool.
 ///
 /// A tile takes one building and then refuses, so a tap on a tile that is already built on does
@@ -172,6 +233,7 @@ fn place_building_system(
     player_input: Res<PlayerInput>,
     action: Res<State<PlayerAction>>,
     roads: Res<RoadTiles>,
+    facing: Res<PlacementFacing>,
     mut buildings: ResMut<BuildingTiles>,
     tiles: Query<&MapTile>,
 ) {
@@ -196,8 +258,8 @@ fn place_building_system(
             Visibility::Hidden,
         ))
         .with_children(|ports| {
-            for (corner, port) in BUILDING_PORTS {
-                ports.spawn((port, RoadEndpoint::at(corner.node_of(tile.coordinates))));
+            for (port, node) in ports_standing(facing.0, tile.coordinates) {
+                ports.spawn((port, RoadEndpoint::at(node)));
             }
         })
         .id();
@@ -278,17 +340,62 @@ fn draw_the_ports(
         let Ok(building) = buildings.get(of.0) else {
             continue;
         };
-        let standing = endpoint.standing_on().world_position() + GIZMO_LIFT;
-        let middle = building.coordinates.world_position() + GIZMO_LIFT;
-        let reach =
-            standing + (middle - standing).normalize_or_zero() * MAP_TILE_INRADIUS * PORT_MARK;
-
-        let (from, to, colour) = match port {
-            Port::Intake => (standing, reach, INTAKE_COLOUR),
-            Port::Outlet => (reach, standing, OUTLET_COLOUR),
-        };
-        gizmos.arrow(from, to, colour);
+        draw_a_port(
+            &mut gizmos,
+            building.coordinates,
+            endpoint.standing_on(),
+            *port,
+        );
     }
+}
+
+/// Show which corners the ports of the next building will stand on, before it is placed.
+///
+/// A layout that turns with the tool is otherwise something the player learns by placing a
+/// building and reading where its ports came out (invariant 5). Drawn on a tile that will refuse
+/// the building it would be an offer the tap does not honour, so the cross stands there instead.
+fn draw_the_ports_to_place(
+    mut gizmos: Gizmos<DebugGizmos>,
+    player_input: Res<PlayerInput>,
+    action: Res<State<PlayerAction>>,
+    facing: Res<PlacementFacing>,
+    roads: Res<RoadTiles>,
+    buildings: Res<BuildingTiles>,
+    tiles: Query<&MapTile>,
+) {
+    if *action.get() != PlayerAction::EditBuildings {
+        return;
+    }
+    let Some(tile) = player_input
+        .cursor_tile
+        .and_then(|entity| tiles.get(entity).ok())
+    else {
+        return;
+    };
+    if !takes_a_building(tile.coordinates, &buildings, &roads) {
+        return;
+    }
+
+    for (port, node) in ports_standing(facing.0, tile.coordinates) {
+        draw_a_port(&mut gizmos, tile.coordinates, node, port);
+    }
+}
+
+fn draw_a_port(
+    gizmos: &mut Gizmos<DebugGizmos>,
+    tile: HexCoordinates,
+    node: LatticeNode,
+    port: Port,
+) {
+    let standing = node.world_position() + GIZMO_LIFT;
+    let middle = tile.world_position() + GIZMO_LIFT;
+    let reach = standing + (middle - standing).normalize_or_zero() * MAP_TILE_INRADIUS * PORT_MARK;
+
+    let (from, to, colour) = match port {
+        Port::Intake => (standing, reach, INTAKE_COLOUR),
+        Port::Outlet => (reach, standing, OUTLET_COLOUR),
+    };
+    gizmos.arrow(from, to, colour);
 }
 
 impl Initialize<BuildingInitializeParams<'_, '_>> for Building {
@@ -318,7 +425,6 @@ mod tests {
     use crate::common::cleanup::CleanupPlugin;
     use crate::common::initialize::InitializationFailed;
     use crate::diagnostics::DebugGizmosPlugin;
-    use crate::map::LatticeNode;
     use crate::road::{Road, RoadPlugin};
     use crate::rover::{Cargo, Route, Rover, RoverPlugin};
     use crate::simulation::SimulationPlugin;
@@ -504,6 +610,124 @@ mod tests {
             .get::<RoadEndpoint>()
             .and_then(RoadEndpoint::served_by)
             .is_some()
+    }
+
+    /// Ask the tool to turn what it will place next, letting the key go between presses.
+    fn turn_the_tool(app: &mut App, times: usize) {
+        for _ in 0..times {
+            app.world_mut().resource_mut::<PlayerInput>().turn = true;
+            tick(app);
+            app.world_mut().resource_mut::<PlayerInput>().turn = false;
+        }
+    }
+
+    fn hold_the_building_tool(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<NextState<PlayerAction>>()
+            .set(PlayerAction::EditBuildings);
+        tick(app);
+    }
+
+    /// Which corner of `tile` each port of `building` stands on.
+    fn port_corners(
+        app: &mut App,
+        building: Entity,
+        tile: HexCoordinates,
+    ) -> Vec<(Port, TileCorner)> {
+        ports_of(app, building)
+            .into_iter()
+            .map(|(port, entity)| {
+                let node = app
+                    .world()
+                    .entity(entity)
+                    .get::<RoadEndpoint>()
+                    .expect("a port stands on the road lattice")
+                    .standing_on();
+                let corner = TileCorner::ALL
+                    .into_iter()
+                    .find(|corner| corner.node_of(tile) == node)
+                    .expect("a port stands on a corner of its own tile");
+                (port, corner)
+            })
+            .collect()
+    }
+
+    /// Assert every port of `building` stands where its layout names, turned by `facing`.
+    fn assert_ports_face(app: &mut App, building: Entity, offset: (i32, i32), facing: TileCorner) {
+        let standing = port_corners(app, building, tile_at(offset));
+
+        for (corner, port) in BUILDING_PORTS {
+            let wanted = corner.turned_to(facing);
+            assert!(
+                standing.contains(&(port, wanted)),
+                "{port:?} left {wanted:?} for {standing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_building_placed_unturned_stands_its_ports_on_the_corners_its_layout_names() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+
+        let building = place_building_at(&mut app, PORTED);
+
+        assert_ports_face(&mut app, building, PORTED, UNTURNED);
+    }
+
+    #[test]
+    fn the_building_tool_turns_the_ports_of_what_it_is_about_to_place() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        turn_the_tool(&mut app, 1);
+
+        let building = place_building_at(&mut app, PORTED);
+
+        assert_ports_face(&mut app, building, PORTED, UNTURNED.next_round());
+    }
+
+    #[test]
+    fn the_same_building_placed_at_two_facings_stands_its_ports_on_different_corners() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        let unturned = place_building_at(&mut app, PORTED);
+
+        turn_the_tool(&mut app, 1);
+        let turned = place_building_at(&mut app, SHARING);
+
+        assert_ne!(
+            port_corners(&mut app, unturned, tile_at(PORTED)),
+            port_corners(&mut app, turned, tile_at(SHARING))
+        );
+    }
+
+    #[test]
+    fn turning_the_tool_six_times_puts_the_ports_back_where_they_started() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+
+        turn_the_tool(&mut app, TileCorner::ALL.len());
+        let building = place_building_at(&mut app, PORTED);
+
+        assert_ports_face(&mut app, building, PORTED, UNTURNED);
+    }
+
+    #[test]
+    fn a_building_already_on_the_map_does_not_turn() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        let building = place_building_at(&mut app, PORTED);
+        let standing = port_corners(&mut app, building, tile_at(PORTED));
+
+        turn_the_tool(&mut app, 1);
+
+        assert_eq!(port_corners(&mut app, building, tile_at(PORTED)), standing);
+    }
+
+    #[test]
+    fn turning_while_another_tool_is_held_leaves_the_building_tool_unturned() {
+        let mut app = building_app(PlayerAction::Select);
+
+        turn_the_tool(&mut app, 1);
+        hold_the_building_tool(&mut app);
+        let building = place_building_at(&mut app, PORTED);
+
+        assert_ports_face(&mut app, building, PORTED, UNTURNED);
     }
 
     fn buildings_in_the_world(app: &mut App) -> Vec<Entity> {
