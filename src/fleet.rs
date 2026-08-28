@@ -68,12 +68,22 @@ struct Serving {
     port: Entity,
 }
 
+/// A rover its fleet has already given up, waiting on the world to take it.
+///
+/// A rover is marked for destruction on the tick and leaves the world at the end of the frame, and
+/// a frame carries as many ticks as the speed the world is run at asks of it. This is what tells
+/// the ticks in between that its place has already been given back, so a fleet counts a rover it
+/// gave up once rather than once a tick until the frame ends.
+#[derive(Component)]
+struct Retired;
+
 /// A rover with nothing to do: no route, no order for one, and not stopped for want of one.
 type StandingIdle = (Without<Route>, Without<SentTo>, Without<Stranded>);
 
 impl Plugin for FleetPlugin {
     fn build(&self, app: &mut App) {
         app.add_observer(take_the_rovers_of_a_fleet_that_is_gone_off_the_road)
+            .add_observer(give_back_the_place_of_a_rover_that_left_the_world)
             .add_systems(
                 FixedUpdate,
                 (
@@ -94,10 +104,10 @@ impl Plugin for FleetPlugin {
 /// Let go of the route of every rover that has reached the end of it, taking on a load if it came
 /// for one.
 ///
-/// A route is spent the moment it is driven, and a rover holding one it has finished is a rover
-/// standing still: dropping it here is what leaves the next leg of the shuttle to be decided from
-/// what the rover is carrying rather than from a record of the trip it just made. At the port it
-/// serves there is nothing to do but let go, the load having already changed hands on the way in.
+/// A route is spent the moment it is driven, and dropping it here leaves the next leg to be
+/// decided from what the rover is carrying rather than from a record of the trip it just made. A
+/// load is only ever taken from the port the rover is standing at, so a fleet pointed somewhere
+/// new leaves the rover that is out to let go where it lands and be sent again (invariant 1).
 ///
 /// A source with nothing to give leaves the rover waiting there holding its route, which is what
 /// keeps an empty producer from costing a search every tick it stays empty.
@@ -114,14 +124,16 @@ fn turn_the_rovers_round_at_the_port_they_reached(
         if !arrived {
             continue;
         }
-        if carrying || route.destination == serving.port {
+        let Ok(fleet) = fleets.get(serving.port) else {
+            continue;
+        };
+        let collecting =
+            !carrying && route.destination == fleet.source && fleet.source != serving.port;
+        if !collecting {
             commands.entity(entity).remove::<Route>();
             continue;
         }
 
-        let Ok(fleet) = fleets.get(serving.port) else {
-            continue;
-        };
         let Ok((_, Some(mut stood))) = ports.get_mut(fleet.source) else {
             continue;
         };
@@ -143,17 +155,16 @@ fn turn_the_rovers_round_at_the_port_they_reached(
 /// Take off the road the rovers of every fleet given fewer than it has out.
 ///
 /// A rover leaves at the port it serves and nowhere else, so one taken away finishes the trip it
-/// is on and hands over what it is carrying before it goes — the handover having already run this
-/// tick. Anything else is a load that stops existing halfway down a road, which is the free
-/// transfer invariant 1 is there to forbid.
+/// is on and hands over what it is carrying before it goes. Anything else is a load that stops
+/// existing halfway down a road, which is the free transfer invariant 1 is there to forbid.
 ///
-/// The tally comes down here rather than when the rover leaves the world, so a second rover
-/// standing at the same port on the same tick is measured against what the fleet will have rather
-/// than against what it had.
+/// The tally comes down here rather than when the rover leaves the world, so a second rover at
+/// the same port on the same tick is measured against what the fleet will have. One already given
+/// up is marked as such and passed over, the world not having taken it yet.
 fn retire_the_rovers_a_fleet_no_longer_wants(
     mut commands: Commands,
     mut fleets: Query<(&Fleet, &RoadEndpoint, &mut OnTheRoad)>,
-    rovers: Query<(Entity, &Rover, &Serving)>,
+    rovers: Query<(Entity, &Rover, &Serving), Without<Retired>>,
 ) {
     for (entity, standing, serving) in &rovers {
         let Ok((fleet, home, mut out)) = fleets.get_mut(serving.port) else {
@@ -163,8 +174,29 @@ fn retire_the_rovers_a_fleet_no_longer_wants(
             continue;
         }
         out.0 -= 1;
-        commands.entity(entity).insert(Destroy);
+        commands.entity(entity).insert((Retired, Destroy));
     }
+}
+
+/// Give a fleet back the place of a rover that left the world without being given up.
+///
+/// A rover is taken off the map by more than its own fleet: the ground it stands on can be
+/// bulldozed out from under it, and the port it serves can be taken down with it still driving.
+/// A place that is not given back is a place the fleet counts against a count it can no longer
+/// fill, which leaves it running short of what the player asked for with no way to say so. One
+/// already given up is not given back twice.
+fn give_back_the_place_of_a_rover_that_left_the_world(
+    removed: On<Remove, Serving>,
+    rovers: Query<&Serving, Without<Retired>>,
+    mut fleets: Query<&mut OnTheRoad>,
+) {
+    let Ok(serving) = rovers.get(removed.entity) else {
+        return;
+    };
+    let Ok(mut out) = fleets.get_mut(serving.port) else {
+        return;
+    };
+    out.0 = out.0.saturating_sub(1);
 }
 
 /// Put on the road however many rovers each fleet is short of what it was given.
@@ -284,7 +316,7 @@ mod tests {
     use crate::road::{Road, RoadPlugin, ServedBy};
     use crate::rover::RoverPlugin;
     use crate::simulation::SimulationPlugin;
-    use crate::testing::{headless_app, tick};
+    use crate::testing::{advance, headless_app, tick};
 
     /// The corner of a tile the road runs through and a port stands on.
     ///
@@ -336,6 +368,19 @@ mod tests {
     /// run several trips long is one where the fleets are separated by how much they carried.
     const TRIPS_MEASURED: u32 = 4;
 
+    /// How many ticks a frame carries when the world is run faster than it is drawn.
+    ///
+    /// The top rung of the speed ladder is four times real time against a frame rate that does
+    /// not rise with it, so a frame carrying several ticks is what the game ordinarily does and
+    /// not an edge of it. A fleet has to reach the same place however a frame divides its ticks.
+    const TICKS_A_BUSY_FRAME: u32 = 4;
+
+    /// How many ticks a fleet is left running to see that it settled where it was asked to.
+    ///
+    /// Long enough for a rover to be sent, routed and driven several times over, so a count that
+    /// only looks right on the tick it was read has somewhere to go wrong before it is read again.
+    const TICKS_A_FEW: u32 = 64;
+
     fn fleet_app() -> App {
         let mut app = headless_app();
         app.insert_state(PlayerAction::Select)
@@ -370,6 +415,32 @@ mod tests {
             one_way: false,
         });
         tick(app);
+    }
+
+    /// Lay a road as `lay_road` does, on a frame carrying several ticks rather than one.
+    fn lay_road_on_a_busy_frame(app: &mut App, offsets: &[(i32, i32)]) {
+        let nodes = offsets.iter().copied().map(node_at).collect();
+        app.world_mut().spawn(Road {
+            nodes,
+            leaving: None,
+            one_way: false,
+        });
+        busy_frame(app);
+    }
+
+    /// Advance one frame carrying `TICKS_A_BUSY_FRAME` ticks, as a warped world does.
+    fn busy_frame(app: &mut App) {
+        let timestep = app.world().resource::<Time<Fixed>>().timestep();
+        advance(app, timestep * TICKS_A_BUSY_FRAME);
+    }
+
+    /// The road the test laid, which is the only one on the map until it lays another.
+    fn the_road(app: &mut App) -> Entity {
+        let mut query = app.world_mut().query_filtered::<Entity, With<Road>>();
+        query
+            .iter(app.world())
+            .next()
+            .expect("the test laid a road")
     }
 
     /// Stand a port on the tile at `offset`, which a road reaches when one runs through its corner.
@@ -429,6 +500,11 @@ mod tests {
             .all(|rover| rover.segment == place.segment && rover.along == place.along)
     }
 
+    /// Whether some rover on the map is standing at `place`.
+    fn a_rover_stands_at(app: &mut App, place: ServedBy) -> bool {
+        !no_rover_stands_at(app, place)
+    }
+
     /// Whether no rover on the map is standing at `place`.
     fn no_rover_stands_at(app: &mut App, place: ServedBy) -> bool {
         let mut query = app.world_mut().query::<&Rover>();
@@ -450,6 +526,18 @@ mod tests {
                 return true;
             }
             tick(app);
+        }
+        ready(app)
+    }
+
+    /// Run frames carrying several ticks each until `ready` says so, giving up after
+    /// `TICKS_ALLOWED`.
+    fn run_busy_until(app: &mut App, mut ready: impl FnMut(&mut App) -> bool) -> bool {
+        for _ in 0..TICKS_ALLOWED {
+            if ready(app) {
+                return true;
+            }
+            busy_frame(app);
         }
         ready(app)
     }
@@ -566,6 +654,31 @@ mod tests {
     }
 
     #[test]
+    fn a_fleet_asked_for_a_rover_back_runs_the_count_it_was_given() {
+        let (mut app, source, home) = haulage_app();
+        assign(&mut app, home, A_FLEET, source);
+        tick(&mut app);
+        assert_eq!(rovers_serving(&mut app, home), A_FLEET as usize);
+
+        assign(&mut app, home, 1, source);
+        let given_up = run_until(&mut app, |app| rovers_serving(app, home) == 1);
+        assert!(given_up, "the fleet never gave up the rover it lost");
+
+        assign(&mut app, home, A_FLEET, source);
+        let back = run_busy_until(&mut app, |app| {
+            rovers_serving(app, home) == A_FLEET as usize
+        });
+
+        assert!(back, "the fleet never made the rover it gave up back");
+        run(&mut app, TICKS_A_FEW);
+        assert_eq!(
+            rovers_serving(&mut app, home),
+            A_FLEET as usize,
+            "the fleet ran a different number of rovers than it was given"
+        );
+    }
+
+    #[test]
     fn a_rover_taken_off_hands_over_what_it_was_carrying_first() {
         let (mut app, source, home) = haulage_app();
         assign(&mut app, home, A_FLEET, source);
@@ -617,6 +730,98 @@ mod tests {
         let delivered = run_until(&mut app, |app| held_at(app, home) > 0);
 
         assert!(delivered, "the fleet stayed put after a road reached it");
+    }
+
+    #[test]
+    fn a_fleet_sets_off_once_a_road_reaches_its_source_however_a_frame_divides() {
+        let mut app = fleet_app();
+        lay_road(&mut app, &HAULAGE);
+        let source = port_at(&mut app, UP_THE_BRANCH);
+        let home = port_at(&mut app, HOME);
+        stock(&mut app, source, A_STOCK);
+        tick(&mut app);
+        assign(&mut app, home, 1, source);
+        run(&mut app, TICKS_MEASURED);
+        assert_eq!(held_at(&app, home), 0);
+
+        lay_road_on_a_busy_frame(&mut app, &BRANCH);
+        let delivered = run_busy_until(&mut app, |app| held_at(app, home) > 0);
+
+        assert!(
+            delivered,
+            "a frame carrying several ticks parked the fleet for good after a road reached it"
+        );
+    }
+
+    #[test]
+    fn a_rover_takes_on_no_load_from_a_port_it_is_not_standing_at() {
+        let mut app = fleet_app();
+        lay_road(&mut app, &HAULAGE);
+        let empty = port_at(&mut app, SOURCE);
+        let stocked = port_at(&mut app, OTHER_HOME);
+        let home = port_at(&mut app, HOME);
+        stock(&mut app, stocked, A_STOCK);
+        tick(&mut app);
+        assign(&mut app, home, 1, empty);
+        let waiting = run_until(&mut app, |app| {
+            let standing = served(app, empty);
+            a_rover_stands_at(app, standing)
+        });
+        assert!(waiting, "the rover never reached the source it was sent to");
+
+        assign(&mut app, home, 1, stocked);
+        tick(&mut app);
+
+        assert_eq!(
+            held_at(&app, stocked),
+            A_STOCK,
+            "a load left a port with no rover standing at it"
+        );
+    }
+
+    #[test]
+    fn a_fleet_puts_out_again_the_rovers_a_bulldozed_road_took_with_it() {
+        let (mut app, source, home) = haulage_app();
+        assign(&mut app, home, A_FLEET, source);
+        tick(&mut app);
+        assert_eq!(rovers_serving(&mut app, home), A_FLEET as usize);
+
+        let road = the_road(&mut app);
+        app.world_mut().entity_mut(road).despawn();
+        let taken = run_until(&mut app, |app| rovers_serving(app, home) == 0);
+        assert!(taken, "the bulldozed road left its rovers in the world");
+
+        lay_road(&mut app, &HAULAGE);
+        let back = run_until(&mut app, |app| {
+            rovers_serving(app, home) == A_FLEET as usize
+        });
+
+        assert!(
+            back,
+            "the fleet never made up the rovers the bulldozed road took with it"
+        );
+    }
+
+    #[test]
+    fn a_port_given_a_fleet_again_puts_its_rovers_back_on_the_road() {
+        let (mut app, source, home) = haulage_app();
+        assign(&mut app, home, A_FLEET, source);
+        tick(&mut app);
+        assert_eq!(rovers_serving(&mut app, home), A_FLEET as usize);
+
+        app.world_mut().entity_mut(home).remove::<Fleet>();
+        let gone = run_until(&mut app, |app| rovers_serving(app, home) == 0);
+        assert!(gone, "a rover outlived the fleet it belonged to");
+
+        assign(&mut app, home, A_FLEET, source);
+        let back = run_until(&mut app, |app| {
+            rovers_serving(app, home) == A_FLEET as usize
+        });
+
+        assert!(
+            back,
+            "a port given a fleet again never put its rovers on the road"
+        );
     }
 
     #[test]
