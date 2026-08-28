@@ -3,7 +3,9 @@ use crate::common::cursor::CursorSurface;
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use crate::diagnostics::DebugGizmos;
 use crate::input::{PlayerAction, PlayerInput};
-use crate::map::{HexCoordinates, MapTile, TileCorner, MAP_TILE_INRADIUS, MAP_TILE_SIZE};
+use crate::map::{
+    HexCoordinates, LatticeNode, MapTile, RawMaterial, TileCorner, MAP_TILE_INRADIUS, MAP_TILE_SIZE,
+};
 use crate::road::{RoadEndpoint, RoadTiles};
 use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
 use bevy::ecs::system::SystemParam;
@@ -31,16 +33,28 @@ const INTAKE_COLOUR: Color = Color::srgb(0.4, 0.75, 0.95);
 /// The colour a port handing goods to the road is drawn in
 const OUTLET_COLOUR: Color = Color::srgb(0.95, 0.8, 0.35);
 
-/// Which corner of its tile each port of a building stands on, and which way it moves goods.
+/// The corners a building takes goods in on, in the order its recipe names what it consumes.
 ///
-/// One layout, there being one thing the tool puts down. A building carries no orientation, so
-/// every one placed has its intake and its outlet on these same two corners — and a building
-/// standing north-west of another has its outlet on the very corner that other one takes goods in
-/// on, which is density the player earns by placing well.
-const BUILDING_PORTS: [(TileCorner, Port); 2] = [
-    (TileCorner::North, Port::Intake),
-    (TileCorner::SouthEast, Port::Outlet),
+/// Three of the six, because the widest recipe of the production tree takes three items. The
+/// first of them is a corner of the same three-tile class as the first `OUTLET_CORNERS`, so a
+/// building's intake stands on the very corner another building's outlet does one tile away —
+/// two links of a chain served by one road node, which is density the player earns by placing
+/// well.
+const INTAKE_CORNERS: [TileCorner; 3] = [
+    TileCorner::SouthWest,
+    TileCorner::NorthWest,
+    TileCorner::South,
 ];
+
+/// The corners a building hands goods out on, in the order its recipe names what it makes.
+const OUTLET_CORNERS: [TileCorner; 3] = [
+    TileCorner::North,
+    TileCorner::NorthEast,
+    TileCorner::SouthEast,
+];
+
+/// The keys that step through the catalogue, and how far each steps through it.
+const CHOOSE_KEYS: [(KeyCode, isize); 2] = [(KeyCode::KeyQ, -1), (KeyCode::KeyE, 1)];
 
 pub struct BuildingPlugin;
 
@@ -56,18 +70,92 @@ struct Building {
     coordinates: HexCoordinates,
 }
 
-/// One place a building hands goods to the road or takes them from it, on a corner of its tile.
-///
-/// A port is an entity of its own and a child of the building, an entity carrying one
-/// `RoadEndpoint` and a building having several ports. That is also what makes it the thing a
-/// rover is sent to, so a delivery names the door it is for rather than the building it is at.
-#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Port {
+/// Which way goods move through a port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Flow {
     /// Goods a rover brought, handed over here for the building to take in.
     Intake,
     /// Goods the building has made, standing here until a rover takes them away.
     Outlet,
 }
+
+/// One place a building hands one item to the road or takes it from it, on a corner of its tile.
+///
+/// A port is an entity of its own and a child of the building, an entity carrying one
+/// `RoadEndpoint` and a building having several ports. That is also what makes it the thing a
+/// rover is sent to, so a delivery names the door it is for rather than the building it is at.
+#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Port {
+    /// Which way this port moves goods.
+    pub flow: Flow,
+    /// The one item that passes through it.
+    pub item: Item,
+}
+
+/// One good the production tree moves, which is either dug out of the ground or made from others.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Item {
+    /// A material a deposit holds, which an extractor draws rather than a recipe making it.
+    Raw(RawMaterial),
+    Water,
+    Hydrogen,
+    Oxygen,
+    CarbonDioxide,
+    Carbon,
+    Ammonia,
+    SiliconWafer,
+    Glass,
+    SiliconCarbide,
+    ActivatedCharcoal,
+    RefinedCobalt,
+    Electronics,
+    HydrocarbonPolymer,
+    FertilizedSoil,
+    Battery,
+    FuelCell,
+    DomeHabitatPanel,
+    HydroponicsBay,
+}
+
+/// How much of one item.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Stack {
+    /// Which item this is a quantity of.
+    pub item: Item,
+    /// How many of it.
+    pub count: u32,
+}
+
+/// What one run of a building takes in and what it puts out.
+///
+/// The quantities are `docs/production_tree.md`'s, which is where the balance they are chosen for
+/// is argued. A recipe may put out more than one thing: where a reaction really splits, one
+/// recipe makes both, so a byproduct nobody hauls away is a jam like any other.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Recipe {
+    /// What one run consumes.
+    pub inputs: &'static [Stack],
+    /// What one run produces.
+    pub outputs: &'static [Stack],
+}
+
+/// What a building is made to do, which is what decides the ports it stands.
+///
+/// Two archetypes rather than a kind of building per row of the production tree: an extractor
+/// draws any raw material, an assembler runs any recipe, and everything that tells one apart from
+/// another is the configuration it carries. A type is a definition rather than an entity, so
+/// every copy of one has the same ports and does the same thing.
+#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BuildingType {
+    /// Draws a raw material out of the ground it stands on: nothing in, one thing out.
+    Extractor(RawMaterial),
+    /// Runs one recipe of the production tree.
+    Assembler(Recipe),
+}
+
+/// The type the building tool will place next, which the player steps through with `CHOOSE_KEYS`.
+#[derive(Resource, Default)]
+pub struct ChosenBuildingType(usize);
 
 /// Which building stands on each tile of the map.
 ///
@@ -111,9 +199,231 @@ impl BuildingTiles {
     }
 }
 
+const fn stack(count: u32, item: Item) -> Stack {
+    Stack { item, count }
+}
+
+const fn assembler(inputs: &'static [Stack], outputs: &'static [Stack]) -> BuildingType {
+    BuildingType::Assembler(Recipe { inputs, outputs })
+}
+
+fn extracted(material: RawMaterial) -> &'static [Stack] {
+    match material {
+        RawMaterial::Ice => const { &[stack(1, Item::Raw(RawMaterial::Ice))] },
+        RawMaterial::CarbonMonoxide => {
+            const { &[stack(1, Item::Raw(RawMaterial::CarbonMonoxide))] }
+        }
+        RawMaterial::Nitrogen => const { &[stack(1, Item::Raw(RawMaterial::Nitrogen))] },
+        RawMaterial::Silicon => const { &[stack(1, Item::Raw(RawMaterial::Silicon))] },
+        RawMaterial::CobaltOre => const { &[stack(1, Item::Raw(RawMaterial::CobaltOre))] },
+    }
+}
+
+fn counted(stacks: &[Stack]) -> String {
+    stacks
+        .iter()
+        .map(|stack| format!("{} {}", stack.count, stack.item.name()))
+        .collect::<Vec<String>>()
+        .join(" + ")
+}
+
+impl Item {
+    /// What the player is told this item is called.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Raw(material) => material.name(),
+            Self::Water => "Water",
+            Self::Hydrogen => "Hydrogen",
+            Self::Oxygen => "Oxygen",
+            Self::CarbonDioxide => "Carbon Dioxide",
+            Self::Carbon => "Carbon",
+            Self::Ammonia => "Ammonia",
+            Self::SiliconWafer => "Silicon Wafer",
+            Self::Glass => "Glass",
+            Self::SiliconCarbide => "Silicon Carbide",
+            Self::ActivatedCharcoal => "Activated Charcoal",
+            Self::RefinedCobalt => "Refined Cobalt",
+            Self::Electronics => "Electronics",
+            Self::HydrocarbonPolymer => "Hydrocarbon Polymer",
+            Self::FertilizedSoil => "Fertilized Soil",
+            Self::Battery => "Battery",
+            Self::FuelCell => "Fuel Cell",
+            Self::DomeHabitatPanel => "Dome Habitat Panel",
+            Self::HydroponicsBay => "Hydroponics Bay",
+        }
+    }
+}
+
+impl BuildingType {
+    /// Every type the player can place, transcribed from `docs/production_tree.md`.
+    ///
+    /// An extractor for each raw material, then an assembler for each recipe, in the tier order
+    /// the tables come in. Adding a building to the game is a row here rather than a kind of
+    /// building, which is what the two archetypes buy.
+    pub const ALL: [Self; 22] = [
+        Self::Extractor(RawMaterial::Ice),
+        Self::Extractor(RawMaterial::CarbonMonoxide),
+        Self::Extractor(RawMaterial::Nitrogen),
+        Self::Extractor(RawMaterial::Silicon),
+        Self::Extractor(RawMaterial::CobaltOre),
+        assembler(
+            &[stack(1, Item::Raw(RawMaterial::Ice))],
+            &[stack(1, Item::Water)],
+        ),
+        assembler(
+            &[stack(1, Item::Water)],
+            &[stack(2, Item::Hydrogen), stack(1, Item::Oxygen)],
+        ),
+        assembler(
+            &[
+                stack(2, Item::Raw(RawMaterial::CarbonMonoxide)),
+                stack(1, Item::Oxygen),
+            ],
+            &[stack(1, Item::CarbonDioxide)],
+        ),
+        assembler(
+            &[stack(1, Item::CarbonDioxide)],
+            &[stack(1, Item::Carbon), stack(1, Item::Oxygen)],
+        ),
+        assembler(
+            &[
+                stack(1, Item::Raw(RawMaterial::Nitrogen)),
+                stack(3, Item::Hydrogen),
+            ],
+            &[stack(1, Item::Ammonia)],
+        ),
+        assembler(
+            &[stack(1, Item::Raw(RawMaterial::Silicon))],
+            &[stack(1, Item::SiliconWafer)],
+        ),
+        assembler(
+            &[
+                stack(1, Item::Raw(RawMaterial::Silicon)),
+                stack(2, Item::Oxygen),
+            ],
+            &[stack(1, Item::Glass)],
+        ),
+        assembler(
+            &[
+                stack(1, Item::Raw(RawMaterial::Silicon)),
+                stack(1, Item::Carbon),
+            ],
+            &[stack(1, Item::SiliconCarbide)],
+        ),
+        assembler(
+            &[stack(2, Item::Carbon)],
+            &[stack(1, Item::ActivatedCharcoal)],
+        ),
+        assembler(
+            &[
+                stack(4, Item::Water),
+                stack(4, Item::Ammonia),
+                stack(2, Item::ActivatedCharcoal),
+            ],
+            &[stack(1, Item::FertilizedSoil)],
+        ),
+        assembler(
+            &[stack(2, Item::Raw(RawMaterial::CobaltOre))],
+            &[stack(1, Item::RefinedCobalt)],
+        ),
+        assembler(
+            &[stack(2, Item::SiliconWafer), stack(1, Item::RefinedCobalt)],
+            &[stack(1, Item::Electronics)],
+        ),
+        assembler(
+            &[stack(3, Item::Carbon), stack(6, Item::Hydrogen)],
+            &[stack(1, Item::HydrocarbonPolymer)],
+        ),
+        assembler(
+            &[
+                stack(1, Item::RefinedCobalt),
+                stack(1, Item::SiliconCarbide),
+                stack(1, Item::HydrocarbonPolymer),
+            ],
+            &[stack(1, Item::Battery)],
+        ),
+        assembler(
+            &[
+                stack(2, Item::SiliconCarbide),
+                stack(2, Item::Electronics),
+                stack(2, Item::RefinedCobalt),
+            ],
+            &[stack(1, Item::FuelCell)],
+        ),
+        assembler(
+            &[
+                stack(2, Item::Glass),
+                stack(1, Item::Battery),
+                stack(1, Item::HydrocarbonPolymer),
+            ],
+            &[stack(1, Item::DomeHabitatPanel)],
+        ),
+        assembler(
+            &[
+                stack(2, Item::FuelCell),
+                stack(4, Item::DomeHabitatPanel),
+                stack(4, Item::FertilizedSoil),
+            ],
+            &[stack(1, Item::HydroponicsBay)],
+        ),
+    ];
+
+    /// What one run of a building of this type takes in and puts out.
+    ///
+    /// An extractor draws what it stands on rather than taking anything in, so it is the same
+    /// machine as an assembler with an empty left-hand side rather than a second kind of thing.
+    pub fn recipe(self) -> Recipe {
+        match self {
+            Self::Extractor(material) => Recipe {
+                inputs: &[],
+                outputs: extracted(material),
+            },
+            Self::Assembler(recipe) => recipe,
+        }
+    }
+
+    /// Which corner of its tile each of this type's ports stands on, and what passes through it.
+    ///
+    /// Derived from the recipe rather than declared beside it, so a type whose ports do not cover
+    /// what it takes and makes cannot be written down: an intake per item consumed, an outlet per
+    /// item produced, and the corners taken in the order the recipe names them.
+    pub fn ports(self) -> impl Iterator<Item = (TileCorner, Port)> {
+        let recipe = self.recipe();
+        let intakes = recipe.inputs.iter().zip(INTAKE_CORNERS);
+        let outlets = recipe.outputs.iter().zip(OUTLET_CORNERS);
+        intakes
+            .map(|(stack, corner)| (corner, Flow::Intake, stack.item))
+            .chain(outlets.map(|(stack, corner)| (corner, Flow::Outlet, stack.item)))
+            .map(|(corner, flow, item)| (corner, Port { flow, item }))
+    }
+
+    /// What the legend calls this type, which is what it draws or what it turns into what.
+    pub fn label(self) -> String {
+        match self {
+            Self::Extractor(material) => format!("{} Extractor", material.name()),
+            Self::Assembler(recipe) => {
+                format!("{} → {}", counted(recipe.inputs), counted(recipe.outputs))
+            }
+        }
+    }
+}
+
+impl ChosenBuildingType {
+    /// The type the building tool will place on the next tap.
+    pub fn chosen(&self) -> BuildingType {
+        BuildingType::ALL[self.0]
+    }
+
+    fn step(&mut self, by: isize) {
+        let catalogue = BuildingType::ALL.len() as isize;
+        self.0 = (self.0 as isize + by).rem_euclid(catalogue) as usize;
+    }
+}
+
 impl Plugin for BuildingPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<BuildingTiles>()
+            .init_resource::<ChosenBuildingType>()
             .declare_bindings([
                 Binding {
                     input: BindingInput::Mouse(MouseButton::Left),
@@ -125,6 +435,16 @@ impl Plugin for BuildingPlugin {
                     action: "Take the building off the tile",
                     context: BindingContext::Tool(PlayerAction::EditBuildings),
                 },
+                Binding {
+                    input: BindingInput::Key(CHOOSE_KEYS[0].0),
+                    action: "Choose the type before this one",
+                    context: BindingContext::Tool(PlayerAction::EditBuildings),
+                },
+                Binding {
+                    input: BindingInput::Key(CHOOSE_KEYS[1].0),
+                    action: "Choose the type after this one",
+                    context: BindingContext::Tool(PlayerAction::EditBuildings),
+                },
             ])
             .add_observer(release_the_tile_of_a_removed_building)
             .add_systems(
@@ -134,9 +454,15 @@ impl Plugin for BuildingPlugin {
             .add_systems(
                 Update,
                 (
-                    (place_building_system, remove_building_system).chain(),
+                    (
+                        choose_building_type_system,
+                        place_building_system,
+                        remove_building_system,
+                    )
+                        .chain(),
                     draw_the_refused_tile,
                     draw_the_ports,
+                    draw_the_type_under_the_cursor,
                 ),
             );
     }
@@ -172,6 +498,7 @@ fn place_building_system(
     player_input: Res<PlayerInput>,
     action: Res<State<PlayerAction>>,
     roads: Res<RoadTiles>,
+    chosen: Res<ChosenBuildingType>,
     mut buildings: ResMut<BuildingTiles>,
     tiles: Query<&MapTile>,
 ) {
@@ -188,20 +515,42 @@ fn place_building_system(
         return;
     }
 
+    let kind = chosen.chosen();
     let building = commands
         .spawn((
             Building {
                 coordinates: tile.coordinates,
             },
+            kind,
             Visibility::Hidden,
         ))
         .with_children(|ports| {
-            for (corner, port) in BUILDING_PORTS {
+            for (corner, port) in kind.ports() {
                 ports.spawn((port, RoadEndpoint::at(corner.node_of(tile.coordinates))));
             }
         })
         .id();
     buildings.claim(tile.coordinates, building);
+}
+
+/// Step through the catalogue, so the tool places what the player chose rather than what it last
+/// placed.
+///
+/// The choice is the tool's own record and nothing on the tick reads it, so it is settled on the
+/// frame the key was pressed, like every other thing the player holds (invariant 2).
+fn choose_building_type_system(
+    input: Res<ButtonInput<KeyCode>>,
+    action: Res<State<PlayerAction>>,
+    mut chosen: ResMut<ChosenBuildingType>,
+) {
+    if *action.get() != PlayerAction::EditBuildings {
+        return;
+    }
+    for (key, by) in CHOOSE_KEYS {
+        if input.just_pressed(key) {
+            chosen.step(by);
+        }
+    }
 }
 
 /// Take the building off the tile the cursor is over, when the player clicks the secondary button
@@ -278,17 +627,67 @@ fn draw_the_ports(
         let Ok(building) = buildings.get(of.0) else {
             continue;
         };
-        let standing = endpoint.standing_on().world_position() + GIZMO_LIFT;
-        let middle = building.coordinates.world_position() + GIZMO_LIFT;
-        let reach =
-            standing + (middle - standing).normalize_or_zero() * MAP_TILE_INRADIUS * PORT_MARK;
-
-        let (from, to, colour) = match port {
-            Port::Intake => (standing, reach, INTAKE_COLOUR),
-            Port::Outlet => (reach, standing, OUTLET_COLOUR),
-        };
-        gizmos.arrow(from, to, colour);
+        draw_a_port(
+            &mut gizmos,
+            building.coordinates,
+            endpoint.standing_on(),
+            port.flow,
+        );
     }
+}
+
+/// Draw the ports the chosen type will stand, on the tile the tool would put it on.
+///
+/// What is drawn under the cursor is what the tap will place, so the player chooses by looking
+/// rather than by placing one and reading it back off the map (invariant 5). A tile the tool will
+/// refuse is left to `draw_the_refused_tile`, which says so instead.
+fn draw_the_type_under_the_cursor(
+    mut gizmos: Gizmos<DebugGizmos>,
+    player_input: Res<PlayerInput>,
+    action: Res<State<PlayerAction>>,
+    roads: Res<RoadTiles>,
+    buildings: Res<BuildingTiles>,
+    chosen: Res<ChosenBuildingType>,
+    tiles: Query<&MapTile>,
+) {
+    if *action.get() != PlayerAction::EditBuildings {
+        return;
+    }
+    let Some(tile) = player_input
+        .cursor_tile
+        .and_then(|entity| tiles.get(entity).ok())
+    else {
+        return;
+    };
+    if !takes_a_building(tile.coordinates, &buildings, &roads) {
+        return;
+    }
+
+    for (corner, port) in chosen.chosen().ports() {
+        draw_a_port(
+            &mut gizmos,
+            tile.coordinates,
+            corner.node_of(tile.coordinates),
+            port.flow,
+        );
+    }
+}
+
+fn draw_a_port(
+    gizmos: &mut Gizmos<DebugGizmos>,
+    middle_of: HexCoordinates,
+    standing_on: LatticeNode,
+    flow: Flow,
+) {
+    let standing = standing_on.world_position() + GIZMO_LIFT;
+    let middle = middle_of.world_position() + GIZMO_LIFT;
+    let reach = standing + (middle - standing).normalize_or_zero() * MAP_TILE_INRADIUS * PORT_MARK;
+
+    let (from, to, colour) = match flow {
+        Flow::Intake => (standing, reach, INTAKE_COLOUR),
+        Flow::Outlet => (reach, standing, OUTLET_COLOUR),
+    };
+    gizmos.arrow(from, to, colour);
 }
 
 impl Initialize<BuildingInitializeParams<'_, '_>> for Building {

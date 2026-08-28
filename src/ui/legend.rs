@@ -8,6 +8,7 @@
 //! A row is then a pair of text nodes under a panel rather than a line of a formatted string,
 //! which is what lets a column line up and a heading read differently from the rows beneath it.
 
+use crate::building::ChosenBuildingType;
 use crate::input::PlayerAction;
 use bevy::prelude::*;
 
@@ -112,7 +113,10 @@ impl Plugin for LegendPlugin {
                 Update,
                 (
                     toggle_the_legend,
-                    redraw_the_legend.run_if(resource_exists_and_changed::<State<PlayerAction>>),
+                    redraw_the_legend.run_if(
+                        resource_exists_and_changed::<State<PlayerAction>>
+                            .or_else(resource_exists_and_changed::<ChosenBuildingType>),
+                    ),
                 ),
             );
     }
@@ -125,8 +129,10 @@ fn open_the_legend(
     mut commands: Commands,
     bindings: Res<PlayerBindings>,
     held: Option<Res<State<PlayerAction>>>,
+    chosen: Option<Res<ChosenBuildingType>>,
 ) {
-    spawn_legend(&mut commands, &bindings, held_tool(held.as_deref()));
+    let held = held_tool(held.as_deref());
+    spawn_legend(&mut commands, &bindings, held, placing(chosen.as_deref(), held));
 }
 
 fn toggle_the_legend(
@@ -134,36 +140,45 @@ fn toggle_the_legend(
     input: Res<ButtonInput<KeyCode>>,
     bindings: Res<PlayerBindings>,
     held: Option<Res<State<PlayerAction>>>,
+    chosen: Option<Res<ChosenBuildingType>>,
     legend_q: Query<Entity, With<Legend>>,
 ) {
     if !input.just_pressed(LEGEND_KEY) {
         return;
     }
 
+    let held = held_tool(held.as_deref());
     match legend_q.iter().next() {
         Some(legend) => {
             commands.entity(legend).despawn();
         }
-        None => spawn_legend(&mut commands, &bindings, held_tool(held.as_deref())),
+        None => spawn_legend(
+            &mut commands,
+            &bindings,
+            held,
+            placing(chosen.as_deref(), held),
+        ),
     }
 }
 
-/// Rewrite the legend when the player picks up another tool, which changes what is on offer.
+/// Rewrite the legend when the player picks up another tool or chooses another thing to build.
 ///
 /// The panel keeps its entity, and only its rows are built again, so a legend already on screen
 /// stays the one on screen rather than blinking out and back.
 fn redraw_the_legend(
     mut commands: Commands,
     bindings: Res<PlayerBindings>,
-    held: Res<State<PlayerAction>>,
+    held: Option<Res<State<PlayerAction>>>,
+    chosen: Option<Res<ChosenBuildingType>>,
     legend_q: Query<Entity, With<Legend>>,
 ) {
-    let held = Some(*held.get());
+    let held = held_tool(held.as_deref());
+    let placing = placing(chosen.as_deref(), held);
     for legend in &legend_q {
         commands
             .entity(legend)
             .despawn_related::<Children>()
-            .with_children(|panel| fill_the_panel(panel, &bindings, held));
+            .with_children(|panel| fill_the_panel(panel, &bindings, held, placing.as_deref()));
     }
 }
 
@@ -171,10 +186,22 @@ fn held_tool(held: Option<&State<PlayerAction>>) -> Option<PlayerAction> {
     held.map(|state| *state.get())
 }
 
-fn spawn_legend(commands: &mut Commands, bindings: &PlayerBindings, held: Option<PlayerAction>) {
+fn placing(chosen: Option<&ChosenBuildingType>, held: Option<PlayerAction>) -> Option<String> {
+    if held != Some(PlayerAction::EditBuildings) {
+        return None;
+    }
+    chosen.map(|chosen| chosen.chosen().label())
+}
+
+fn spawn_legend(
+    commands: &mut Commands,
+    bindings: &PlayerBindings,
+    held: Option<PlayerAction>,
+    placing: Option<String>,
+) {
     commands
         .spawn((Legend, panel()))
-        .with_children(|panel| fill_the_panel(panel, bindings, held));
+        .with_children(|panel| fill_the_panel(panel, bindings, held, placing.as_deref()));
 }
 
 fn panel() -> impl Bundle {
@@ -198,12 +225,13 @@ fn fill_the_panel(
     panel: &mut ChildSpawnerCommands,
     bindings: &PlayerBindings,
     held: Option<PlayerAction>,
+    placing: Option<&str>,
 ) {
     for (place, context) in contexts_in_declaration_order(bindings)
         .into_iter()
         .enumerate()
     {
-        panel.spawn(heading_row(heading(context, held), place));
+        panel.spawn(heading_row(heading(context, held, placing), place));
         for binding in bindings.0.iter().filter(|it| it.context == context) {
             panel.spawn(row()).with_children(|row| {
                 row.spawn(cell(
@@ -263,11 +291,18 @@ fn contexts_in_declaration_order(bindings: &PlayerBindings) -> Vec<BindingContex
     seen
 }
 
-fn heading(context: BindingContext, held: Option<PlayerAction>) -> String {
-    match context {
-        BindingContext::Always => "Anytime".to_string(),
-        BindingContext::Tool(tool) if held == Some(tool) => format!("{} (held)", tool.label()),
-        BindingContext::Tool(tool) => tool.label().to_string(),
+/// What the rows beneath it are for, and what the held tool is set to place.
+///
+/// A tool that places whatever it last placed, with no way to see which that is, is one the
+/// player builds by trial and error, so the heading of the held tool names the choice it carries.
+fn heading(context: BindingContext, held: Option<PlayerAction>, placing: Option<&str>) -> String {
+    match (context, placing) {
+        (BindingContext::Always, _) => "Anytime".to_string(),
+        (BindingContext::Tool(tool), Some(placing)) if held == Some(tool) => {
+            format!("{} (held) — {placing}", tool.label())
+        }
+        (BindingContext::Tool(tool), _) if held == Some(tool) => format!("{} (held)", tool.label()),
+        (BindingContext::Tool(tool), _) => tool.label().to_string(),
     }
 }
 

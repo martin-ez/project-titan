@@ -74,6 +74,19 @@ pub enum RawMaterial {
     CobaltOre,
 }
 
+impl RawMaterial {
+    /// What the player is told this material is called.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ice => "Ice",
+            Self::CarbonMonoxide => "Carbon Monoxide",
+            Self::Nitrogen => "Nitrogen",
+            Self::Silicon => "Silicon",
+            Self::CobaltOre => "Cobalt Ore",
+        }
+    }
+}
+
 /// The raw material a tile holds, and how much of it the ground gives up.
 ///
 /// Carried by the `MapTile` it lies under, so a tile with none answers for itself rather than for
