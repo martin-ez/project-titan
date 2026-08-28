@@ -1,4 +1,4 @@
-use crate::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
+use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
 use bevy::diagnostic::{Diagnostic, DiagnosticPath, Diagnostics, RegisterDiagnostic};
 use bevy::input::InputSystems;
 use bevy::prelude::*;

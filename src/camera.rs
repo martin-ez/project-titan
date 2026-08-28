@@ -1,38 +1,63 @@
 use crate::input::{CameraMovement, PlayerInput};
-use crate::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
+use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use std::f32::consts::{PI, TAU};
 use std::ops::Range;
 
-/// Speed of the camera when translating with WASD, in world units per second.
-///
-/// Settled by play testing as 0.12 per tick of the 64 Hz clock it used to run on.
-const TRANSLATION_SENSITIVITY: f32 = 7.68;
 /// How much the speed of the camera increases when zooming out
 const TRANSLATION_ZOOM_MULTIPLIER: f32 = 0.04;
 /// Smoothing factor for the camera translation
 const TRANSLATION_SMOOTHING: f32 = 4.;
 /// Damping factor for the panning inertia
 const PAN_INERTIA_DAMPING: f32 = 0.08;
-/// Radians per pixel of mouse motion
-const ORBIT_SENSITIVITY: f32 = 0.4 * (PI / 180.0);
 /// Smoothing factor for the camera rotation
 const ROTATION_SMOOTHING: f32 = 8.;
 /// Minimum and maximum pitch allowed for the camera
 const PITCH_RANGE: Range<f32> = 20.0 * (PI / 180.0)..89.0 * (PI / 180.0);
-/// Exponent per pixel of mouse motion
-const ZOOM_SENSITIVITY: f32 = 0.01;
 /// Minimum and maximum radius allowed for the camera
 const ZOOM_RADIUS_RANGE: Range<f32> = 8. ..100.;
-/// For devices with a notched scroll wheel
-const SCROLL_LINE_SENSITIVITY: f32 = 4.;
-/// For devices with smooth scrolling (e.g. touchpad)
-const SCROLL_PIXEL_SENSITIVITY: f32 = 0.5;
 /// Smoothing factor for the camera zoom
 const ZOOM_SMOOTHING: f32 = 12.;
 
 pub struct CameraPlugin;
+
+/// How far the camera moves for a given amount of input.
+///
+/// Held as a resource rather than as constants because these are the settings a player most wants
+/// to change, and there is no one right answer to change them to: a notched wheel and a touchpad
+/// report a scroll in different units on the same machine, so each carries its own factor. Every
+/// field is read on the frame it is used, so raising one moves the camera further from that frame
+/// on, without a restart.
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+pub struct CameraSensitivity {
+    /// World units per second when translating with WASD.
+    pub translation: f32,
+    /// Radians per pixel of mouse motion when orbiting.
+    pub orbit: f32,
+    /// Exponent per pixel of mouse motion when zooming.
+    pub zoom: f32,
+    /// Lines per notch of a scroll wheel, before the zoom exponent.
+    pub scroll_line: f32,
+    /// Lines per pixel of a smooth scroll, before the zoom exponent.
+    pub scroll_pixel: f32,
+}
+
+/// The values the camera shipped with.
+///
+/// The translation speed was settled by play testing as 0.12 per tick of the 64 Hz clock the
+/// camera used to run on, which is 7.68 world units per second.
+impl Default for CameraSensitivity {
+    fn default() -> Self {
+        Self {
+            translation: 7.68,
+            orbit: 0.4 * (PI / 180.0),
+            zoom: 0.01,
+            scroll_line: 4.,
+            scroll_pixel: 0.5,
+        }
+    }
+}
 
 /// Internal state for the camera, use to construct its transform
 #[derive(Component)]
@@ -51,6 +76,7 @@ impl Plugin for CameraPlugin {
             action: "Zoom the camera",
             context: BindingContext::Always,
         }])
+        .init_resource::<CameraSensitivity>()
         .add_systems(Startup, spawn_camera)
         .add_systems(
             Update,
@@ -114,11 +140,12 @@ fn smooth_tracking(
 fn translate(
     mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
     player_input: Res<PlayerInput>,
+    sensitivity: Res<CameraSensitivity>,
     time: Res<Time<Real>>,
 ) -> Result {
     let mut controller = controller_q.single_mut()?;
     let zoom_multiplier = (controller.radius * TRANSLATION_ZOOM_MULTIPLIER).exp();
-    let step = TRANSLATION_SENSITIVITY * zoom_multiplier * time.delta_secs();
+    let step = sensitivity.translation * zoom_multiplier * time.delta_secs();
     controller.target += player_input.movement_vector * step;
     Ok(())
 }
@@ -173,11 +200,12 @@ fn pan(
 fn orbit(
     mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
     mut mouse_motion: MessageReader<MouseMotion>,
+    sensitivity: Res<CameraSensitivity>,
 ) -> Result {
     let mut total_motion: Vec2 = mouse_motion.read().map(|motion| motion.delta).sum();
     total_motion.y = -total_motion.y;
 
-    let orbit = -total_motion * ORBIT_SENSITIVITY;
+    let orbit = -total_motion * sensitivity.orbit;
     let mut controller = controller_q.single_mut()?;
     controller.yaw += orbit.x;
     controller.pitch += orbit.y;
@@ -202,13 +230,14 @@ fn wrap_to_half_turn(angle: f32) -> f32 {
 fn scroll_zoom(
     mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
     mut evr_scroll: MessageReader<MouseWheel>,
+    sensitivity: Res<CameraSensitivity>,
 ) -> Result {
     let mut zoom = 0.;
     for ev in evr_scroll.read() {
         zoom -= ev.y;
         match ev.unit {
-            MouseScrollUnit::Line => zoom *= SCROLL_LINE_SENSITIVITY * ZOOM_SENSITIVITY,
-            MouseScrollUnit::Pixel => zoom *= SCROLL_PIXEL_SENSITIVITY * ZOOM_SENSITIVITY,
+            MouseScrollUnit::Line => zoom *= sensitivity.scroll_line * sensitivity.zoom,
+            MouseScrollUnit::Pixel => zoom *= sensitivity.scroll_pixel * sensitivity.zoom,
         }
     }
 
@@ -224,11 +253,12 @@ fn scroll_zoom(
 fn mouse_zoom(
     mut controller_q: Query<&mut PanOrbitCamera, With<PanOrbitCamera>>,
     mut mouse_motion: MessageReader<MouseMotion>,
+    sensitivity: Res<CameraSensitivity>,
 ) -> Result {
     let total_motion: Vec2 = mouse_motion.read().map(|motion| motion.delta).sum();
 
     let mut controller = controller_q.single_mut()?;
-    controller.radius *= (total_motion.y * ZOOM_SENSITIVITY).exp();
+    controller.radius *= (total_motion.y * sensitivity.zoom).exp();
     controller.radius = controller
         .radius
         .clamp(ZOOM_RADIUS_RANGE.start, ZOOM_RADIUS_RANGE.end);
@@ -238,7 +268,7 @@ fn mouse_zoom(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{advance, headless_app, move_mouse, tick};
+    use crate::testing::{advance, headless_app, move_mouse, scroll_wheel, tick};
     use std::time::Duration;
 
     /// A frame short enough that virtual time never reaches its maximum delta.
@@ -295,6 +325,24 @@ mod tests {
             .translation
     }
 
+    fn orbited_over(app: &mut App, motion: Vec2) -> f32 {
+        tick(app);
+        let before = controller(app, |camera| camera.yaw);
+        move_mouse(app, motion);
+        tick(app);
+        controller(app, |camera| camera.yaw) - before
+    }
+
+    fn zoomed_over(app: &mut App, input: impl Fn(&mut App)) -> f32 {
+        tick(app);
+        let before = controller(app, |camera| camera.radius);
+        input(app);
+        tick(app);
+        (controller(app, |camera| camera.radius) / before)
+            .ln()
+            .abs()
+    }
+
     fn controller<T>(app: &mut App, read: impl Fn(&PanOrbitCamera) -> T) -> T {
         let mut query = app.world_mut().query::<&PanOrbitCamera>();
         let controller = query
@@ -302,6 +350,84 @@ mod tests {
             .next()
             .expect("the plugin spawns a controller on startup");
         read(controller)
+    }
+
+    #[test]
+    fn raising_the_translation_sensitivity_moves_the_camera_further() {
+        let mut app = translating_app();
+        let at_the_default = translated_over(&mut app, 5, FRAME);
+
+        app.world_mut()
+            .resource_mut::<CameraSensitivity>()
+            .translation *= 2.0;
+
+        assert!(translated_over(&mut app, 5, FRAME).x > at_the_default.x * 1.5);
+    }
+
+    #[test]
+    fn raising_the_orbit_sensitivity_turns_the_camera_further() {
+        let mut app = camera_app(CameraMovement::Orbit);
+        let at_the_default = orbited_over(&mut app, Vec2::new(10.0, 0.0));
+
+        app.world_mut().resource_mut::<CameraSensitivity>().orbit *= 2.0;
+
+        assert!(orbited_over(&mut app, Vec2::new(10.0, 0.0)).abs() > at_the_default.abs() * 1.5);
+    }
+
+    #[test]
+    fn raising_the_zoom_sensitivity_zooms_the_camera_further() {
+        let mut app = camera_app(CameraMovement::Zoom);
+        let at_the_default = zoomed_over(&mut app, |app| move_mouse(app, Vec2::new(0.0, 10.0)));
+
+        app.world_mut().resource_mut::<CameraSensitivity>().zoom *= 2.0;
+
+        let raised = zoomed_over(&mut app, |app| move_mouse(app, Vec2::new(0.0, 10.0)));
+        assert!(raised > at_the_default * 1.5);
+    }
+
+    #[test]
+    fn raising_the_notched_wheel_sensitivity_zooms_a_notch_further() {
+        let mut app = camera_app(CameraMovement::Translate);
+        let at_the_default = zoomed_over(&mut app, |app| {
+            scroll_wheel(app, MouseScrollUnit::Line, -1.0)
+        });
+
+        app.world_mut()
+            .resource_mut::<CameraSensitivity>()
+            .scroll_line *= 2.0;
+
+        let raised = zoomed_over(&mut app, |app| {
+            scroll_wheel(app, MouseScrollUnit::Line, -1.0)
+        });
+        assert!(raised > at_the_default * 1.5);
+    }
+
+    #[test]
+    fn a_touchpad_scrolls_by_its_own_sensitivity() {
+        let mut app = camera_app(CameraMovement::Translate);
+        let at_the_default = zoomed_over(&mut app, |app| {
+            scroll_wheel(app, MouseScrollUnit::Pixel, -1.0)
+        });
+
+        app.world_mut()
+            .resource_mut::<CameraSensitivity>()
+            .scroll_line *= 2.0;
+
+        let after = zoomed_over(&mut app, |app| {
+            scroll_wheel(app, MouseScrollUnit::Pixel, -1.0)
+        });
+        assert!((after - at_the_default).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_defaults_are_the_values_the_camera_shipped_with() {
+        let defaults = CameraSensitivity::default();
+
+        assert_eq!(defaults.translation, 7.68);
+        assert_eq!(defaults.orbit, 0.4f32.to_radians());
+        assert_eq!(defaults.zoom, 0.01);
+        assert_eq!(defaults.scroll_line, 4.0);
+        assert_eq!(defaults.scroll_pixel, 0.5);
     }
 
     #[test]
@@ -313,7 +439,7 @@ mod tests {
         move_mouse(&mut app, Vec2::new(10.0, 0.0));
         tick(&mut app);
 
-        let expected = before - 10.0 * ORBIT_SENSITIVITY;
+        let expected = before - 10.0 * CameraSensitivity::default().orbit;
         assert!((controller(&mut app, |camera| camera.yaw) - expected).abs() < 1e-5);
     }
 

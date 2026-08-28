@@ -1,5 +1,5 @@
-use crate::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
 use crate::simulation::TICKS_PER_SECOND;
+use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
 use bevy::dev_tools::diagnostics_overlay::{DiagnosticsOverlay, DiagnosticsOverlayPlugin};
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
 use bevy::prelude::*;

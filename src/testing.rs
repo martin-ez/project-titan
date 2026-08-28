@@ -11,7 +11,8 @@ use crate::simulation::Simulation;
 use bevy::asset::AssetPlugin;
 use bevy::gizmos::GizmoAsset;
 use bevy::input::keyboard::{Key, KeyboardInput, NativeKey};
-use bevy::input::mouse::{MouseButtonInput, MouseMotion};
+use bevy::input::mouse::{MouseButtonInput, MouseMotion, MouseScrollUnit, MouseWheel};
+use bevy::input::touch::TouchPhase;
 use bevy::input::{ButtonState, InputPlugin};
 use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
@@ -66,6 +67,20 @@ pub fn advance(app: &mut App, delta: Duration) {
 /// Move the mouse by `delta`, to be seen on the next tick.
 pub fn move_mouse(app: &mut App, delta: Vec2) {
     app.world_mut().write_message(MouseMotion { delta });
+}
+
+/// Scroll by `amount` in `unit`, to be seen on the next tick.
+///
+/// The unit is the caller's to choose because a notched wheel and a touchpad report a scroll in
+/// different ones, and a system reading them is entitled to weigh them differently.
+pub fn scroll_wheel(app: &mut App, unit: MouseScrollUnit, amount: f32) {
+    app.world_mut().write_message(MouseWheel {
+        unit,
+        x: 0.0,
+        y: amount,
+        window: Entity::PLACEHOLDER,
+        phase: TouchPhase::Moved,
+    });
 }
 
 /// Press `key`, to be seen on the next tick.
