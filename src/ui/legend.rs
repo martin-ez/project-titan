@@ -3,9 +3,10 @@
 //! A binding is declared by the plugin that owns it, from the same table that plugin's systems
 //! read to decide what a press does, so a key cannot start working without saying what it is for.
 //! The legend renders those declarations and nothing else: adding a command adds its row, and
-//! there is no second list to forget. A row is a pair of text nodes under a panel rather than a
-//! line of a formatted string, which is what lets a column line up and a heading read differently
-//! from the rows beneath it.
+//! there is no second list to forget. It is drawn in `bevy_ui` nodes rather than Bevy's
+//! `bevy_feathers` widgets, an editor set and not a game's, for the reasons [`crate::ui`] gives.
+//! A row is then a pair of text nodes under a panel rather than a line of a formatted string,
+//! which is what lets a column line up and a heading read differently from the rows beneath it.
 
 use crate::input::PlayerAction;
 use bevy::prelude::*;
