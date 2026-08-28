@@ -1,5 +1,17 @@
+//! The hex grid the game is played on, and what a tile of it holds.
+//!
+//! A tile is located by integer coordinates and its world position is derived from them
+//! (invariant 3), and a road's nodes stand on the same integers at twice the resolution.
+//!
+//! A tile may also carry a `Deposit`: a raw material in the ground, which never runs out. Titan
+//! is a terraforming builder rather than a survival game, and its production tree is a standing
+//! chain rather than a race, so a deposit is ground the player builds around and keeps building
+//! around rather than ground they exhaust and walk away from. What a deposit says instead of a
+//! reserve is how rich it is — how much it yields, which is a standing property of the ground.
+
 use crate::common::cursor::{CursorSurface, TileSurface};
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
+use crate::diagnostics::DebugGizmos;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use std::f32::consts::FRAC_PI_2;
@@ -20,7 +32,61 @@ pub const MAP_TILE_INRADIUS: f32 = MAP_TILE_WIDTH / 2.;
 
 const NEIGHBOUR_STEPS: [(i32, i32); 6] = [(1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)];
 
+/// How far the debug view lifts the mark on a deposit, so it does not fight the tile it lies on.
+const GIZMO_LIFT: Vec3 = Vec3::new(0., 0.1, 0.);
+
+/// How far the mark on a deposit of richness one reaches, as a share of the tile's inradius.
+const DEPOSIT_MARK: f32 = 0.25;
+
+const ICE_COLOUR: Color = Color::srgb(0.75, 0.95, 1.);
+const CARBON_MONOXIDE_COLOUR: Color = Color::srgb(0.3, 0.3, 0.34);
+const NITROGEN_COLOUR: Color = Color::srgb(0.55, 0.45, 0.95);
+const SILICON_COLOUR: Color = Color::srgb(0.3, 0.75, 0.4);
+const COBALT_ORE_COLOUR: Color = Color::srgb(0.15, 0.3, 0.9);
+
+/// The deposits the starting map holds: a tile's offset column and row, its material, and how
+/// rich it is.
+///
+/// Laid out rather than generated, because a map that differs between two runs of the same save
+/// takes back the determinism the simulation is built on (invariant 2). Ice is commonest and
+/// cobalt ore rarest, which is the order the production tree reaches them in.
+const STARTING_DEPOSITS: [(i32, i32, RawMaterial, u32); 11] = [
+    (-4, -4, RawMaterial::Ice, 3),
+    (2, -5, RawMaterial::Ice, 3),
+    (-1, 3, RawMaterial::Ice, 3),
+    (4, 1, RawMaterial::Ice, 2),
+    (-5, 1, RawMaterial::CarbonMonoxide, 2),
+    (3, -2, RawMaterial::CarbonMonoxide, 2),
+    (0, -3, RawMaterial::Nitrogen, 2),
+    (-3, 4, RawMaterial::Nitrogen, 2),
+    (1, 1, RawMaterial::Silicon, 2),
+    (-2, -1, RawMaterial::Silicon, 1),
+    (5, 4, RawMaterial::CobaltOre, 1),
+];
+
 pub struct MapPlugin;
+
+/// A raw material lying in the ground, which every chain of the production tree starts at.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RawMaterial {
+    Ice,
+    CarbonMonoxide,
+    Nitrogen,
+    Silicon,
+    CobaltOre,
+}
+
+/// The raw material a tile holds, and how much of it the ground gives up.
+///
+/// Carried by the `MapTile` it lies under, so a tile with none answers for itself rather than for
+/// a neighbour. A deposit never runs out; `richness` is what it yields, not what is left of it.
+#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Deposit {
+    /// Which raw material is in the ground here.
+    pub material: RawMaterial,
+    /// How much this ground gives up, richer being more.
+    pub richness: u32,
+}
 
 /// Where a tile is: axial hex coordinates, from which a world position is derived.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -73,23 +139,65 @@ struct MapTileInitializeParams<'w, 's> {
 
 impl Plugin for MapPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, setup).add_systems(
-            PreUpdate,
-            initialize_system::<MapTile, MapTileInitializeParams>,
-        );
+        app.add_systems(Startup, setup)
+            .add_systems(
+                PreUpdate,
+                initialize_system::<MapTile, MapTileInitializeParams>,
+            )
+            .add_systems(Update, draw_the_deposits);
     }
 }
 
 fn setup(mut commands: Commands) {
     for col in -MAP_GRID_SIZE / 2..MAP_GRID_SIZE / 2 {
         for row in -MAP_GRID_SIZE / 2..MAP_GRID_SIZE / 2 {
-            commands.spawn((
-                MapTile {
-                    coordinates: HexCoordinates::from_offset_row(col, row),
-                },
-                Visibility::Hidden,
-            ));
+            let coordinates = HexCoordinates::from_offset_row(col, row);
+            let tile = commands
+                .spawn((MapTile { coordinates }, Visibility::Hidden))
+                .id();
+
+            if let Some(deposit) = starting_deposit_on(coordinates) {
+                commands.entity(tile).insert(deposit);
+            }
         }
+    }
+}
+
+fn starting_deposit_on(tile: HexCoordinates) -> Option<Deposit> {
+    STARTING_DEPOSITS
+        .iter()
+        .find(|(col, row, _, _)| HexCoordinates::from_offset_row(*col, *row) == tile)
+        .map(|(_, _, material, richness)| Deposit {
+            material: *material,
+            richness: *richness,
+        })
+}
+
+/// Mark every deposit on the map, in the colour of its material and at the size of its richness.
+///
+/// A deposit is a fact of the ground with nothing standing on it to show it, so without this the
+/// grid reads as bare tiles and where the player builds looks arbitrary. What one looks like past
+/// a ring is presentation work, and not this (invariant 5).
+fn draw_the_deposits(mut gizmos: Gizmos<DebugGizmos>, deposits: Query<(&MapTile, &Deposit)>) {
+    for (tile, deposit) in &deposits {
+        gizmos.circle(
+            Isometry3d::new(
+                tile.coordinates.world_position() + GIZMO_LIFT,
+                Quat::from_rotation_x(FRAC_PI_2),
+            ),
+            MAP_TILE_INRADIUS * DEPOSIT_MARK * deposit.richness as f32,
+            colour_of(deposit.material),
+        );
+    }
+}
+
+fn colour_of(material: RawMaterial) -> Color {
+    match material {
+        RawMaterial::Ice => ICE_COLOUR,
+        RawMaterial::CarbonMonoxide => CARBON_MONOXIDE_COLOUR,
+        RawMaterial::Nitrogen => NITROGEN_COLOUR,
+        RawMaterial::Silicon => SILICON_COLOUR,
+        RawMaterial::CobaltOre => COBALT_ORE_COLOUR,
     }
 }
 
@@ -230,12 +338,13 @@ impl Initialize<MapTileInitializeParams<'_, '_>> for MapTile {
 mod tests {
     use super::*;
     use crate::common::initialize::InitializationFailed;
+    use crate::diagnostics::DebugGizmosPlugin;
     use crate::testing::{headless_app, tick};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     fn map_app() -> App {
         let mut app = headless_app();
-        app.add_plugins(MapPlugin);
+        app.add_plugins((DebugGizmosPlugin, MapPlugin));
         app
     }
 
@@ -559,5 +668,113 @@ mod tests {
             HexCoordinates::from_world_position(tile.world_position() + towards * (1. + STRIDE)),
             beyond
         );
+    }
+
+    /// A tile the starting map puts ice on, in offset column and row.
+    const ICE_TILE: (i32, i32) = (-4, -4);
+
+    /// A tile beside `ICE_TILE` that the starting map leaves bare, so neither answers for the
+    /// other.
+    const BARE_TILE: (i32, i32) = (-3, -4);
+
+    fn deposits(app: &mut App) -> HashMap<HexCoordinates, Deposit> {
+        let mut query = app.world_mut().query::<(&MapTile, &Deposit)>();
+        query
+            .iter(app.world())
+            .map(|(tile, deposit)| (tile.coordinates, *deposit))
+            .collect()
+    }
+
+    fn started_map() -> App {
+        let mut app = map_app();
+        tick(&mut app);
+        app
+    }
+
+    fn offset(tile: (i32, i32)) -> HexCoordinates {
+        HexCoordinates::from_offset_row(tile.0, tile.1)
+    }
+
+    #[test]
+    fn a_tile_carrying_a_deposit_says_which_material_it_holds() {
+        let mut app = started_map();
+
+        let held = deposits(&mut app);
+
+        assert_eq!(
+            held.get(&offset(ICE_TILE)).map(|deposit| deposit.material),
+            Some(RawMaterial::Ice)
+        );
+    }
+
+    #[test]
+    fn a_tile_carrying_a_deposit_says_how_rich_it_is() {
+        let mut app = started_map();
+
+        let held = deposits(&mut app);
+
+        assert_eq!(
+            held.get(&offset(ICE_TILE)).map(|deposit| deposit.richness),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn a_tile_beside_a_deposit_carries_none() {
+        let mut app = started_map();
+        let bare = offset(BARE_TILE);
+
+        let held = deposits(&mut app);
+
+        assert!(
+            !held.contains_key(&bare),
+            "{bare:?} answered {:?} for its neighbour",
+            held.get(&bare)
+        );
+    }
+
+    #[test]
+    fn the_starting_map_offers_every_raw_material() {
+        let mut app = started_map();
+
+        let held: HashSet<RawMaterial> = deposits(&mut app)
+            .values()
+            .map(|deposit| deposit.material)
+            .collect();
+
+        for material in [
+            RawMaterial::Ice,
+            RawMaterial::CarbonMonoxide,
+            RawMaterial::Nitrogen,
+            RawMaterial::Silicon,
+            RawMaterial::CobaltOre,
+        ] {
+            assert!(
+                held.contains(&material),
+                "no chain can start at {material:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_starting_map_comes_up_on_every_run() {
+        let mut one = started_map();
+        let mut again = started_map();
+
+        assert_eq!(deposits(&mut one), deposits(&mut again));
+    }
+
+    #[test]
+    fn a_deposit_stands_where_its_tile_stands() {
+        let mut app = started_map();
+        let ice = offset(ICE_TILE);
+
+        let mut query = app.world_mut().query::<(&MapTile, &Transform, &Deposit)>();
+        let standing = query
+            .iter(app.world())
+            .find(|(tile, _, _)| tile.coordinates == ice)
+            .map(|(_, transform, _)| transform.translation);
+
+        assert_eq!(standing, Some(ice.world_position()));
     }
 }
