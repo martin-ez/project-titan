@@ -1,6 +1,6 @@
 use crate::common::cursor::{CursorHit, CursorRayCast};
-use crate::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
 use crate::map::{LatticeNode, MapTile};
+use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
 use bevy::ecs::system::SystemParam;
 use bevy::input::InputSystems;
 use bevy::prelude::*;

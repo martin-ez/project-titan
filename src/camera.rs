@@ -1,5 +1,5 @@
 use crate::input::{CameraMovement, PlayerInput};
-use crate::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
+use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use std::f32::consts::{PI, TAU};
