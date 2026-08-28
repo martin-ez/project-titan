@@ -36,13 +36,19 @@ the ones to use. It also draws Oxygen and Dioxygen as two items, and they are
 one here: the same substance twice cannot close, and folding them together is
 what lets the oxygen a carbon plant hands back feed the plant that spent it.
 
+Where the picture draws a Solar Panel, this tree builds a Fuel Cell. Sunlight is
+a thin thing to plan a base around under an atmosphere thick enough to need
+terraforming, and a cell runs on what the tree already makes. What the tree has
+no notion of is power itself: a Fuel Cell is a part the Hydroponics Bay is built
+from, and once it is standing nothing generates or draws anything.
+
 ## Items by tier
 
 |  | Tier 1 | Tier 2 | Tier 3 | Tier 4 |
 | --- | --- | --- | --- | --- |
 | Raw materials | Ice | Carbon Monoxide, Nitrogen | Silicon | Cobalt Ore |
 | Intermediate products | Water, Hydrogen, Oxygen | Carbon Dioxide, Carbon, Ammonia | Silicon Wafer, Glass, Silicon Carbide, Activated Charcoal | Refined Cobalt, Electronics, Hydrocarbon Polymer |
-| Assemblies | | | Fertilized Soil | Battery, Solar Panel, Dome Habitat Panel |
+| Assemblies | | | Fertilized Soil | Battery, Fuel Cell, Dome Habitat Panel |
 
 The final assembly, which nothing consumes, is the **Hydroponics Bay**.
 
@@ -91,24 +97,24 @@ input, so these are the recipes with nothing on their left.
 | Inputs | Outputs | Ticks |
 | --- | --- | --- |
 | 2 Cobalt Ore | 1 Refined Cobalt | 256 |
-| 1 Silicon Wafer + 1 Refined Cobalt | 1 Electronics | 256 |
-| 2 Carbon + 4 Hydrogen | 1 Hydrocarbon Polymer | 256 |
+| 2 Silicon Wafer + 1 Refined Cobalt | 1 Electronics | 256 |
+| 3 Carbon + 6 Hydrogen | 1 Hydrocarbon Polymer | 256 |
 | 1 Refined Cobalt + 1 Silicon Carbide + 1 Hydrocarbon Polymer | 1 Battery | 512 |
-| 2 Silicon Wafer + 2 Electronics + 2 Battery | 1 Solar Panel | 512 |
+| 2 Silicon Carbide + 2 Electronics + 2 Refined Cobalt | 1 Fuel Cell | 512 |
 | 2 Glass + 1 Battery + 1 Hydrocarbon Polymer | 1 Dome Habitat Panel | 512 |
 
 ### Final assembly
 
 | Inputs | Outputs | Ticks |
 | --- | --- | --- |
-| 2 Solar Panel + 4 Dome Habitat Panel + 4 Fertilized Soil | 1 Hydroponics Bay | 1024 |
+| 2 Fuel Cell + 4 Dome Habitat Panel + 4 Fertilized Soil | 1 Hydroponics Bay | 1024 |
 
 ## A balanced chain
 
 One Hydroponics Bay every 1024 ticks, with every building running without
-starving and without idling, is fifty buildings. Each row's output is exactly
-what the rows above it consume, so a row's count is its demand divided by what
-one building of it produces — which is why none of them is a fraction.
+starving and without idling, is forty-seven buildings. Each row's output is
+exactly what the rows above it consume, so a row's count is its demand divided
+by what one building of it produces — which is why none of them is a fraction.
 
 | Recipe | Buildings | Runs per 1024 ticks |
 | --- | --- | --- |
@@ -128,13 +134,13 @@ one building of it produces — which is why none of them is a fraction.
 | Activated Charcoal | 1 | 8 |
 | Refined Cobalt | 3 | 12 |
 | Electronics | 1 | 4 |
-| Hydrocarbon Polymer | 3 | 12 |
+| Hydrocarbon Polymer | 2 | 8 |
 | Fertilized Soil | 1 | 4 |
-| Battery | 4 | 8 |
-| Solar Panel | 1 | 2 |
+| Battery | 2 | 4 |
+| Fuel Cell | 1 | 2 |
 | Dome Habitat Panel | 2 | 4 |
 | Hydroponics Bay | 1 | 1 |
-| **Total** | **50** | |
+| **Total** | **47** | |
 
 Oxygen is a loop rather than a line, and that is the shape worth keeping if
 these numbers are ever retuned. Making carbon dioxide spends it and taking the
