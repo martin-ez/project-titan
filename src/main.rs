@@ -4,11 +4,11 @@ mod camera;
 mod common;
 mod diagnostics;
 mod input;
-mod legend;
 mod map;
 mod road;
 mod rover;
 mod simulation;
+mod ui;
 #[cfg(test)]
 mod testing;
 
@@ -21,11 +21,11 @@ fn main() {
         .add_plugins(diagnostics::DebugGizmosPlugin)
         .add_plugins(diagnostics::DiagnosticsPlugin)
         .add_plugins(input::PlayerInputPlugin)
-        .add_plugins(legend::LegendPlugin)
         .add_plugins(map::MapPlugin)
         .add_plugins(road::RoadPlugin)
         .add_plugins(rover::RoverPlugin)
         .add_plugins(simulation::SimulationPlugin)
+        .add_plugins(ui::legend::LegendPlugin)
         .add_systems(Startup, setup_test_scene)
         .run();
 }
