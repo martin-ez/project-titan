@@ -2,8 +2,10 @@
 //!
 //! A binding is declared by the plugin that owns it, from the same table that plugin's systems
 //! read to decide what a press does, so a key cannot start working without saying what it is for.
-//! The legend renders those declarations and nothing else: adding a command adds its row, and
-//! there is no second list to forget. It is drawn in `bevy_ui` nodes rather than Bevy's
+//! The legend renders those declarations: adding a command adds its row, and there is no second
+//! list to forget. The one thing on the panel that is not a binding is a heading naming what the
+//! tool holding it is set to place, because a key that steps through a catalogue says what it does
+//! without saying where it has got to. It is drawn in `bevy_ui` nodes rather than Bevy's
 //! `bevy_feathers` widgets, an editor set and not a game's, for the reasons [`crate::ui`] gives.
 //! A row is then a pair of text nodes under a panel rather than a line of a formatted string,
 //! which is what lets a column line up and a heading read differently from the rows beneath it.
@@ -28,6 +30,8 @@ const ROW_GAP: f32 = 2.0;
 const HEADING_GAP: f32 = 10.0;
 /// How wide the column naming what the player presses is, in logical pixels
 const KEY_COLUMN_WIDTH: f32 = 92.0;
+/// How wide the panel is, in logical pixels, held fixed so no heading can resize it
+const PANEL_WIDTH: f32 = 320.0;
 /// How large the legend's text is, in logical pixels
 const TEXT_SIZE: f32 = 12.0;
 /// The colour a heading is written in
@@ -215,6 +219,7 @@ fn panel() -> impl Bundle {
             position_type: PositionType::Absolute,
             top: Val::Px(PANEL_INSET),
             left: Val::Px(PANEL_INSET),
+            width: Val::Px(PANEL_WIDTH),
             flex_direction: FlexDirection::Column,
             padding: UiRect::all(Val::Px(PANEL_PADDING)),
             row_gap: Val::Px(ROW_GAP),
@@ -328,6 +333,8 @@ fn key_label(key: KeyCode) -> String {
         KeyCode::KeyA => "A",
         KeyCode::KeyS => "S",
         KeyCode::KeyD => "D",
+        KeyCode::KeyQ => "Q",
+        KeyCode::KeyE => "E",
         KeyCode::ShiftLeft => "Shift",
         KeyCode::ControlLeft => "Ctrl",
         KeyCode::Space => "Space",
@@ -520,6 +527,43 @@ mod tests {
             .expect("the binding is named");
 
         assert!(heading < row, "{legend}");
+    }
+
+    #[test]
+    fn a_bound_key_is_named_as_it_is_printed_on_the_keyboard() {
+        let mut app = legend_app();
+        declare(
+            &mut app,
+            [Binding {
+                input: BindingInput::Key(KeyCode::KeyQ),
+                action: "Choose the type before this one",
+                context: BindingContext::Always,
+            }],
+        );
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        let legend = shown_legend(&mut app);
+
+        assert!(legend.contains('Q'), "{legend}");
+        assert!(!legend.contains("KeyQ"), "{legend}");
+    }
+
+    #[test]
+    fn the_panel_is_not_sized_by_the_type_the_player_chose() {
+        let mut app = building_legend_app();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        let panel = legend_panel(&mut app);
+        let width = app
+            .world()
+            .entity(panel)
+            .get::<Node>()
+            .expect("a panel")
+            .width;
+
+        assert!(matches!(width, Val::Px(_)), "{width:?}");
     }
 
     /// A legend over a game holding the building tool, which is what names a type to place.
