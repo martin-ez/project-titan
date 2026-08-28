@@ -8,9 +8,9 @@ mod map;
 mod road;
 mod rover;
 mod simulation;
-mod ui;
 #[cfg(test)]
 mod testing;
+mod ui;
 
 fn main() {
     App::new()

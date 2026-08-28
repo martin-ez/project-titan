@@ -1,19 +1,39 @@
-//! Every command the game answers to, named on screen while it is being play tested.
+//! Every command the game answers to, named on screen for the player who is looking for one.
 //!
 //! A binding is declared by the plugin that owns it, from the same table that plugin's systems
 //! read to decide what a press does, so a key cannot start working without saying what it is for.
 //! The legend renders those declarations and nothing else: adding a command adds its row, and
-//! there is no second list to forget. This is a debug view under invariant 5, drawn in plain text
-//! on the footing the diagnostics overlay already stands on. Choosing the widget layer a player
-//! will read is #59's, and nothing here decides it.
+//! there is no second list to forget. A row is a pair of text nodes under a panel rather than a
+//! line of a formatted string, which is what lets a column line up and a heading read differently
+//! from the rows beneath it.
 
 use crate::input::PlayerAction;
 use bevy::prelude::*;
 
 /// Key binding that shows and hides the legend
 const LEGEND_KEY: KeyCode = KeyCode::F1;
-/// Whether the legend is on screen when the game opens
-const LEGEND_AT_STARTUP: bool = cfg!(debug_assertions);
+/// How far the panel sits from the corner of the screen, in logical pixels
+const PANEL_INSET: f32 = 8.0;
+/// How much space the panel keeps between its edge and its rows, in logical pixels
+const PANEL_PADDING: f32 = 10.0;
+/// How round the panel's corners are, in logical pixels
+const PANEL_RADIUS: f32 = 4.0;
+/// What the panel is drawn on, dark enough to read text over whatever the world puts behind it
+const PANEL_BACKGROUND: Color = Color::srgba(0.04, 0.04, 0.06, 0.85);
+/// How much space sits between one row and the next, in logical pixels
+const ROW_GAP: f32 = 2.0;
+/// How much space sits above a heading, holding it off the rows before it, in logical pixels
+const HEADING_GAP: f32 = 10.0;
+/// How wide the column naming what the player presses is, in logical pixels
+const KEY_COLUMN_WIDTH: f32 = 92.0;
+/// How large the legend's text is, in logical pixels
+const TEXT_SIZE: f32 = 12.0;
+/// The colour a heading is written in
+const HEADING_COLOR: Color = Color::srgb(0.62, 0.78, 0.98);
+/// The colour a key is written in
+const KEY_COLOR: Color = Color::srgb(0.98, 0.90, 0.66);
+/// The colour an action is written in
+const ACTION_COLOR: Color = Color::srgb(0.86, 0.87, 0.90);
 
 /// What the player presses to reach a command.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -86,7 +106,7 @@ impl Plugin for LegendPlugin {
                 action: "Show or hide this legend",
                 context: BindingContext::Always,
             }])
-            .add_systems(Startup, open_the_legend.run_if(|| LEGEND_AT_STARTUP))
+            .add_systems(Startup, open_the_legend)
             .add_systems(
                 Update,
                 (
@@ -128,13 +148,21 @@ fn toggle_the_legend(
 }
 
 /// Rewrite the legend when the player picks up another tool, which changes what is on offer.
+///
+/// The panel keeps its entity, and only its rows are built again, so a legend already on screen
+/// stays the one on screen rather than blinking out and back.
 fn redraw_the_legend(
+    mut commands: Commands,
     bindings: Res<PlayerBindings>,
     held: Res<State<PlayerAction>>,
-    mut legend_q: Query<&mut Text, With<Legend>>,
+    legend_q: Query<Entity, With<Legend>>,
 ) {
-    for mut text in &mut legend_q {
-        text.0 = legend_text(&bindings, Some(*held.get()));
+    let held = Some(*held.get());
+    for legend in &legend_q {
+        commands
+            .entity(legend)
+            .despawn_related::<Children>()
+            .with_children(|panel| fill_the_panel(panel, &bindings, held));
     }
 }
 
@@ -143,34 +171,84 @@ fn held_tool(held: Option<&State<PlayerAction>>) -> Option<PlayerAction> {
 }
 
 fn spawn_legend(commands: &mut Commands, bindings: &PlayerBindings, held: Option<PlayerAction>) {
-    commands.spawn((
-        Legend,
-        Text(legend_text(bindings, held)),
-        TextFont {
-            font_size: FontSize::Px(12.0),
-            ..default()
-        },
+    commands
+        .spawn((Legend, panel()))
+        .with_children(|panel| fill_the_panel(panel, bindings, held));
+}
+
+fn panel() -> impl Bundle {
+    (
         Node {
             position_type: PositionType::Absolute,
-            top: Val::Px(8.0),
-            left: Val::Px(8.0),
+            top: Val::Px(PANEL_INSET),
+            left: Val::Px(PANEL_INSET),
+            flex_direction: FlexDirection::Column,
+            padding: UiRect::all(Val::Px(PANEL_PADDING)),
+            row_gap: Val::Px(ROW_GAP),
+            border_radius: BorderRadius::all(Val::Px(PANEL_RADIUS)),
             ..default()
         },
-    ));
+        BackgroundColor(PANEL_BACKGROUND),
+    )
 }
 
 /// Lay the declared bindings out, the ones on offer whatever is held first and a tool's own after.
-fn legend_text(bindings: &PlayerBindings, held: Option<PlayerAction>) -> String {
-    let mut text = String::new();
-    for context in contexts_in_declaration_order(bindings) {
-        text.push_str(&heading(context, held));
-        text.push('\n');
+fn fill_the_panel(
+    panel: &mut ChildSpawnerCommands,
+    bindings: &PlayerBindings,
+    held: Option<PlayerAction>,
+) {
+    for (place, context) in contexts_in_declaration_order(bindings)
+        .into_iter()
+        .enumerate()
+    {
+        panel.spawn(heading_row(heading(context, held), place));
         for binding in bindings.0.iter().filter(|it| it.context == context) {
-            let key = input_label(binding.input);
-            text.push_str(&format!("  {key:<12}{}\n", binding.action));
+            panel.spawn(row()).with_children(|row| {
+                row.spawn(cell(
+                    input_label(binding.input),
+                    KEY_COLOR,
+                    Val::Px(KEY_COLUMN_WIDTH),
+                ));
+                row.spawn(cell(binding.action.to_string(), ACTION_COLOR, Val::Auto));
+            });
         }
     }
-    text
+}
+
+fn heading_row(heading: String, place: usize) -> impl Bundle {
+    (
+        Node {
+            margin: UiRect::top(Val::Px(if place == 0 { 0.0 } else { HEADING_GAP })),
+            ..default()
+        },
+        Text(heading),
+        legend_font(),
+        TextColor(HEADING_COLOR),
+    )
+}
+
+fn row() -> impl Bundle {
+    Node {
+        flex_direction: FlexDirection::Row,
+        ..default()
+    }
+}
+
+fn cell(text: String, color: Color, width: Val) -> impl Bundle {
+    (
+        Node { width, ..default() },
+        Text(text),
+        legend_font(),
+        TextColor(color),
+    )
+}
+
+fn legend_font() -> TextFont {
+    TextFont {
+        font_size: FontSize::Px(TEXT_SIZE),
+        ..default()
+    }
 }
 
 fn contexts_in_declaration_order(bindings: &PlayerBindings) -> Vec<BindingContext> {
@@ -251,14 +329,34 @@ mod tests {
             .count()
     }
 
-    fn shown_legend(app: &mut App) -> String {
+    fn legend_panel(app: &mut App) -> Entity {
         app.world_mut()
-            .query_filtered::<&Text, With<Legend>>()
+            .query_filtered::<Entity, With<Legend>>()
             .iter(app.world())
             .next()
             .expect("a legend is on screen")
-            .0
-            .clone()
+    }
+
+    fn legend_lines(app: &mut App) -> Vec<String> {
+        let panel = legend_panel(app);
+        let mut lines = Vec::new();
+        collect_text(app.world(), panel, &mut lines);
+        lines
+    }
+
+    fn collect_text(world: &World, entity: Entity, lines: &mut Vec<String>) {
+        if let Some(text) = world.get::<Text>(entity) {
+            lines.push(text.0.clone());
+        }
+        if let Some(children) = world.get::<Children>(entity) {
+            for child in children.iter() {
+                collect_text(world, child, lines);
+            }
+        }
+    }
+
+    fn shown_legend(app: &mut App) -> String {
+        legend_lines(app).join("\n")
     }
 
     fn declare(app: &mut App, bindings: impl IntoIterator<Item = Binding>) {
@@ -284,24 +382,13 @@ mod tests {
         tick(app);
     }
 
-    #[cfg(debug_assertions)]
     #[test]
-    fn a_development_build_opens_with_the_legend_on() {
+    fn the_legend_is_on_screen_when_the_game_opens() {
         let mut app = legend_app();
 
         tick(&mut app);
 
         assert_eq!(legends(&mut app), 1);
-    }
-
-    #[cfg(not(debug_assertions))]
-    #[test]
-    fn a_release_build_opens_with_the_legend_off() {
-        let mut app = legend_app();
-
-        tick(&mut app);
-
-        assert_eq!(legends(&mut app), 0);
     }
 
     #[test]
@@ -438,5 +525,54 @@ mod tests {
 
         assert!(legend.contains("Shift"), "{legend}");
         assert!(!legend.contains("ShiftLeft"), "{legend}");
+    }
+
+    #[test]
+    fn a_row_names_its_key_and_its_action_in_separate_nodes() {
+        let mut app = legend_app();
+        declare(
+            &mut app,
+            [Binding {
+                input: BindingInput::Mouse(MouseButton::Left),
+                action: "Place a road node",
+                context: BindingContext::Always,
+            }],
+        );
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        let lines = legend_lines(&mut app);
+
+        assert!(lines.iter().any(|line| line == "Click"), "{lines:?}");
+        assert!(
+            lines.iter().any(|line| line == "Place a road node"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn picking_up_a_tool_redraws_the_same_panel() {
+        let mut app = legend_app();
+        app.insert_state(PlayerAction::Select);
+        declare(
+            &mut app,
+            [Binding {
+                input: BindingInput::Mouse(MouseButton::Left),
+                action: "Place a road node",
+                context: BindingContext::Tool(PlayerAction::EditRoads),
+            }],
+        );
+        tick(&mut app);
+        show_a_legend(&mut app);
+        let panel = legend_panel(&mut app);
+
+        app.world_mut()
+            .resource_mut::<NextState<PlayerAction>>()
+            .set(PlayerAction::EditRoads);
+        tick(&mut app);
+
+        assert_eq!(legend_panel(&mut app), panel);
+        let legend = shown_legend(&mut app);
+        assert!(legend.contains("(held)"), "{legend}");
     }
 }
