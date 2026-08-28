@@ -1,7 +1,100 @@
 **Warning: This is a work in progress.** It will likely evolve as I develop and
 play test the game.
 
-# ![Production Tree](../assets/docs/production_tree.png)
+# Production tree
+
+```mermaid
+flowchart LR
+  ICE([Ice])
+  CMON([Carbon Monoxide])
+  NITRO([Nitrogen])
+  SILI([Silicon])
+  COBORE([Cobalt Ore])
+
+  WATER[Water]
+  ELYSIS{{electrolysis}}
+  HYD[Hydrogen]
+  OXY[Oxygen]
+  CDIOX[Carbon Dioxide]
+  CCAPT{{carbon capture}}
+  CARB[Carbon]
+  AMMO[Ammonia]
+  WAFER[Silicon Wafer]
+  GLASS[Glass]
+  SICARB[Silicon Carbide]
+  CHARC[Activated Charcoal]
+  RCOB[Refined Cobalt]
+  ELECT[Electronics]
+  POLY[Hydrocarbon Polymer]
+
+  SOIL[Fertilized Soil]
+  BATT[Battery]
+  FCELL[Fuel Cell]
+  DOME[Dome Habitat Panel]
+  BAY[Hydroponics Bay]
+  ATMOS[/Atmosphere/]
+
+  ICE --> WATER
+  WATER --> ELYSIS
+  ELYSIS --> HYD
+  ELYSIS --> OXY
+  CMON --> CDIOX
+  OXY --> CDIOX
+  CDIOX --> CCAPT
+  CCAPT --> CARB
+  CCAPT --> OXY
+  NITRO --> AMMO
+  HYD --> AMMO
+  SILI --> WAFER
+  SILI --> GLASS
+  OXY --> GLASS
+  SILI --> SICARB
+  CARB --> SICARB
+  CARB --> CHARC
+  WATER --> SOIL
+  AMMO --> SOIL
+  CHARC --> SOIL
+  COBORE --> RCOB
+  WAFER --> ELECT
+  RCOB --> ELECT
+  CARB --> POLY
+  HYD --> POLY
+  RCOB --> BATT
+  SICARB --> BATT
+  POLY --> BATT
+  SICARB --> FCELL
+  ELECT --> FCELL
+  RCOB --> FCELL
+  GLASS --> DOME
+  BATT --> DOME
+  POLY --> DOME
+  FCELL --> BAY
+  DOME --> BAY
+  SOIL --> BAY
+  OXY -.-> ATMOS
+
+  classDef raw fill:#cfe6fb,stroke:#5b7fa6,color:#10233a
+  classDef mid fill:#ded7fb,stroke:#6f63a8,color:#1b1442
+  classDef split fill:#f4f2ff,stroke:#6f63a8,color:#1b1442
+  classDef asm fill:#f6d4f2,stroke:#a763a0,color:#3d1039
+  classDef fin fill:#b9e8de,stroke:#4f9d8c,color:#0d3a31
+  classDef vent fill:#e4ebe7,stroke:#7f8d87,color:#1d2b25
+
+  class ICE,CMON,NITRO,SILI,COBORE raw
+  class WATER,HYD,OXY,CDIOX,CARB,AMMO,WAFER,GLASS,SICARB,CHARC,RCOB,ELECT,POLY mid
+  class ELYSIS,CCAPT split
+  class SOIL,BATT,FCELL,DOME asm
+  class BAY fin
+  class ATMOS vent
+```
+
+Rounded is a raw material, square an intermediate, pink an assembly. The two
+hexagons are the recipes that split, drawn as one step so that both of their
+outputs visibly come from it. The dotted edge is the only thing the chain makes
+and cannot use.
+
+The diagram is the shape and the tables below are the numbers, which is the one
+place this file can drift from itself: an edge here has to be a row there.
 
 ## How to read this
 
@@ -30,14 +123,25 @@ ladder the quantities are chosen so that a chain sustaining one Hydroponics Bay
 uses a whole number of every building, which is what makes the balance at the
 bottom of this file a count rather than an impression.
 
-The picture above labels the Dome Habitat Panel "Drone Habitat Panel", and names
-Refined Cobalt by its process, "Refine Cobalt (Co)". The names in this file are
-the ones to use. It also draws Oxygen and Dioxygen as two items, and they are
-one here: the same substance twice cannot close, and folding them together is
-what lets the oxygen a carbon plant hands back feed the plant that spent it.
+## Where this departs from the sketch
 
-Where the picture draws a Solar Panel, this tree builds a Fuel Cell. Sunlight is
-a thin thing to plan a base around under an atmosphere thick enough to need
+`assets/docs/production_tree.png` is the drawing this tree grew out of. The
+diagram above has moved past it in three places and reconciles two names; where
+the two disagree, this file is the one to believe.
+
+It labels the Dome Habitat Panel "Drone Habitat Panel", and names Refined Cobalt
+by its process, "Refine Cobalt (Co)". The names in this file are the ones to
+use.
+
+It draws Oxygen and Dioxygen as two items, and they are one here. The same
+substance twice cannot close, and folding them together is what lets the oxygen
+a carbon plant hands back feed the plant that spent it.
+
+It makes glass out of silicon alone. Glass is silica, so it takes oxygen as
+well, which is what ties the ice branch to the silicon branch.
+
+Where it draws a Solar Panel, this tree builds a Fuel Cell. Sunlight is a thin
+thing to plan a base around under an atmosphere thick enough to need
 terraforming, and a cell runs on what the tree already makes. What the tree has
 no notion of is power itself: a Fuel Cell is a part the Hydroponics Bay is built
 from, and once it is standing nothing generates or draws anything.
