@@ -53,6 +53,22 @@ const OUTLET_CORNERS: [TileCorner; 3] = [
     TileCorner::SouthEast,
 ];
 
+const _: () = {
+    let mut index = 0;
+    while index < BuildingType::ALL.len() {
+        let recipe = BuildingType::ALL[index].recipe();
+        assert!(
+            recipe.inputs.len() <= INTAKE_CORNERS.len(),
+            "a type takes in more items than there are corners to take them in on"
+        );
+        assert!(
+            recipe.outputs.len() <= OUTLET_CORNERS.len(),
+            "a type puts out more items than there are corners to hand them out on"
+        );
+        index += 1;
+    }
+};
+
 /// The keys that step through the catalogue, and how far each steps through it.
 const CHOOSE_KEYS: [(KeyCode, isize); 2] = [(KeyCode::KeyQ, -1), (KeyCode::KeyE, 1)];
 
@@ -207,7 +223,7 @@ const fn assembler(inputs: &'static [Stack], outputs: &'static [Stack]) -> Build
     BuildingType::Assembler(Recipe { inputs, outputs })
 }
 
-fn extracted(material: RawMaterial) -> &'static [Stack] {
+const fn extracted(material: RawMaterial) -> &'static [Stack] {
     match material {
         RawMaterial::Ice => const { &[stack(1, Item::Raw(RawMaterial::Ice))] },
         RawMaterial::CarbonMonoxide => {
@@ -372,7 +388,7 @@ impl BuildingType {
     ///
     /// An extractor draws what it stands on rather than taking anything in, so it is the same
     /// machine as an assembler with an empty left-hand side rather than a second kind of thing.
-    pub fn recipe(self) -> Recipe {
+    pub const fn recipe(self) -> Recipe {
         match self {
             Self::Extractor(material) => Recipe {
                 inputs: &[],
@@ -386,7 +402,8 @@ impl BuildingType {
     ///
     /// Derived from the recipe rather than declared beside it, so a type whose ports do not cover
     /// what it takes and makes cannot be written down: an intake per item consumed, an outlet per
-    /// item produced, and the corners taken in the order the recipe names them.
+    /// item produced, and the corners taken in the order the recipe names them. A recipe too wide
+    /// for the corners to cover fails to compile rather than losing the items it has no room for.
     pub fn ports(self) -> impl Iterator<Item = (TileCorner, Port)> {
         let recipe = self.recipe();
         let intakes = recipe.inputs.iter().zip(INTAKE_CORNERS);
