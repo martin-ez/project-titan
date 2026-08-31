@@ -2,12 +2,15 @@
 //!
 //! A binding is declared by the plugin that owns it, from the same table that plugin's systems
 //! read to decide what a press does, so a key cannot start working without saying what it is for.
-//! The legend renders those declarations and nothing else: adding a command adds its row, and
-//! there is no second list to forget. It is drawn in `bevy_ui` nodes rather than Bevy's
+//! The legend renders those declarations: adding a command adds its row, and there is no second
+//! list to forget. The one thing on the panel that is not a binding is a heading naming what the
+//! tool holding it is set to place, because a key that steps through a catalogue says what it does
+//! without saying where it has got to. It is drawn in `bevy_ui` nodes rather than Bevy's
 //! `bevy_feathers` widgets, an editor set and not a game's, for the reasons [`crate::ui`] gives.
 //! A row is then a pair of text nodes under a panel rather than a line of a formatted string,
 //! which is what lets a column line up and a heading read differently from the rows beneath it.
 
+use crate::building::ChosenBuildingType;
 use crate::input::PlayerAction;
 use bevy::prelude::*;
 
@@ -27,6 +30,8 @@ const ROW_GAP: f32 = 2.0;
 const HEADING_GAP: f32 = 10.0;
 /// How wide the column naming what the player presses is, in logical pixels
 const KEY_COLUMN_WIDTH: f32 = 92.0;
+/// How wide the panel is, in logical pixels, held fixed so no heading can resize it
+const PANEL_WIDTH: f32 = 320.0;
 /// How large the legend's text is, in logical pixels
 const TEXT_SIZE: f32 = 12.0;
 /// The colour a heading is written in
@@ -112,7 +117,10 @@ impl Plugin for LegendPlugin {
                 Update,
                 (
                     toggle_the_legend,
-                    redraw_the_legend.run_if(resource_exists_and_changed::<State<PlayerAction>>),
+                    redraw_the_legend.run_if(
+                        resource_exists_and_changed::<State<PlayerAction>>
+                            .or_else(resource_exists_and_changed::<ChosenBuildingType>),
+                    ),
                 ),
             );
     }
@@ -125,8 +133,15 @@ fn open_the_legend(
     mut commands: Commands,
     bindings: Res<PlayerBindings>,
     held: Option<Res<State<PlayerAction>>>,
+    chosen: Option<Res<ChosenBuildingType>>,
 ) {
-    spawn_legend(&mut commands, &bindings, held_tool(held.as_deref()));
+    let held = held_tool(held.as_deref());
+    spawn_legend(
+        &mut commands,
+        &bindings,
+        held,
+        placing(chosen.as_deref(), held),
+    );
 }
 
 fn toggle_the_legend(
@@ -134,36 +149,45 @@ fn toggle_the_legend(
     input: Res<ButtonInput<KeyCode>>,
     bindings: Res<PlayerBindings>,
     held: Option<Res<State<PlayerAction>>>,
+    chosen: Option<Res<ChosenBuildingType>>,
     legend_q: Query<Entity, With<Legend>>,
 ) {
     if !input.just_pressed(LEGEND_KEY) {
         return;
     }
 
+    let held = held_tool(held.as_deref());
     match legend_q.iter().next() {
         Some(legend) => {
             commands.entity(legend).despawn();
         }
-        None => spawn_legend(&mut commands, &bindings, held_tool(held.as_deref())),
+        None => spawn_legend(
+            &mut commands,
+            &bindings,
+            held,
+            placing(chosen.as_deref(), held),
+        ),
     }
 }
 
-/// Rewrite the legend when the player picks up another tool, which changes what is on offer.
+/// Rewrite the legend when the player picks up another tool or chooses another thing to build.
 ///
 /// The panel keeps its entity, and only its rows are built again, so a legend already on screen
 /// stays the one on screen rather than blinking out and back.
 fn redraw_the_legend(
     mut commands: Commands,
     bindings: Res<PlayerBindings>,
-    held: Res<State<PlayerAction>>,
+    held: Option<Res<State<PlayerAction>>>,
+    chosen: Option<Res<ChosenBuildingType>>,
     legend_q: Query<Entity, With<Legend>>,
 ) {
-    let held = Some(*held.get());
+    let held = held_tool(held.as_deref());
+    let placing = placing(chosen.as_deref(), held);
     for legend in &legend_q {
         commands
             .entity(legend)
             .despawn_related::<Children>()
-            .with_children(|panel| fill_the_panel(panel, &bindings, held));
+            .with_children(|panel| fill_the_panel(panel, &bindings, held, placing.as_deref()));
     }
 }
 
@@ -171,10 +195,22 @@ fn held_tool(held: Option<&State<PlayerAction>>) -> Option<PlayerAction> {
     held.map(|state| *state.get())
 }
 
-fn spawn_legend(commands: &mut Commands, bindings: &PlayerBindings, held: Option<PlayerAction>) {
+fn placing(chosen: Option<&ChosenBuildingType>, held: Option<PlayerAction>) -> Option<String> {
+    if held != Some(PlayerAction::EditBuildings) {
+        return None;
+    }
+    chosen.map(|chosen| chosen.chosen().label())
+}
+
+fn spawn_legend(
+    commands: &mut Commands,
+    bindings: &PlayerBindings,
+    held: Option<PlayerAction>,
+    placing: Option<String>,
+) {
     commands
         .spawn((Legend, panel()))
-        .with_children(|panel| fill_the_panel(panel, bindings, held));
+        .with_children(|panel| fill_the_panel(panel, bindings, held, placing.as_deref()));
 }
 
 fn panel() -> impl Bundle {
@@ -183,6 +219,7 @@ fn panel() -> impl Bundle {
             position_type: PositionType::Absolute,
             top: Val::Px(PANEL_INSET),
             left: Val::Px(PANEL_INSET),
+            width: Val::Px(PANEL_WIDTH),
             flex_direction: FlexDirection::Column,
             padding: UiRect::all(Val::Px(PANEL_PADDING)),
             row_gap: Val::Px(ROW_GAP),
@@ -198,12 +235,13 @@ fn fill_the_panel(
     panel: &mut ChildSpawnerCommands,
     bindings: &PlayerBindings,
     held: Option<PlayerAction>,
+    placing: Option<&str>,
 ) {
     for (place, context) in contexts_in_declaration_order(bindings)
         .into_iter()
         .enumerate()
     {
-        panel.spawn(heading_row(heading(context, held), place));
+        panel.spawn(heading_row(heading(context, held, placing), place));
         for binding in bindings.0.iter().filter(|it| it.context == context) {
             panel.spawn(row()).with_children(|row| {
                 row.spawn(cell(
@@ -263,11 +301,18 @@ fn contexts_in_declaration_order(bindings: &PlayerBindings) -> Vec<BindingContex
     seen
 }
 
-fn heading(context: BindingContext, held: Option<PlayerAction>) -> String {
-    match context {
-        BindingContext::Always => "Anytime".to_string(),
-        BindingContext::Tool(tool) if held == Some(tool) => format!("{} (held)", tool.label()),
-        BindingContext::Tool(tool) => tool.label().to_string(),
+/// What the rows beneath it are for, and what the held tool is set to place.
+///
+/// A tool that places whatever it last placed, with no way to see which that is, is one the
+/// player builds by trial and error, so the heading of the held tool names the choice it carries.
+fn heading(context: BindingContext, held: Option<PlayerAction>, placing: Option<&str>) -> String {
+    match (context, placing) {
+        (BindingContext::Always, _) => "Anytime".to_string(),
+        (BindingContext::Tool(tool), Some(placing)) if held == Some(tool) => {
+            format!("{} (held) — {placing}", tool.label())
+        }
+        (BindingContext::Tool(tool), _) if held == Some(tool) => format!("{} (held)", tool.label()),
+        (BindingContext::Tool(tool), _) => tool.label().to_string(),
     }
 }
 
@@ -288,6 +333,9 @@ fn key_label(key: KeyCode) -> String {
         KeyCode::KeyA => "A",
         KeyCode::KeyS => "S",
         KeyCode::KeyD => "D",
+        KeyCode::KeyQ => "Q",
+        KeyCode::KeyE => "E",
+        KeyCode::KeyR => "R",
         KeyCode::ShiftLeft => "Shift",
         KeyCode::ControlLeft => "Ctrl",
         KeyCode::Space => "Space",
@@ -315,6 +363,7 @@ fn mouse_label(button: MouseButton) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::TURN_KEY;
     use crate::testing::{headless_app, press_key, release_key, tick};
 
     fn legend_app() -> App {
@@ -483,6 +532,80 @@ mod tests {
     }
 
     #[test]
+    fn the_panel_is_not_sized_by_the_type_the_player_chose() {
+        let mut app = building_legend_app();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        let panel = legend_panel(&mut app);
+        let width = app
+            .world()
+            .entity(panel)
+            .get::<Node>()
+            .expect("a panel")
+            .width;
+
+        assert!(matches!(width, Val::Px(_)), "{width:?}");
+    }
+
+    /// A legend over a game holding the building tool, which is what names a type to place.
+    fn building_legend_app() -> App {
+        let mut app = headless_app();
+        app.insert_state(PlayerAction::EditBuildings)
+            .init_resource::<ChosenBuildingType>()
+            .add_plugins(LegendPlugin);
+        declare(
+            &mut app,
+            [Binding {
+                input: BindingInput::Mouse(MouseButton::Left),
+                action: "Put a building on the tile",
+                context: BindingContext::Tool(PlayerAction::EditBuildings),
+            }],
+        );
+        app
+    }
+
+    #[test]
+    fn the_legend_names_the_type_the_building_tool_will_place() {
+        let mut app = building_legend_app();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        let legend = shown_legend(&mut app);
+
+        let placing = app
+            .world()
+            .resource::<ChosenBuildingType>()
+            .chosen()
+            .label();
+        assert!(legend.contains(&placing), "{legend}");
+    }
+
+    #[test]
+    fn the_legend_follows_the_player_stepping_to_another_type() {
+        let mut app = building_legend_app();
+        tick(&mut app);
+        show_a_legend(&mut app);
+        let before = app
+            .world()
+            .resource::<ChosenBuildingType>()
+            .chosen()
+            .label();
+
+        app.world_mut().resource_mut::<ChosenBuildingType>().step(1);
+        tick(&mut app);
+
+        let after = app
+            .world()
+            .resource::<ChosenBuildingType>()
+            .chosen()
+            .label();
+        let legend = shown_legend(&mut app);
+        assert!(legend.contains(&after), "{legend}");
+        assert!(!legend.contains(&before), "{legend}");
+    }
+
+    #[test]
     fn no_two_bindings_claim_the_same_input_in_the_same_context() {
         let mut app = headless_app();
         app.add_plugins(bevy::diagnostic::DiagnosticsPlugin)
@@ -513,11 +636,28 @@ mod tests {
         let mut app = legend_app();
         declare(
             &mut app,
-            [Binding {
-                input: BindingInput::Key(KeyCode::ShiftLeft),
-                action: "Orbit the camera",
-                context: BindingContext::Always,
-            }],
+            [
+                Binding {
+                    input: BindingInput::Key(KeyCode::ShiftLeft),
+                    action: "Orbit the camera",
+                    context: BindingContext::Always,
+                },
+                Binding {
+                    input: BindingInput::Key(KeyCode::KeyQ),
+                    action: "Choose the type before this one",
+                    context: BindingContext::Always,
+                },
+                Binding {
+                    input: BindingInput::Key(KeyCode::KeyE),
+                    action: "Choose the type after this one",
+                    context: BindingContext::Always,
+                },
+                Binding {
+                    input: BindingInput::Key(TURN_KEY),
+                    action: "Turn the building you are about to place",
+                    context: BindingContext::Always,
+                },
+            ],
         );
         tick(&mut app);
         show_a_legend(&mut app);
@@ -526,6 +666,9 @@ mod tests {
 
         assert!(legend.contains("Shift"), "{legend}");
         assert!(!legend.contains("ShiftLeft"), "{legend}");
+        assert!(!legend.contains("KeyQ"), "{legend}");
+        assert!(!legend.contains("KeyE"), "{legend}");
+        assert!(!legend.contains("KeyR"), "{legend}");
     }
 
     #[test]
