@@ -623,6 +623,7 @@ impl Plugin for RoadPlugin {
                     cut_the_roads_where_they_cross,
                     fit_the_turns_through_the_junctions,
                     join_the_legs_at_the_junctions,
+                    connect_the_endpoints,
                 )
                     .chain()
                     .in_set(RoadsLaid),
@@ -631,7 +632,7 @@ impl Plugin for RoadPlugin {
                 Update,
                 (
                     (place_a_node, remove_the_arc_under_the_cursor, lay_the_road).chain(),
-                    (connect_the_endpoints, draw_the_endpoints).chain(),
+                    draw_the_endpoints,
                     draw_the_lanes,
                     draw_the_junctions,
                     draw_the_road_being_placed,
@@ -2426,6 +2427,10 @@ fn draw_the_taken_tile_under_the_cursor(
 /// that is already on the network. One whose segment no longer reaches the place it stops at looks
 /// again, which is what a road cut under it leaves behind: the segment that was serving it answers
 /// for a shorter stretch than it did, and the place is another's to give.
+///
+/// It runs where the roads are laid rather than on the frame that draws them, because a rover
+/// routes against this on the tick: an answer written afterwards is one the rest of a frame's
+/// ticks spend routing against a network that has already moved (invariant 2).
 fn connect_the_endpoints(
     mut endpoints: Query<&mut RoadEndpoint>,
     occupied: Res<RoadTiles>,

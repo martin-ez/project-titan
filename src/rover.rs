@@ -60,6 +60,14 @@ const STRANDED_MARK: f32 = 2.;
 /// along it. Nothing here moves it.
 pub struct RoverPlugin;
 
+/// The point in a tick by which every rover has driven and handed over whatever it brought.
+///
+/// A system that acts on where a rover got to orders itself after this rather than after any one
+/// of the systems inside it, so what a rover does when it arrives is written once here and read
+/// from outside as a single moment.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RoversDriven;
+
 /// A rover, standing somewhere along the segment it is driving.
 ///
 /// Where it is is the distance, measured along the segment's own arc rather than as a fraction of
@@ -173,6 +181,7 @@ impl Plugin for RoverPlugin {
                     hand_the_load_to_the_endpoint_it_was_driven_to,
                 )
                     .chain()
+                    .in_set(RoversDriven)
                     .in_set(Simulation),
             )
             .add_systems(
@@ -188,6 +197,19 @@ impl Plugin for RoverPlugin {
                 )
                     .chain(),
             );
+    }
+}
+
+impl Rover {
+    /// Whether the rover is standing where `endpoint` is served from, which is where it arrives.
+    ///
+    /// The segment and the distance both, because an endpoint is a place along an arc rather than
+    /// a stretch of one: a rover on the right segment and short of the stop has not arrived. An
+    /// endpoint no road reaches is nowhere to arrive at, so nothing is standing at it.
+    pub fn standing_at(&self, endpoint: &RoadEndpoint) -> bool {
+        endpoint
+            .served_by()
+            .is_some_and(|served| served.segment == self.segment && served.along == self.along)
     }
 }
 
@@ -495,11 +517,7 @@ fn hand_the_load_to_the_endpoint_it_was_driven_to(
     for (entity, standing, route, load) in &rovers {
         let arrived = endpoints
             .get(route.destination)
-            .ok()
-            .and_then(RoadEndpoint::served_by)
-            .is_some_and(|served| {
-                served.segment == standing.segment && served.along == standing.along
-            });
+            .is_ok_and(|endpoint| standing.standing_at(endpoint));
         if !arrived {
             continue;
         }
