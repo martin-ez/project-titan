@@ -702,7 +702,9 @@ mod tests {
     use crate::diagnostics::DebugGizmosPlugin;
     use crate::input::{PlayerAction, PlayerInput};
     use crate::map::{HexCoordinates, LatticeNode, MAP_TILE_INRADIUS};
-    use crate::road::{EndsAtJunction, JunctionLegs, Road, RoadEndpoint, RoadPlugin, ServedBy};
+    use crate::road::{
+        EndsAtJunction, JunctionLegs, Road, RoadEndpoint, RoadPlugin, ServedBy, ROVER_ROOM,
+    };
     use crate::simulation::{SimulationPlugin, Ticks};
     use crate::testing::{advance, headless_app, tick, trace};
     use std::time::Duration;
@@ -920,6 +922,25 @@ mod tests {
 
     /// How much of its segment a rover waiting at the junction ahead of it has covered.
     const AT_THE_JUNCTION: f32 = 1.;
+
+    /// How many ticks a queue is given to settle into whatever shape the road allows.
+    ///
+    /// Long enough for a rover set down at the top of a lane to drive the length of it and come
+    /// to rest against whatever is stopping the traffic, so what is counted afterwards is where
+    /// the road put the rovers rather than where the test did.
+    const TICKS_TO_SETTLE: u32 = 2048;
+
+    /// How much of a segment a rover set down at its middle has covered.
+    const HALF_WAY: f32 = 0.5;
+
+    /// How many rovers are set off down a lane to fill it.
+    ///
+    /// More than any one segment of it will hold, so what stops the last of them is the road
+    /// running out of room rather than the test running out of rovers.
+    const A_QUEUE: u32 = 12;
+
+    /// How far down its first segment each rover driving into a forming jam sets off from.
+    const SETTING_OFF: [f32; 3] = [0., 0.3, 0.6];
 
     fn rover_app() -> App {
         rover_app_holding(PlayerAction::Select)
@@ -2917,6 +2938,245 @@ mod tests {
         assert_eq!(
             one_way_round,
             trace(the_other, &A_TICK_A_FRAME, TICKS_TRACED, traffic)
+        );
+    }
+
+    /// Lay a one-way road through `offsets` on `app`, which takes a tick to become segments.
+    fn lay_one_way_road(app: &mut App, offsets: &[(i32, i32)]) {
+        let nodes = tiles(offsets)
+            .into_iter()
+            .map(LatticeNode::from_tile)
+            .collect();
+        app.world_mut().spawn(Road {
+            nodes,
+            leaving: None,
+            one_way: true,
+        });
+    }
+
+    /// An app holding one straight one-way road, laid and cut into segments.
+    ///
+    /// One way, because the two lanes of a two-way road are joined end to end into a circuit: a
+    /// rover driving one comes back down the other for ever, and a road with no end to it has
+    /// nowhere for a queue to form against.
+    fn one_way_road_app() -> App {
+        let mut app = rover_app();
+        lay_one_way_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+        app
+    }
+
+    /// A one-way road crossed by another, laid together so neither gives way to the other.
+    fn a_one_way_crossroads() -> App {
+        let mut app = rover_app();
+        lay_one_way_road(&mut app, &STRAIGHT);
+        lay_one_way_road(&mut app, &CROSSING);
+        tick(&mut app);
+        app
+    }
+
+    /// The last segment of the lane setting off from `from`, where a rover runs out of road.
+    fn the_end_of_the_lane(app: &App, from: Entity) -> Entity {
+        let mut segment = from;
+        for _ in 0..LAP_SEGMENTS {
+            match next_of(app, segment) {
+                Some(onward) => segment = onward,
+                None => return segment,
+            }
+        }
+        panic!("the lane comes to an end")
+    }
+
+    /// The segment a rover crosses just before `segment`, walking the lane from `from`.
+    fn the_segment_before(app: &App, from: Entity, segment: Entity) -> Entity {
+        let mut walking = from;
+        for _ in 0..LAP_SEGMENTS {
+            let onward = next_of(app, walking).expect("the lane reaches the segment");
+            if onward == segment {
+                return walking;
+            }
+            walking = onward;
+        }
+        panic!("the lane reaches the segment")
+    }
+
+    /// How many rovers are standing on `segment`.
+    fn carried_by(app: &mut App, segment: Entity) -> u32 {
+        app.world_mut()
+            .query::<&Rover>()
+            .iter(app.world())
+            .filter(|rover| rover.segment == segment)
+            .count() as u32
+    }
+
+    /// How many rovers `segment` has room for.
+    fn capacity_of(app: &App, segment: Entity) -> u32 {
+        app.world()
+            .entity(segment)
+            .get::<RoadSegment>()
+            .expect("the segment is still there")
+            .capacity()
+    }
+
+    /// Stand rovers nose to tail back from the end of `segment` until it will take no more.
+    fn fill_to_capacity(app: &mut App, segment: Entity) {
+        let end = place_along(app, segment, 1.);
+        for back in 0..capacity_of(app, segment) {
+            spawn_rover(app, segment, end - back as f32 * ROVER_ROOM);
+        }
+    }
+
+    /// Fill every segment from `segment` to the end of its lane, leaving nothing room to move.
+    fn jam_the_lane_from(app: &mut App, segment: Entity) {
+        let mut jamming = segment;
+        for _ in 0..LAP_SEGMENTS {
+            fill_to_capacity(app, jamming);
+            match next_of(app, jamming).filter(|&onward| onward != segment) {
+                Some(onward) => jamming = onward,
+                None => return,
+            }
+        }
+        panic!("the lane comes to an end")
+    }
+
+    /// Set `count` rovers off from the start of `segment`, each on top of the last.
+    ///
+    /// Stacked rather than spread, so how far apart they end up and how many of them get
+    /// anywhere is the road's answer rather than a spacing the test chose.
+    fn set_a_queue_off_down(app: &mut App, segment: Entity, count: u32) {
+        for _ in 0..count {
+            set_down_on(app, segment, 0.);
+        }
+    }
+
+    fn drive_for(app: &mut App, ticks: u32) {
+        for _ in 0..ticks {
+            tick(app);
+        }
+    }
+
+    /// A crossroads with the road beyond it jammed solid, and the way onto it and the way behind.
+    fn a_crossroads_jammed_beyond_the_junction() -> (App, Entity, Entity) {
+        let mut app = a_one_way_crossroads();
+        let arriving = arriving_from(&mut app, STRAIGHT[0]);
+        let out = ways_out_of(&app, arriving)[0];
+        jam_the_lane_from(&mut app, out);
+        let lane = segment_from(&mut app, tiles(&STRAIGHT)[0]);
+        let before = the_segment_before(&app, lane, arriving);
+        (app, arriving, before)
+    }
+
+    /// A lane jammed at its far end, with rovers driving down it into the back of the queue.
+    ///
+    /// Each sets off from a place of its own rather than one on top of the next, so no two of
+    /// them stand where a reading of the world could not tell them apart.
+    fn a_lane_jamming() -> App {
+        let mut app = one_way_road_app();
+        let lane = segment_from(&mut app, tiles(&STRAIGHT)[0]);
+        let last = the_end_of_the_lane(&app, lane);
+        fill_to_capacity(&mut app, last);
+        for along in SETTING_OFF {
+            set_down_on(&mut app, lane, along);
+        }
+        app
+    }
+
+    #[test]
+    fn a_rover_does_not_pass_the_one_ahead_of_it_on_a_segment() {
+        let mut app = one_way_road_app();
+        let lane = segment_from(&mut app, tiles(&STRAIGHT)[0]);
+        let last = the_end_of_the_lane(&app, lane);
+        let ahead = set_down_on(&mut app, last, HALF_WAY);
+        let behind = set_down_on(&mut app, last, 0.);
+
+        drive_for(&mut app, TICKS_TO_SETTLE);
+
+        assert!(place_of(&app, behind).1 < place_of(&app, ahead).1);
+    }
+
+    #[test]
+    fn a_rover_stops_a_rovers_room_behind_the_one_ahead() {
+        let mut app = one_way_road_app();
+        let lane = segment_from(&mut app, tiles(&STRAIGHT)[0]);
+        let last = the_end_of_the_lane(&app, lane);
+        let ahead = set_down_on(&mut app, last, HALF_WAY);
+        let behind = set_down_on(&mut app, last, 0.);
+
+        drive_for(&mut app, TICKS_TO_SETTLE);
+
+        let gap = place_of(&app, ahead).1 - place_of(&app, behind).1;
+        assert!((gap - ROVER_ROOM).abs() < TOLERANCE, "{gap} of road apart");
+    }
+
+    #[test]
+    fn a_rover_waits_rather_than_entering_a_segment_with_no_room_on_it() {
+        let mut app = one_way_road_app();
+        let lane = segment_from(&mut app, tiles(&STRAIGHT)[0]);
+        let last = the_end_of_the_lane(&app, lane);
+        let before = the_segment_before(&app, lane, last);
+        fill_to_capacity(&mut app, last);
+        let waiting = set_down_on(&mut app, before, 0.);
+
+        drive_for(&mut app, TICKS_TO_SETTLE);
+
+        assert_eq!(place_of(&app, waiting).0, before);
+    }
+
+    #[test]
+    fn a_segment_holds_as_many_rovers_as_its_length_has_room_for() {
+        let mut app = one_way_road_app();
+        let lane = segment_from(&mut app, tiles(&STRAIGHT)[0]);
+        let last = the_end_of_the_lane(&app, lane);
+        set_a_queue_off_down(&mut app, lane, A_QUEUE);
+
+        drive_for(&mut app, TICKS_TO_SETTLE);
+
+        let packed = carried_by(&mut app, last) as f32;
+        let length = length_of(&app, last);
+        assert!(packed * ROVER_ROOM <= length, "{packed} on {length} of road");
+        assert!(
+            (packed + 1.) * ROVER_ROOM > length,
+            "{packed} on {length} of road"
+        );
+    }
+
+    #[test]
+    fn a_stretch_a_junction_cut_back_holds_fewer_rovers_than_a_whole_one() {
+        let mut app = a_crossed_road();
+        let whole = segment_from(&mut app, tiles(&STRAIGHT)[0]);
+        let cut = arriving_from(&mut app, STRAIGHT[0]);
+
+        assert!(capacity_of(&app, cut) < capacity_of(&app, whole));
+    }
+
+    #[test]
+    fn a_junction_holds_a_rover_whose_way_out_has_no_room() {
+        let (mut app, arriving, _) = a_crossroads_jammed_beyond_the_junction();
+        let held = set_down_on(&mut app, arriving, AT_THE_JUNCTION);
+
+        drive_for(&mut app, TICKS_TO_SETTLE);
+
+        assert_eq!(place_of(&app, held).0, arriving);
+    }
+
+    #[test]
+    fn a_queue_reaches_back_onto_the_road_behind_a_junction() {
+        let (mut app, arriving, before) = a_crossroads_jammed_beyond_the_junction();
+        fill_to_capacity(&mut app, arriving);
+        let behind = set_down_on(&mut app, before, 0.);
+
+        drive_for(&mut app, TICKS_TO_SETTLE);
+
+        assert_eq!(place_of(&app, behind).0, before);
+    }
+
+    #[test]
+    fn a_jam_forms_the_same_way_however_the_frames_fall() {
+        let steady = trace(a_lane_jamming(), &A_TICK_A_FRAME, TICKS_TRACED, traffic);
+
+        assert_eq!(
+            steady,
+            trace(a_lane_jamming(), &RAGGED_FRAMES, TICKS_TRACED, traffic)
         );
     }
 }
