@@ -753,16 +753,18 @@ fn draw_the_refused_tile(
     }
 }
 
-/// Draw which way each port moves goods: in off the road, or out onto it.
+/// Draw which way each port moves goods and how near full it is standing.
 ///
 /// The two ports of a building otherwise look alike, each a mark on a corner, and which of them a
-/// rover should be sent to is the whole of what tells them apart (invariant 5).
+/// rover should be sent to is the whole of what tells them apart. The bar is the other half: a
+/// chain that has stopped and one that is running are the same arrows without it, and a full
+/// intake is where a jam shows first (invariant 5).
 fn draw_the_ports(
     mut gizmos: Gizmos<DebugGizmos>,
     buildings: Query<&Building>,
-    ports: Query<(&Port, &RoadEndpoint, &ChildOf)>,
+    ports: Query<(&Port, &Holding, &RoadEndpoint, &ChildOf)>,
 ) {
-    for (port, endpoint, of) in &ports {
+    for (port, holding, endpoint, of) in &ports {
         let Ok(building) = buildings.get(of.0) else {
             continue;
         };
@@ -772,7 +774,19 @@ fn draw_the_ports(
             endpoint.standing_on(),
             port.flow,
         );
+        draw_what_a_port_holds(&mut gizmos, endpoint.standing_on(), holding.held());
     }
+}
+
+/// Draw a bar at `node` standing as tall a share of `STOCK_MARK` as `held` is of a full port.
+fn draw_what_a_port_holds(gizmos: &mut Gizmos<DebugGizmos>, node: LatticeNode, held: u32) {
+    let standing = node.world_position() + GIZMO_LIFT;
+    let full = held as f32 / PORT_CAPACITY as f32;
+    gizmos.line(
+        standing,
+        standing + Vec3::Y * MAP_TILE_INRADIUS * STOCK_MARK * full,
+        STOCK_COLOUR,
+    );
 }
 
 /// Show which corners the ports of the next building will stand on, before it is placed.
