@@ -27,6 +27,20 @@ const REFUSED_MARK: f32 = 0.5;
 /// How far into the tile a port's arrow reaches, as a share of the tile's inradius.
 const PORT_MARK: f32 = 0.4;
 
+/// How high a full port's stock stands in the debug view, as a share of the tile's inradius.
+const STOCK_MARK: f32 = 0.6;
+
+/// The colour the stock standing at a port is drawn in
+const STOCK_COLOUR: Color = Color::srgb(0.9, 0.9, 0.4);
+
+/// How much of its item a port holds before it is full.
+///
+/// A few deliveries' worth and no more. What a port may bank is slack at the end of a road, and a
+/// port that banked without limit would let a producer run indefinitely ahead of the rovers
+/// hauling for it — which is the free transfer invariant 1 forbids, arriving as an unbounded
+/// buffer instead of as a belt.
+pub const PORT_CAPACITY: u32 = 12;
+
 /// The colour a port taking goods off the road is drawn in
 const INTAKE_COLOUR: Color = Color::srgb(0.4, 0.75, 0.95);
 
@@ -110,6 +124,15 @@ pub struct Port {
     pub flow: Flow,
     /// The one item that passes through it.
     pub item: Item,
+}
+
+/// What a port is holding, of the one item its [`Port`] names.
+///
+/// Its own component rather than a field of `Port`, which is the description a recipe writes down
+/// and a placed port is compared against. What is standing at the door is the half that moves.
+#[derive(Component, Default)]
+pub struct Holding {
+    held: u32,
 }
 
 /// One good the production tree moves, which is either dug out of the ground or made from others.
@@ -293,6 +316,27 @@ fn counted(stacks: &[Stack]) -> String {
         .map(|stack| format!("{} {}", stack.count, stack.item.name()))
         .collect::<Vec<String>>()
         .join(" + ")
+}
+
+impl Holding {
+    /// How much of its port's item is standing here.
+    pub fn held(&self) -> u32 {
+        self.held
+    }
+
+    /// Put `quantity` in, and answer with how much of it fitted.
+    pub fn take_in(&mut self, quantity: u32) -> u32 {
+        let fitted = quantity.min(PORT_CAPACITY - self.held);
+        self.held += fitted;
+        fitted
+    }
+
+    /// Take up to `quantity` out, and answer with how much there was to take.
+    pub fn give_out(&mut self, quantity: u32) -> u32 {
+        let given = self.held.min(quantity);
+        self.held -= given;
+        given
+    }
 }
 
 impl Item {
@@ -621,7 +665,7 @@ fn place_building_system(
         ))
         .with_children(|ports| {
             for (port, node) in to_place.ports_standing(tile.coordinates) {
-                ports.spawn((port, RoadEndpoint::at(node)));
+                ports.spawn((port, Holding::default(), RoadEndpoint::at(node)));
             }
         })
         .id();
@@ -1231,6 +1275,15 @@ mod tests {
     /// How much a rover carries to a port in these tests.
     const LOAD: u32 = 3;
 
+    /// The item a `MELTER` takes in, which is the one thing its intake accepts.
+    const MELTED: Item = Item::Raw(RawMaterial::Ice);
+
+    /// An item a `MELTER` neither takes in nor puts out, so no port of one is a door for it.
+    const UNWANTED: Item = Item::Hydrogen;
+
+    /// How long a rover a full port refuses is watched for, to see it never wears the port down.
+    const TICKS_HELD_AT_A_FULL_PORT: u32 = 16;
+
     /// A building app that also drives rovers, so a delivery can be run to a port and land.
     fn delivery_app() -> App {
         let mut app = building_app(PlayerAction::EditBuildings);
@@ -1238,45 +1291,141 @@ mod tests {
         app
     }
 
+    /// A melter with a road run to the port of `flow`, and the building and that port.
+    fn a_melter_served_at(flow: Flow) -> (App, Entity, Entity) {
+        let mut app = delivery_app();
+        let building = place_building_at(&mut app, MELTER, PORTED);
+        let port = port_of(&mut app, building, flow);
+        lay_road_to(
+            &mut app,
+            corner_for(MELTER, flow).node_of(tile_at(PORTED)),
+            &[PORTED],
+        );
+        (app, building, port)
+    }
+
+    /// Stand a rover loaded with `quantity` of `item` at `port`, driven there and about to arrive.
+    fn drive_a_load_to(app: &mut App, port: Entity, item: Item, quantity: u32) -> Entity {
+        let stops = app
+            .world()
+            .entity(port)
+            .get::<RoadEndpoint>()
+            .and_then(RoadEndpoint::served_by)
+            .expect("the road serves the port");
+        app.world_mut()
+            .spawn((
+                Rover {
+                    segment: stops.segment,
+                    along: stops.along,
+                },
+                Cargo { item, quantity },
+                Route {
+                    destination: port,
+                    ways_out: Vec::new(),
+                },
+            ))
+            .id()
+    }
+
+    /// Put `quantity` of its own item at `port`, as though the building had made it.
+    fn stock(app: &mut App, port: Entity, quantity: u32) {
+        app.world_mut()
+            .entity_mut(port)
+            .get_mut::<Holding>()
+            .expect("a port holds stock")
+            .take_in(quantity);
+    }
+
+    /// How much is standing at `entity`, which is nothing at all where it is no port.
     fn load_at(app: &App, entity: Entity) -> Option<u32> {
         app.world()
             .entity(entity)
+            .get::<Holding>()
+            .map(Holding::held)
+    }
+
+    /// How much `rover` is still carrying, which is nothing once it has handed everything over.
+    fn carried_by(app: &App, rover: Entity) -> u32 {
+        app.world()
+            .entity(rover)
             .get::<Cargo>()
-            .map(|held| held.quantity)
+            .map_or(0, |load| load.quantity)
+    }
+
+    #[test]
+    fn a_port_stands_holding_nothing_when_its_building_is_placed() {
+        let mut app = delivery_app();
+        let building = place_building_at(&mut app, MELTER, PORTED);
+
+        for (_, port) in ports_of(&mut app, building) {
+            assert_eq!(load_at(&app, port), Some(0), "a port was placed with stock");
+        }
     }
 
     #[test]
     fn a_rover_driven_to_a_port_leaves_its_load_there_rather_than_at_the_building() {
-        let mut app = delivery_app();
-        let building = place_building_at(&mut app, MELTER, PORTED);
-        let intake = port_of(&mut app, building, Flow::Intake);
-        lay_road_to(
-            &mut app,
-            corner_for(MELTER, Flow::Intake).node_of(tile_at(PORTED)),
-            &[PORTED],
-        );
-        let stops = app
-            .world()
-            .entity(intake)
-            .get::<RoadEndpoint>()
-            .and_then(RoadEndpoint::served_by)
-            .expect("the road serves the intake");
-        app.world_mut().spawn((
-            Rover {
-                segment: stops.segment,
-                along: stops.along,
-            },
-            Cargo { quantity: LOAD },
-            Route {
-                destination: intake,
-                ways_out: Vec::new(),
-            },
-        ));
+        let (mut app, building, intake) = a_melter_served_at(Flow::Intake);
+        drive_a_load_to(&mut app, intake, MELTED, LOAD);
 
         tick(&mut app);
 
         assert_eq!(load_at(&app, intake), Some(LOAD));
         assert_eq!(load_at(&app, building), None);
+    }
+
+    #[test]
+    fn a_port_refuses_a_delivery_of_an_item_it_is_not_for() {
+        let (mut app, _, intake) = a_melter_served_at(Flow::Intake);
+        let rover = drive_a_load_to(&mut app, intake, UNWANTED, LOAD);
+
+        tick(&mut app);
+
+        assert_eq!(load_at(&app, intake), Some(0));
+        assert_eq!(carried_by(&app, rover), LOAD);
+    }
+
+    #[test]
+    fn an_outlet_refuses_a_delivery_a_rover_brought_it() {
+        let (mut app, _, outlet) = a_melter_served_at(Flow::Outlet);
+        let made = MELTER
+            .ports()
+            .find(|(_, port)| port.flow == Flow::Outlet)
+            .expect("a melter has an outlet")
+            .1
+            .item;
+        let rover = drive_a_load_to(&mut app, outlet, made, LOAD);
+
+        tick(&mut app);
+
+        assert_eq!(load_at(&app, outlet), Some(0));
+        assert_eq!(carried_by(&app, rover), LOAD);
+    }
+
+    #[test]
+    fn a_port_takes_only_what_fits_and_the_rover_keeps_the_rest() {
+        let (mut app, _, intake) = a_melter_served_at(Flow::Intake);
+        let room = 1;
+        stock(&mut app, intake, PORT_CAPACITY - room);
+        let rover = drive_a_load_to(&mut app, intake, MELTED, LOAD);
+
+        tick(&mut app);
+
+        assert_eq!(load_at(&app, intake), Some(PORT_CAPACITY));
+        assert_eq!(carried_by(&app, rover), LOAD - room);
+    }
+
+    #[test]
+    fn a_full_port_takes_nothing_and_the_rover_waits_holding_its_load() {
+        let (mut app, _, intake) = a_melter_served_at(Flow::Intake);
+        stock(&mut app, intake, PORT_CAPACITY);
+        let rover = drive_a_load_to(&mut app, intake, MELTED, LOAD);
+
+        for _ in 0..TICKS_HELD_AT_A_FULL_PORT {
+            tick(&mut app);
+        }
+
+        assert_eq!(load_at(&app, intake), Some(PORT_CAPACITY));
+        assert_eq!(carried_by(&app, rover), LOAD);
     }
 
     #[test]

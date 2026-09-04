@@ -1,3 +1,4 @@
+use crate::building::{Flow, Holding, Item, Port};
 use crate::common::cleanup::Destroy;
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use crate::diagnostics::DebugGizmos;
@@ -96,13 +97,15 @@ struct WaitingAtJunction {
     since: u64,
 }
 
-/// A load, on the rover carrying it or standing at the endpoint it was left at.
+/// The load a rover is carrying: which item, and how much of it.
 ///
-/// Goods and recipes are #26's, and they come after traffic. Until then a load is opaque: enough
-/// for something to change hands and for a jam to be worth watching, and not enough for a
-/// production chain to be built on top of it. Whatever holds nothing has no `Cargo` at all.
+/// A load names its item because a port takes one and refuses the rest, so a chain can be wired
+/// wrongly and a recipe means something. It is only ever the item of the port it was collected
+/// from, never one a rover chose. A rover carrying nothing has no `Cargo` at all.
 #[derive(Component)]
 pub struct Cargo {
+    /// Which item this is a load of.
+    pub item: Item,
     /// How much of it there is.
     pub quantity: u32,
 }
@@ -192,7 +195,6 @@ impl Plugin for RoverPlugin {
                         draw_the_rovers,
                         draw_the_rovers_a_junction_holds,
                         draw_where_the_rovers_are_going,
-                        draw_the_loads_standing_at_the_endpoints,
                     ),
                 )
                     .chain(),
@@ -502,33 +504,34 @@ fn drive_the_rovers(
     }
 }
 
-/// Hand the load of every rover standing at its destination to whatever is built there.
+/// Hand the load of every rover standing at its destination to the port it was driven to.
 ///
 /// This is invariant 1 coming due: what a building receives it receives because a rover drove a
-/// road to it, and here is where the load stops being the rover's. It is instant, and it happens
-/// once — the whole load goes, so a rover parked at the endpoint it delivered to is carrying
-/// nothing and has nothing left to hand over. Holding it there for a number of ticks nothing in
-/// the game measures would be a balance claim with no measurement behind it (2.3).
+/// road to it, and here is where the load stops being the rover's. Only an intake for that very
+/// item takes one, so a chain can be plumbed wrongly and stay wrong rather than the goods
+/// changing into whatever the door was for.
+///
+/// What the port has room for goes and the rest stays on the rover, which waits at the door and
+/// tries again. Nothing is created and nothing is lost either way: a full port refuses a delivery
+/// rather than banking past its bound, and the load it refused is still on the back of the rover.
 fn hand_the_load_to_the_endpoint_it_was_driven_to(
     mut commands: Commands,
-    rovers: Query<(Entity, &Rover, &Route, &Cargo)>,
-    endpoints: Query<&RoadEndpoint>,
+    mut rovers: Query<(Entity, &Rover, &Route, &mut Cargo)>,
+    mut ports: Query<(&RoadEndpoint, &Port, &mut Holding)>,
 ) {
-    for (entity, standing, route, load) in &rovers {
-        let arrived = endpoints
-            .get(route.destination)
-            .is_ok_and(|endpoint| standing.standing_at(endpoint));
-        if !arrived {
+    for (entity, standing, route, mut load) in &mut rovers {
+        let Ok((endpoint, port, mut holding)) = ports.get_mut(route.destination) else {
+            continue;
+        };
+        let takes_it = port.flow == Flow::Intake && port.item == load.item;
+        if !takes_it || !standing.standing_at(endpoint) {
             continue;
         }
 
-        let quantity = load.quantity;
-        commands
-            .entity(route.destination)
-            .entry::<Cargo>()
-            .and_modify(move |mut held| held.quantity += quantity)
-            .or_insert(Cargo { quantity });
-        commands.entity(entity).remove::<Cargo>();
+        load.quantity -= holding.take_in(load.quantity);
+        if load.quantity == 0 {
+            commands.entity(entity).remove::<Cargo>();
+        }
     }
 }
 
@@ -659,33 +662,6 @@ fn draw_where_the_rovers_are_going(
             ROUTE_COLOUR
         };
         gizmos.arrow(standing, bound_for + GIZMO_LIFT, colour);
-    }
-}
-
-/// Draw what is standing at each endpoint, waiting to be taken or just delivered.
-///
-/// A load that changed hands is otherwise invisible: what it was left at looks the same holding a
-/// hundred as holding none, and a delivery landing is the one thing a road full of rovers is for
-/// (invariant 5).
-fn draw_the_loads_standing_at_the_endpoints(
-    mut gizmos: Gizmos<DebugGizmos>,
-    endpoints: Query<(&RoadEndpoint, &Cargo)>,
-    segments: Query<&RoadSegment>,
-) {
-    for (endpoint, load) in &endpoints {
-        let Some(standing) = endpoint
-            .served_by()
-            .and_then(|served| standing_place(served.segment, served.along, &segments))
-        else {
-            continue;
-        };
-
-        let standing = standing + GIZMO_LIFT;
-        gizmos.line(
-            standing,
-            standing + Vec3::Y * LOAD_MARK * load.quantity as f32,
-            LOAD_COLOUR,
-        );
     }
 }
 
@@ -884,6 +860,9 @@ mod tests {
 
     /// How much a rover carries on a delivery under test.
     const LOAD: u32 = 3;
+
+    /// The one item these tests haul, every port standing here being a door for it.
+    const HAULED: Item = Item::Water;
 
     /// How many ticks a delivery is given to land before the test gives up on it.
     const TICKS_TO_DELIVER: u32 = 4096;
@@ -1628,9 +1607,10 @@ mod tests {
     #[test]
     fn a_rovers_cargo_is_untouched_by_the_frames_that_place_it() {
         let (mut app, rover, segment) = road_and_rover(0.);
-        app.world_mut()
-            .entity_mut(rover)
-            .insert(Cargo { quantity: 3 });
+        app.world_mut().entity_mut(rover).insert(Cargo {
+            item: HAULED,
+            quantity: 3,
+        });
 
         let along = place_along(&app, segment, 0.5);
         move_to(&mut app, rover, along);
@@ -2156,9 +2136,21 @@ mod tests {
         });
     }
 
-    /// An endpoint on a tile's corner, standing in for a port of whatever is built there.
+    /// An intake port on a tile's corner, standing in for a door of whatever is built there.
+    ///
+    /// An intake for `HAULED`, because a delivery is what these tests drive a rover to make and
+    /// only a port facing that way and holding that item takes one.
     fn endpoint_at(app: &mut App, corner: LatticeNode) -> Entity {
-        app.world_mut().spawn(RoadEndpoint::at(corner)).id()
+        app.world_mut()
+            .spawn((
+                Port {
+                    flow: Flow::Intake,
+                    item: HAULED,
+                },
+                Holding::default(),
+                RoadEndpoint::at(corner),
+            ))
+            .id()
     }
 
     /// One road, and an endpoint at either end of it.
@@ -2205,7 +2197,10 @@ mod tests {
                     segment: from.segment,
                     along: from.along,
                 },
-                Cargo { quantity: LOAD },
+                Cargo {
+                    item: HAULED,
+                    quantity: LOAD,
+                },
                 Route {
                     destination: delivery,
                     ways_out,
@@ -2352,7 +2347,10 @@ mod tests {
                     segment: from.segment,
                     along: from.along,
                 },
-                Cargo { quantity: LOAD },
+                Cargo {
+                    item: HAULED,
+                    quantity: LOAD,
+                },
                 SentTo(delivery),
             ))
             .id()
@@ -2371,12 +2369,12 @@ mod tests {
         app.world().entity(rover).contains::<SentTo>()
     }
 
-    /// How much `entity` is carrying or holding, which is nothing while it holds no load at all.
+    /// How much `entity` is carrying or holding, on the back of a rover or standing at a port.
     fn load_of(app: &App, entity: Entity) -> u32 {
-        app.world()
-            .entity(entity)
-            .get::<Cargo>()
-            .map_or(0, |cargo| cargo.quantity)
+        let entity = app.world().entity(entity);
+        let carried = entity.get::<Cargo>().map_or(0, |cargo| cargo.quantity);
+        let stood = entity.get::<Holding>().map_or(0, Holding::held);
+        carried + stood
     }
 
     /// The tick a load reached `endpoint` on, or nothing if none ever did.
@@ -2607,7 +2605,10 @@ mod tests {
                     segment: stops.segment,
                     along: stops.along,
                 },
-                Cargo { quantity: LOAD },
+                Cargo {
+                    item: HAULED,
+                    quantity: LOAD,
+                },
                 SentTo(delivery),
             ))
             .id();
