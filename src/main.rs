@@ -27,7 +27,9 @@ fn main() {
         .add_plugins(road::RoadPlugin)
         .add_plugins(rover::RoverPlugin)
         .add_plugins(simulation::SimulationPlugin)
+        .add_plugins(ui::building_panel::BuildingPanelPlugin)
         .add_plugins(ui::legend::LegendPlugin)
+        .add_plugins(ui::selection::SelectionPlugin)
         .add_systems(Startup, setup_test_scene)
         .run();
 }
