@@ -347,6 +347,15 @@ mod tests {
     /// How many rovers a fleet under test is given.
     const A_FLEET: u32 = 2;
 
+    /// How many rovers a fleet is given that the road it runs on has room for.
+    const A_FLEET_THAT_FITS: u32 = 4;
+
+    /// How many rovers a fleet is given that its road has nowhere to put.
+    ///
+    /// Well past what a round trip along `HAULAGE` holds, so the road is packed and a rover
+    /// spends its ticks standing behind another rather than driving between the two ports.
+    const A_FLEET_TOO_LARGE_FOR_ITS_ROAD: u32 = 64;
+
     /// How much a source under test holds, far more than a run of trips can take away.
     const A_STOCK: u32 = 10_000;
 
@@ -860,6 +869,25 @@ mod tests {
         assert!(
             two > one,
             "two rovers delivered {two} where one delivered {one}"
+        );
+    }
+
+    #[test]
+    fn a_fleet_too_large_for_its_road_delivers_less_than_one_that_fits() {
+        let delivered = |rovers: u32| {
+            let (mut app, source, home) = haulage_app();
+            assign(&mut app, home, rovers, source);
+            run(&mut app, TICKS_MEASURED);
+            held_at(&app, home)
+        };
+
+        let fits = delivered(A_FLEET_THAT_FITS);
+        let crowded = delivered(A_FLEET_TOO_LARGE_FOR_ITS_ROAD);
+
+        assert!(
+            crowded < fits,
+            "{A_FLEET_TOO_LARGE_FOR_ITS_ROAD} rovers delivered {crowded} over \
+             {TICKS_MEASURED} ticks where {A_FLEET_THAT_FITS} delivered {fits}"
         );
     }
 }

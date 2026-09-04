@@ -23,9 +23,17 @@ const HANDOVER_REACH: f32 = 0.1;
 /// How long a stretch of an arc a rover should drive in one go.
 ///
 /// Arcs come out of a fit at lengths of their own, so each is cut into whichever number of equal
-/// stretches lands nearest this. Keeping segments close to one length is what lets #8 read a
-/// segment's capacity off its geometry rather than store one beside it.
+/// stretches lands nearest this. Keeping segments close to one length is what leaves a segment's
+/// capacity readable off its geometry rather than stored beside it.
 const SEGMENT_LENGTH: f32 = 5.;
+
+/// How much road a rover takes to itself, as a length along the arc it is driving.
+///
+/// An eighth of a tile, which is a rover's own length and a quarter of it again in the gap it
+/// keeps behind the one ahead. It is what a segment's capacity is counted in and what a rover
+/// standing in a queue is held back by, so the limit on a road and the gap between two rovers on
+/// it are one number rather than two that can disagree.
+pub const ROVER_ROOM: f32 = MAP_TILE_SIZE / 8.;
 
 /// The tightest turn a road may be built to make, as the radius of the arc a rover drives.
 ///
@@ -862,6 +870,17 @@ impl RoadSegment {
     pub fn speed_limit(&self) -> f32 {
         let radius = self.arc.curvature.abs().recip();
         STRAIGHT_SPEED_LIMIT * (radius / COMFORTABLE_RADIUS).sqrt().min(1.)
+    }
+
+    /// How many rovers this segment's stretch has room for.
+    ///
+    /// Its length over the room a rover takes, so it follows the geometry rather than sitting in
+    /// a field beside it: a stretch cut shorter holds fewer of them the moment it is cut, and no
+    /// number anywhere has to be brought back into line (invariant 6). A stretch too short for
+    /// even one rover's room still takes one, because a road no rover may enter is a road that
+    /// stops the network rather than one that is merely small.
+    pub fn capacity(&self) -> u32 {
+        ((self.length() / ROVER_ROOM) as u32).max(1)
     }
 }
 
