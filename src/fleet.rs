@@ -9,20 +9,24 @@
 //!
 //! The source is named by the player rather than found by the rover, the finding being #132's
 //! and needing recipes this comes before. What crosses between the two ends is
-//! [`crate::rover::Cargo`], an opaque load whose kind is #26's.
+//! [`crate::rover::Cargo`], carrying the item of the outlet it was collected from.
 
+use crate::building::{Flow, Holding, Port};
 use crate::common::cleanup::Destroy;
 use crate::diagnostics::DebugGizmos;
+use crate::input::{PlayerAction, PlayerInput};
 use crate::road::{RoadEndpoint, RoadTiles};
 use crate::rover::{Cargo, Route, Rover, RoversDriven, SentTo, Stranded};
 use crate::simulation::Simulation;
+use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
+use crate::ui::selection::{Picked, PointedAt, Selection};
 use bevy::prelude::*;
 
 /// How much a rover takes on in one trip.
 ///
-/// A load has no kind to weigh it by, that being #26's, so what this is worth in goods is not a
-/// question the game can answer. What it has to be is more than one, so a source holding less
-/// than a full load hands over what it has rather than nothing at all.
+/// The same for every item, weight and bulk being no part of the game. What it has to be is more
+/// than one, so a source holding less than a full load hands over what it has rather than nothing
+/// at all, and less than what a port holds, so a full port takes more than one trip to empty.
 const ROVER_LOAD: u32 = 4;
 
 /// How far the debug view lifts a fleet's mark off the ground, so it does not fight the tiles.
@@ -30,6 +34,9 @@ const GIZMO_LIFT: Vec3 = Vec3::new(0., 0.3, 0.);
 
 /// The colour the way a fleet collects along is drawn in
 const FLEET_COLOUR: Color = Color::srgb(0.6, 0.5, 0.9);
+
+/// The keys that change the selected port's fleet, and how many rovers each asks for.
+const FLEET_KEYS: [(KeyCode, i32); 2] = [(KeyCode::Minus, -1), (KeyCode::Equal, 1)];
 
 /// The rovers each port has been given, and the shuttle they run.
 pub struct FleetPlugin;
@@ -84,6 +91,23 @@ impl Plugin for FleetPlugin {
     fn build(&self, app: &mut App) {
         app.add_observer(take_the_rovers_of_a_fleet_that_is_gone_off_the_road)
             .add_observer(give_back_the_place_of_a_rover_that_left_the_world)
+            .declare_bindings([
+                Binding {
+                    input: BindingInput::Mouse(MouseButton::Right),
+                    action: "Collect from the port under the cursor",
+                    context: BindingContext::Tool(PlayerAction::Select),
+                },
+                Binding {
+                    input: BindingInput::Key(FLEET_KEYS[0].0),
+                    action: "Take a rover off the port you picked out",
+                    context: BindingContext::Tool(PlayerAction::Select),
+                },
+                Binding {
+                    input: BindingInput::Key(FLEET_KEYS[1].0),
+                    action: "Put another rover on the port you picked out",
+                    context: BindingContext::Tool(PlayerAction::Select),
+                },
+            ])
             .add_systems(
                 FixedUpdate,
                 (
@@ -97,7 +121,78 @@ impl Plugin for FleetPlugin {
                     .after(RoversDriven)
                     .in_set(Simulation),
             )
-            .add_systems(Update, draw_the_way_a_fleet_collects_along);
+            .add_systems(
+                Update,
+                (
+                    point_the_fleet_at_the_port_the_player_clicked,
+                    set_the_rovers_the_player_asked_for,
+                    draw_the_way_a_fleet_collects_along,
+                )
+                    .chain()
+                    .after(Picked),
+            );
+    }
+}
+
+/// Point the port the player picked out at the port they clicked, to collect from.
+///
+/// A source is named by pointing at it rather than by naming an entity, so the whole of the
+/// gesture is which port on the map the cursor was over. Only an intake is given a fleet, this
+/// being a shuttle that brings a building what it takes in, and no port collects from itself.
+///
+/// A port already collecting somewhere keeps the rovers it has, so re-pointing a running fleet
+/// moves where it goes without emptying the road it runs on.
+fn point_the_fleet_at_the_port_the_player_clicked(
+    mut commands: Commands,
+    input: Res<PlayerInput>,
+    action: Res<State<PlayerAction>>,
+    selection: Res<Selection>,
+    pointed: PointedAt,
+    ports: Query<&Port>,
+    mut fleets: Query<&mut Fleet>,
+) {
+    if !input.secondary_tap || *action.get() != PlayerAction::Select {
+        return;
+    }
+    let Some(port) = selection.port() else {
+        return;
+    };
+    if !ports.get(port).is_ok_and(|door| door.flow == Flow::Intake) {
+        return;
+    }
+    let Some(source) = pointed.under_the_cursor().port().filter(|it| *it != port) else {
+        return;
+    };
+
+    match fleets.get_mut(port) {
+        Ok(mut fleet) => fleet.source = source,
+        Err(_) => {
+            commands.entity(port).insert(Fleet { rovers: 0, source });
+        }
+    }
+}
+
+/// Put another rover on the port the player picked out, or take one off it.
+///
+/// The count written is the one the simulation reads on the next tick, so what the player asked
+/// for and what is running are one number rather than two that can disagree. A port with no
+/// source has no fleet to raise: pointing it somewhere is what gives it one.
+fn set_the_rovers_the_player_asked_for(
+    keys: Res<ButtonInput<KeyCode>>,
+    action: Res<State<PlayerAction>>,
+    selection: Res<Selection>,
+    mut fleets: Query<&mut Fleet>,
+) {
+    if *action.get() != PlayerAction::Select {
+        return;
+    }
+    let Some(mut fleet) = selection.port().and_then(|port| fleets.get_mut(port).ok()) else {
+        return;
+    };
+    for (key, asked) in FLEET_KEYS {
+        if keys.just_pressed(key) {
+            fleet.rovers = fleet.rovers.saturating_add_signed(asked);
+        }
     }
 }
 
@@ -106,27 +201,29 @@ impl Plugin for FleetPlugin {
 ///
 /// A route is spent the moment it is driven, and dropping it here leaves the next leg to be
 /// decided from what the rover is carrying rather than from a record of the trip it just made. A
-/// load is only ever taken from the port the rover is standing at, so a fleet pointed somewhere
-/// new leaves the rover that is out to let go where it lands and be sent again (invariant 1).
+/// load only ever comes out of the outlet the rover is standing at (invariant 1).
 ///
-/// A source with nothing to give leaves the rover waiting there holding its route, which is what
-/// keeps an empty producer from costing a search every tick it stays empty.
+/// A door with nothing to give and a door with no room for what was brought both leave the rover
+/// waiting there holding the route it drove, so a jam costs no search on any tick it goes on for.
 fn turn_the_rovers_round_at_the_port_they_reached(
     mut commands: Commands,
     fleets: Query<&Fleet>,
-    mut ports: Query<(&RoadEndpoint, Option<&mut Cargo>)>,
+    mut ports: Query<(&RoadEndpoint, &Port, &mut Holding)>,
     rovers: Query<(Entity, &Rover, &Route, &Serving, Has<Cargo>)>,
 ) {
     for (entity, standing, route, serving, carrying) in &rovers {
         let arrived = ports
             .get(route.destination)
-            .is_ok_and(|(endpoint, _)| standing.standing_at(endpoint));
+            .is_ok_and(|(endpoint, _, _)| standing.standing_at(endpoint));
         if !arrived {
             continue;
         }
         let Ok(fleet) = fleets.get(serving.port) else {
             continue;
         };
+        if carrying && route.destination == serving.port {
+            continue;
+        }
         let collecting =
             !carrying && route.destination == fleet.source && fleet.source != serving.port;
         if !collecting {
@@ -134,20 +231,22 @@ fn turn_the_rovers_round_at_the_port_they_reached(
             continue;
         }
 
-        let Ok((_, Some(mut stood))) = ports.get_mut(fleet.source) else {
+        let Ok((_, source, mut stood)) = ports.get_mut(fleet.source) else {
             continue;
         };
-        let taken = stood.quantity.min(ROVER_LOAD);
+        if source.flow != Flow::Outlet {
+            continue;
+        }
+        let taken = stood.give_out(ROVER_LOAD);
         if taken == 0 {
             continue;
         }
-        stood.quantity -= taken;
-        if stood.quantity == 0 {
-            commands.entity(fleet.source).remove::<Cargo>();
-        }
         commands
             .entity(entity)
-            .insert(Cargo { quantity: taken })
+            .insert(Cargo {
+                item: source.item,
+                quantity: taken,
+            })
             .remove::<Route>();
     }
 }
@@ -308,15 +407,16 @@ fn draw_the_way_a_fleet_collects_along(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::building::BuildingPlugin;
+    use crate::building::{BuildingPlugin, BuildingTiles, ChosenBuildingType, Item, PORT_CAPACITY};
     use crate::common::cleanup::CleanupPlugin;
     use crate::diagnostics::DebugGizmosPlugin;
     use crate::input::{PlayerAction, PlayerInput};
-    use crate::map::{HexCoordinates, LatticeNode, TileCorner};
+    use crate::map::{HexCoordinates, LatticeNode, MapTile, TileCorner};
     use crate::road::{Road, RoadPlugin, ServedBy};
     use crate::rover::RoverPlugin;
     use crate::simulation::SimulationPlugin;
-    use crate::testing::{advance, headless_app, tick};
+    use crate::testing::{advance, headless_app, press_key, release_key, tick};
+    use crate::ui::selection::SelectionPlugin;
 
     /// The corner of a tile the road runs through and a port stands on.
     ///
@@ -356,8 +456,17 @@ mod tests {
     /// spends its ticks standing behind another rather than driving between the two ports.
     const A_FLEET_TOO_LARGE_FOR_ITS_ROAD: u32 = 64;
 
-    /// How much a source under test holds, far more than a run of trips can take away.
-    const A_STOCK: u32 = 10_000;
+    /// How much a source under test is stocked with, which is everything a port will hold.
+    ///
+    /// A finite figure now that a port is bounded, and the whole of what the world holds in the
+    /// tests that count what came out the other end.
+    const A_STOCK: u32 = PORT_CAPACITY;
+
+    /// The one item these tests haul, every port standing here being a door for it.
+    const HAULED: Item = Item::Water;
+
+    /// An item no port standing in these tests is a door for, so nothing takes a delivery of it.
+    const MISPLUMBED: Item = Item::Hydrogen;
 
     /// How many ticks a fleet is given to do something before the test gives up on it.
     ///
@@ -390,6 +499,32 @@ mod tests {
     /// only looks right on the tick it was read has somewhere to go wrong before it is read again.
     const TICKS_A_FEW: u32 = 64;
 
+    /// An outlet whose building keeps making what it hands out, until production is #26's.
+    ///
+    /// A bounded port is three rover-loads of slack and no more, so a measurement over hundreds of
+    /// ticks needs something behind the door refilling it. This is the smallest stand-in for that.
+    #[derive(Component)]
+    struct Producing;
+
+    /// An intake whose building consumes what arrives, keeping count of how much did.
+    ///
+    /// The tally is what makes throughput measurable now that a port cannot bank without limit:
+    /// what a run delivered is what was consumed, not what happens to be standing at the door.
+    #[derive(Component, Default)]
+    struct Consuming(u32);
+
+    fn keep_the_producing_ports_full(mut ports: Query<&mut Holding, With<Producing>>) {
+        for mut holding in &mut ports {
+            holding.take_in(PORT_CAPACITY);
+        }
+    }
+
+    fn take_in_what_reached_the_consuming_ports(mut ports: Query<(&mut Holding, &mut Consuming)>) {
+        for (mut holding, mut consuming) in &mut ports {
+            consuming.0 += holding.give_out(PORT_CAPACITY);
+        }
+    }
+
     fn fleet_app() -> App {
         let mut app = headless_app();
         app.insert_state(PlayerAction::Select)
@@ -402,7 +537,16 @@ mod tests {
                 RoadPlugin,
                 RoverPlugin,
                 FleetPlugin,
-            ));
+                SelectionPlugin,
+            ))
+            .add_systems(
+                FixedUpdate,
+                (
+                    keep_the_producing_ports_full,
+                    take_in_what_reached_the_consuming_ports,
+                )
+                    .before(RoversDriven),
+            );
         app
     }
 
@@ -452,11 +596,31 @@ mod tests {
             .expect("the test laid a road")
     }
 
-    /// Stand a port on the tile at `offset`, which a road reaches when one runs through its corner.
-    fn port_at(app: &mut App, offset: (i32, i32)) -> Entity {
+    /// Stand a port for `item` moving goods `flow` on the tile at `offset`, which a road running
+    /// through its corner reaches.
+    fn port_at(app: &mut App, offset: (i32, i32), flow: Flow, item: Item) -> Entity {
         app.world_mut()
-            .spawn(RoadEndpoint::at(node_at(offset)))
+            .spawn((
+                Port { flow, item },
+                Holding::default(),
+                RoadEndpoint::at(node_at(offset)),
+            ))
             .id()
+    }
+
+    /// Stand the door a fleet collects from on the tile at `offset`.
+    fn outlet_at(app: &mut App, offset: (i32, i32)) -> Entity {
+        port_at(app, offset, Flow::Outlet, HAULED)
+    }
+
+    /// Stand a door handing out `item` rather than the one the rest of the map is plumbed for.
+    fn outlet_of(app: &mut App, offset: (i32, i32), item: Item) -> Entity {
+        port_at(app, offset, Flow::Outlet, item)
+    }
+
+    /// Stand the door a fleet delivers to on the tile at `offset`.
+    fn intake_at(app: &mut App, offset: (i32, i32)) -> Entity {
+        port_at(app, offset, Flow::Intake, HAULED)
     }
 
     /// Give `port` a fleet of `rovers` collecting from `source`.
@@ -468,20 +632,64 @@ mod tests {
 
     /// Put `quantity` at `port` for a fleet to collect.
     fn stock(app: &mut App, port: Entity, quantity: u32) {
-        app.world_mut().entity_mut(port).insert(Cargo { quantity });
+        app.world_mut()
+            .entity_mut(port)
+            .get_mut::<Holding>()
+            .expect("a port holds stock")
+            .take_in(quantity);
+    }
+
+    /// Have the building behind `port` keep making what it hands out, so a fleet never runs it dry.
+    fn produce_at(app: &mut App, port: Entity) {
+        app.world_mut().entity_mut(port).insert(Producing);
+    }
+
+    /// Have the building behind `port` consume what arrives, tallying it as it goes.
+    fn consume_at(app: &mut App, port: Entity) {
+        app.world_mut()
+            .entity_mut(port)
+            .insert(Consuming::default());
+    }
+
+    /// What every rover on the map that is carrying anything has on its back.
+    fn carried_items(app: &mut App) -> Vec<Item> {
+        let mut query = app.world_mut().query_filtered::<&Cargo, With<Rover>>();
+        query.iter(app.world()).map(|load| load.item).collect()
+    }
+
+    /// Whether every loaded rover on the map is holding a route rather than an order for one.
+    ///
+    /// A route it already drove is what a jammed rover waits on. One that let go of it is one the
+    /// network is asked to route again on every tick of the jam.
+    fn every_waiting_rover_still_holds_its_route(app: &mut App) -> bool {
+        let mut query = app
+            .world_mut()
+            .query_filtered::<Option<&Route>, (With<Rover>, With<Cargo>)>();
+        query.iter(app.world()).all(|route| route.is_some())
+    }
+
+    /// How much the building behind `port` has taken in over the run so far.
+    fn taken_in(app: &App, port: Entity) -> u32 {
+        app.world()
+            .entity(port)
+            .get::<Consuming>()
+            .map_or(0, |consuming| consuming.0)
     }
 
     fn held_at(app: &App, entity: Entity) -> u32 {
-        app.world()
-            .entity(entity)
-            .get::<Cargo>()
-            .map_or(0, |load| load.quantity)
+        let entity = app.world().entity(entity);
+        let carried = entity.get::<Cargo>().map_or(0, |load| load.quantity);
+        let stood = entity.get::<Holding>().map_or(0, Holding::held);
+        carried + stood
     }
 
     /// Everything anything in the world is holding, standing at a port or on the back of a rover.
     fn held_anywhere(app: &mut App) -> u32 {
-        let mut query = app.world_mut().query::<&Cargo>();
-        query.iter(app.world()).map(|load| load.quantity).sum()
+        let mut carried = app.world_mut().query::<&Cargo>();
+        let on_the_road: u32 = carried.iter(app.world()).map(|load| load.quantity).sum();
+        let mut stood = app.world_mut().query::<&Holding>();
+        let at_the_doors: u32 = stood.iter(app.world()).map(Holding::held).sum();
+        on_the_road + at_the_doors
     }
 
     fn rovers_serving(app: &mut App, port: Entity) -> usize {
@@ -555,8 +763,8 @@ mod tests {
     fn haulage_app() -> (App, Entity, Entity) {
         let mut app = fleet_app();
         lay_road(&mut app, &HAULAGE);
-        let source = port_at(&mut app, SOURCE);
-        let home = port_at(&mut app, HOME);
+        let source = outlet_at(&mut app, SOURCE);
+        let home = intake_at(&mut app, HOME);
         stock(&mut app, source, A_STOCK);
         tick(&mut app);
         (app, source, home)
@@ -575,8 +783,8 @@ mod tests {
     #[test]
     fn a_fleet_on_a_port_no_road_reaches_puts_no_rovers_on_the_road() {
         let mut app = fleet_app();
-        let source = port_at(&mut app, SOURCE);
-        let home = port_at(&mut app, HOME);
+        let source = outlet_at(&mut app, SOURCE);
+        let home = intake_at(&mut app, HOME);
         assign(&mut app, home, A_FLEET, source);
 
         tick(&mut app);
@@ -607,9 +815,141 @@ mod tests {
     }
 
     #[test]
+    fn a_rover_carries_the_item_of_the_outlet_it_collected_from() {
+        let mut app = fleet_app();
+        lay_road(&mut app, &HAULAGE);
+        let source = outlet_of(&mut app, SOURCE, MISPLUMBED);
+        let home = intake_at(&mut app, HOME);
+        stock(&mut app, source, A_STOCK);
+        tick(&mut app);
+        assign(&mut app, home, 1, source);
+
+        let loaded = run_until(&mut app, |app| !carried_items(app).is_empty());
+
+        assert!(loaded, "the rover never took anything on");
+        assert_eq!(carried_items(&mut app), vec![MISPLUMBED]);
+    }
+
+    #[test]
+    fn a_fleet_pointed_at_an_outlet_of_another_item_delivers_nothing() {
+        let mut app = fleet_app();
+        lay_road(&mut app, &HAULAGE);
+        let source = outlet_of(&mut app, SOURCE, MISPLUMBED);
+        let home = intake_at(&mut app, HOME);
+        stock(&mut app, source, A_STOCK);
+        tick(&mut app);
+        assign(&mut app, home, A_FLEET, source);
+
+        run(&mut app, TICKS_MEASURED);
+
+        assert_eq!(
+            held_at(&app, home),
+            0,
+            "a port took in an item it is no door for"
+        );
+        assert_eq!(held_anywhere(&mut app), A_STOCK);
+    }
+
+    #[test]
+    fn a_rover_collecting_from_an_empty_outlet_takes_on_nothing() {
+        let mut app = fleet_app();
+        lay_road(&mut app, &HAULAGE);
+        let source = outlet_at(&mut app, SOURCE);
+        let home = intake_at(&mut app, HOME);
+        tick(&mut app);
+        assign(&mut app, home, 1, source);
+
+        let reached = run_until(&mut app, |app| {
+            let standing = served(app, source);
+            a_rover_stands_at(app, standing)
+        });
+
+        assert!(reached, "the rover never reached the source");
+        run(&mut app, TICKS_A_FEW);
+        assert_eq!(
+            held_anywhere(&mut app),
+            0,
+            "a load came out of an empty port"
+        );
+    }
+
+    #[test]
+    fn a_fleet_collecting_from_an_intake_takes_nothing_out_of_it() {
+        let mut app = fleet_app();
+        lay_road(&mut app, &HAULAGE);
+        let source = intake_at(&mut app, SOURCE);
+        let home = intake_at(&mut app, HOME);
+        stock(&mut app, source, A_STOCK);
+        tick(&mut app);
+        assign(&mut app, home, A_FLEET, source);
+
+        run(&mut app, TICKS_MEASURED);
+
+        assert_eq!(
+            held_at(&app, source),
+            A_STOCK,
+            "a rover drew on what was delivered to an intake"
+        );
+    }
+
+    #[test]
+    fn a_rover_that_cannot_hand_over_waits_at_the_door_it_serves() {
+        let (mut app, source, home) = haulage_app();
+        produce_at(&mut app, source);
+        stock(&mut app, home, PORT_CAPACITY);
+        assign(&mut app, home, 1, source);
+
+        let back = run_until(&mut app, |app| {
+            let standing = served(app, home);
+            a_rover_stands_at(app, standing) && !carried_items(app).is_empty()
+        });
+
+        assert!(back, "no loaded rover ever got back to the port it serves");
+        run(&mut app, TICKS_A_FEW);
+        assert_eq!(held_at(&app, home), PORT_CAPACITY);
+        assert_eq!(
+            carried_items(&mut app),
+            vec![HAULED],
+            "the rover it could not unload gave up its load anyway"
+        );
+    }
+
+    #[test]
+    fn a_rover_held_at_a_full_door_keeps_the_route_it_drove_rather_than_asking_for_another() {
+        let (mut app, source, home) = haulage_app();
+        produce_at(&mut app, source);
+        stock(&mut app, home, PORT_CAPACITY);
+        assign(&mut app, home, 1, source);
+
+        let back = run_until(&mut app, |app| {
+            let standing = served(app, home);
+            a_rover_stands_at(app, standing) && !carried_items(app).is_empty()
+        });
+        assert!(back, "no loaded rover ever got back to the port it serves");
+        run(&mut app, TICKS_A_FEW);
+
+        assert!(
+            every_waiting_rover_still_holds_its_route(&mut app),
+            "a rover jammed at a full door asks for a route every tick it waits"
+        );
+    }
+
+    #[test]
+    fn a_chain_run_for_a_stretch_of_ticks_loses_nothing_and_invents_nothing() {
+        let (mut app, source, home) = haulage_app();
+        consume_at(&mut app, home);
+        assign(&mut app, home, A_FLEET, source);
+
+        run(&mut app, TICKS_MEASURED);
+
+        assert!(taken_in(&app, home) > 0, "nothing ever reached the port");
+        assert_eq!(taken_in(&app, home) + held_anywhere(&mut app), A_STOCK);
+    }
+
+    #[test]
     fn two_fleets_on_one_road_do_not_draw_on_each_others_rovers() {
         let (mut app, source, home) = haulage_app();
-        let other = port_at(&mut app, OTHER_HOME);
+        let other = intake_at(&mut app, OTHER_HOME);
         tick(&mut app);
         assign(&mut app, home, A_FLEET, source);
         assign(&mut app, other, 1, source);
@@ -706,8 +1046,8 @@ mod tests {
     fn a_fleet_whose_source_no_road_reaches_keeps_its_rovers_at_the_port() {
         let mut app = fleet_app();
         lay_road(&mut app, &HAULAGE);
-        let source = port_at(&mut app, UP_THE_BRANCH);
-        let home = port_at(&mut app, HOME);
+        let source = outlet_at(&mut app, UP_THE_BRANCH);
+        let home = intake_at(&mut app, HOME);
         stock(&mut app, source, A_STOCK);
         tick(&mut app);
         assign(&mut app, home, 1, source);
@@ -727,8 +1067,8 @@ mod tests {
     fn a_fleet_sets_off_once_a_road_reaches_its_source() {
         let mut app = fleet_app();
         lay_road(&mut app, &HAULAGE);
-        let source = port_at(&mut app, UP_THE_BRANCH);
-        let home = port_at(&mut app, HOME);
+        let source = outlet_at(&mut app, UP_THE_BRANCH);
+        let home = intake_at(&mut app, HOME);
         stock(&mut app, source, A_STOCK);
         tick(&mut app);
         assign(&mut app, home, 1, source);
@@ -745,8 +1085,8 @@ mod tests {
     fn a_fleet_sets_off_once_a_road_reaches_its_source_however_a_frame_divides() {
         let mut app = fleet_app();
         lay_road(&mut app, &HAULAGE);
-        let source = port_at(&mut app, UP_THE_BRANCH);
-        let home = port_at(&mut app, HOME);
+        let source = outlet_at(&mut app, UP_THE_BRANCH);
+        let home = intake_at(&mut app, HOME);
         stock(&mut app, source, A_STOCK);
         tick(&mut app);
         assign(&mut app, home, 1, source);
@@ -766,9 +1106,9 @@ mod tests {
     fn a_rover_takes_on_no_load_from_a_port_it_is_not_standing_at() {
         let mut app = fleet_app();
         lay_road(&mut app, &HAULAGE);
-        let empty = port_at(&mut app, SOURCE);
-        let stocked = port_at(&mut app, OTHER_HOME);
-        let home = port_at(&mut app, HOME);
+        let empty = outlet_at(&mut app, SOURCE);
+        let stocked = outlet_at(&mut app, OTHER_HOME);
+        let home = intake_at(&mut app, HOME);
         stock(&mut app, stocked, A_STOCK);
         tick(&mut app);
         assign(&mut app, home, 1, empty);
@@ -853,9 +1193,11 @@ mod tests {
     fn two_rovers_deliver_more_over_the_same_ticks_than_one() {
         let delivered = |rovers: u32| {
             let (mut app, source, home) = haulage_app();
+            produce_at(&mut app, source);
+            consume_at(&mut app, home);
             assign(&mut app, home, rovers, source);
             run(&mut app, TICKS_MEASURED);
-            held_at(&app, home)
+            taken_in(&app, home)
         };
 
         let one = delivered(1);
@@ -870,6 +1212,282 @@ mod tests {
             two > one,
             "two rovers delivered {two} where one delivered {one}"
         );
+    }
+
+    /// The tile the building the player assigns stands on, in offset-row coordinates.
+    const ASSIGNED: (i32, i32) = (0, 0);
+
+    /// The tile the building it is pointed at stands on, in offset-row coordinates.
+    const COLLECTED: (i32, i32) = (3, 0);
+
+    /// How far through the catalogue the first assembler sits: one item in, one out.
+    ///
+    /// An extractor takes nothing in, so it stands no intake, and an intake is what takes a fleet.
+    const MELTER: isize = 5;
+
+    /// The corner a melter's intake stands on, which is `INTAKE_CORNERS[0]` unturned.
+    const INTAKE_CORNER: TileCorner = TileCorner::SouthWest;
+
+    /// The corner an extractor's outlet stands on, which is `OUTLET_CORNERS[0]` unturned.
+    const OUTLET_CORNER: TileCorner = TileCorner::North;
+
+    /// The tiles the road serving the assigned building's intake runs over.
+    const REACHING: [(i32, i32); 2] = [(0, 0), (1, 0)];
+
+    fn hold(app: &mut App, tool: PlayerAction) {
+        app.world_mut()
+            .resource_mut::<NextState<PlayerAction>>()
+            .set(tool);
+        tick(app);
+    }
+
+    /// Lay a road through the `corner` of each of `offsets`, and let it take its tiles.
+    fn lay_road_through(app: &mut App, corner: TileCorner, offsets: &[(i32, i32)]) {
+        let nodes = offsets
+            .iter()
+            .map(|&offset| corner.node_of(tile(offset)))
+            .collect();
+        app.world_mut().spawn(Road {
+            nodes,
+            leaving: None,
+            one_way: false,
+        });
+        tick(app);
+    }
+
+    /// Click over `tile` at `point`, then let the button go, so one frame is not two clicks.
+    fn click_at(app: &mut App, tile: Entity, point: Vec3, secondary: bool) {
+        {
+            let mut input = app.world_mut().resource_mut::<PlayerInput>();
+            if secondary {
+                input.secondary_tap = true;
+            } else {
+                input.tap = true;
+            }
+            input.cursor_tile = Some(tile);
+            input.world_cursor_position = Some(point);
+        }
+        tick(app);
+        let mut input = app.world_mut().resource_mut::<PlayerInput>();
+        input.tap = false;
+        input.secondary_tap = false;
+    }
+
+    /// Put the `steps`th type of the catalogue on `offsets`, answering with it and its tile.
+    fn place(app: &mut App, offsets: (i32, i32), steps: isize) -> (Entity, Entity) {
+        app.world_mut()
+            .resource_mut::<ChosenBuildingType>()
+            .step(steps);
+        let ground = app
+            .world_mut()
+            .spawn(MapTile {
+                coordinates: tile(offsets),
+            })
+            .id();
+        click_at(app, ground, tile(offsets).world_position(), false);
+        app.world_mut()
+            .resource_mut::<ChosenBuildingType>()
+            .step(-steps);
+        let building = app
+            .world()
+            .resource::<BuildingTiles>()
+            .building_on(tile(offsets))
+            .expect("a building stands there");
+        (building, ground)
+    }
+
+    /// The port of `building` standing on `corner` of the tile at `offsets`.
+    fn port_on(app: &App, building: Entity, corner: TileCorner, offsets: (i32, i32)) -> Entity {
+        let node = corner.node_of(tile(offsets));
+        app.world()
+            .get::<Children>(building)
+            .expect("a building has its ports")
+            .iter()
+            .find(|port| {
+                app.world()
+                    .get::<RoadEndpoint>(*port)
+                    .is_some_and(|endpoint| endpoint.standing_on() == node)
+            })
+            .expect("a port stands on that corner")
+    }
+
+    /// Press and release `key`, so one press is not read on every frame after it.
+    fn tap_key(app: &mut App, key: KeyCode) {
+        press_key(app, key);
+        tick(app);
+        release_key(app, key);
+        tick(app);
+    }
+
+    /// A melter to assign, an extractor to point it at, and a road reaching the melter's intake.
+    ///
+    /// Answers with the app, the melter's tile, its intake and the extractor's outlet.
+    fn assignment_app() -> (App, Entity, Entity, Entity) {
+        let mut app = fleet_app();
+        hold(&mut app, PlayerAction::EditBuildings);
+        let (melter, ground) = place(&mut app, ASSIGNED, MELTER);
+        let (extractor, _) = place(&mut app, COLLECTED, 0);
+        lay_road_through(&mut app, INTAKE_CORNER, &REACHING);
+        hold(&mut app, PlayerAction::Select);
+
+        let intake = port_on(&app, melter, INTAKE_CORNER, ASSIGNED);
+        let source = port_on(&app, extractor, OUTLET_CORNER, COLLECTED);
+        (app, ground, intake, source)
+    }
+
+    /// Pick out `corner` of the tile at `offsets`, which is a left click over that corner.
+    fn pick_out(app: &mut App, ground: Entity, offsets: (i32, i32), corner: TileCorner) {
+        click_at(
+            app,
+            ground,
+            corner.node_of(tile(offsets)).world_position(),
+            false,
+        );
+    }
+
+    /// Point what is picked out at `corner` of the tile at `offsets`, which is a right click.
+    fn point_at(app: &mut App, ground: Entity, offsets: (i32, i32), corner: TileCorner) {
+        click_at(
+            app,
+            ground,
+            corner.node_of(tile(offsets)).world_position(),
+            true,
+        );
+    }
+
+    fn ground_of(app: &App, offsets: (i32, i32)) -> Entity {
+        app.world()
+            .iter_entities()
+            .find(|entity| {
+                entity
+                    .get::<MapTile>()
+                    .is_some_and(|it| it.coordinates == tile(offsets))
+            })
+            .expect("the test spawned that tile")
+            .id()
+    }
+
+    fn fleet_of(app: &App, port: Entity) -> Option<&Fleet> {
+        app.world().entity(port).get::<Fleet>()
+    }
+
+    #[test]
+    fn pointing_the_port_picked_out_at_another_gives_it_a_fleet_collecting_there() {
+        let (mut app, ground, intake, source) = assignment_app();
+        pick_out(&mut app, ground, ASSIGNED, INTAKE_CORNER);
+
+        let supplying = ground_of(&app, COLLECTED);
+        point_at(&mut app, supplying, COLLECTED, OUTLET_CORNER);
+
+        let fleet = fleet_of(&app, intake).expect("the intake was given a fleet");
+        assert_eq!(fleet.source, source);
+        assert_eq!(fleet.rovers, 0);
+    }
+
+    #[test]
+    fn pointing_a_port_at_itself_gives_it_no_fleet() {
+        let (mut app, ground, intake, _) = assignment_app();
+        pick_out(&mut app, ground, ASSIGNED, INTAKE_CORNER);
+
+        point_at(&mut app, ground, ASSIGNED, INTAKE_CORNER);
+
+        assert!(fleet_of(&app, intake).is_none());
+    }
+
+    #[test]
+    fn an_outlet_takes_no_fleet() {
+        let (mut app, ground, _, _) = assignment_app();
+        pick_out(&mut app, ground, ASSIGNED, OUTLET_CORNER);
+
+        let supplying = ground_of(&app, COLLECTED);
+        point_at(&mut app, supplying, COLLECTED, OUTLET_CORNER);
+
+        let melter = app
+            .world()
+            .resource::<BuildingTiles>()
+            .building_on(tile(ASSIGNED))
+            .expect("the melter stands there");
+        let outlet = port_on(&app, melter, OUTLET_CORNER, ASSIGNED);
+        assert!(fleet_of(&app, outlet).is_none());
+    }
+
+    #[test]
+    fn raising_the_count_puts_another_rover_on_the_road() {
+        let (mut app, ground, intake, source) = assignment_app();
+        pick_out(&mut app, ground, ASSIGNED, INTAKE_CORNER);
+        assign(&mut app, intake, 1, source);
+        assert!(run_until(&mut app, |app| rovers_serving(app, intake) == 1));
+
+        tap_key(&mut app, FLEET_KEYS[1].0);
+
+        assert!(run_until(&mut app, |app| rovers_serving(app, intake) == 2));
+    }
+
+    #[test]
+    fn lowering_the_count_takes_a_rover_off_the_road() {
+        let (mut app, ground, intake, source) = assignment_app();
+        pick_out(&mut app, ground, ASSIGNED, INTAKE_CORNER);
+        assign(&mut app, intake, A_FLEET, source);
+        assert!(run_until(&mut app, |app| rovers_serving(app, intake)
+            == A_FLEET as usize));
+
+        tap_key(&mut app, FLEET_KEYS[0].0);
+
+        assert!(run_until(&mut app, |app| rovers_serving(app, intake)
+            == A_FLEET as usize - 1));
+    }
+
+    #[test]
+    fn the_count_does_not_fall_below_none() {
+        let (mut app, ground, intake, source) = assignment_app();
+        pick_out(&mut app, ground, ASSIGNED, INTAKE_CORNER);
+        assign(&mut app, intake, 0, source);
+
+        tap_key(&mut app, FLEET_KEYS[0].0);
+
+        assert_eq!(
+            fleet_of(&app, intake)
+                .expect("the intake keeps its fleet")
+                .rovers,
+            0
+        );
+    }
+
+    #[test]
+    fn pointing_a_running_fleet_somewhere_new_keeps_the_rovers_it_has() {
+        let (mut app, ground, intake, source) = assignment_app();
+        pick_out(&mut app, ground, ASSIGNED, INTAKE_CORNER);
+        assign(&mut app, intake, A_FLEET, source);
+        assert!(run_until(&mut app, |app| rovers_serving(app, intake)
+            == A_FLEET as usize));
+
+        point_at(&mut app, ground, ASSIGNED, OUTLET_CORNER);
+
+        let melter = app
+            .world()
+            .resource::<BuildingTiles>()
+            .building_on(tile(ASSIGNED))
+            .expect("the melter stands there");
+        let outlet = port_on(&app, melter, OUTLET_CORNER, ASSIGNED);
+        assert_eq!(
+            fleet_of(&app, intake)
+                .expect("the intake keeps its fleet")
+                .source,
+            outlet
+        );
+        assert_eq!(rovers_serving(&mut app, intake), A_FLEET as usize);
+    }
+
+    #[test]
+    fn a_click_with_another_tool_held_assigns_nothing() {
+        let (mut app, ground, intake, _) = assignment_app();
+        pick_out(&mut app, ground, ASSIGNED, INTAKE_CORNER);
+        hold(&mut app, PlayerAction::EditRoads);
+
+        let supplying = ground_of(&app, COLLECTED);
+        point_at(&mut app, supplying, COLLECTED, OUTLET_CORNER);
+
+        assert!(fleet_of(&app, intake).is_none());
     }
 
     #[test]
