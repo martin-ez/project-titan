@@ -41,6 +41,10 @@ const FLEET_KEYS: [(KeyCode, i32); 2] = [(KeyCode::Minus, -1), (KeyCode::Equal, 
 /// The rovers each port has been given, and the shuttle they run.
 pub struct FleetPlugin;
 
+/// The set the shuttles run in, so a system reading a port after they collected can follow them.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FleetsServed;
+
 /// The rovers a port has been given, and the port they collect from.
 ///
 /// The count is the port's own record rather than a fact about a frame, which is what leaves a
@@ -118,6 +122,7 @@ impl Plugin for FleetPlugin {
                     set_the_idle_rovers_off_again,
                 )
                     .chain()
+                    .in_set(FleetsServed)
                     .after(RoversDriven)
                     .in_set(Simulation),
             )

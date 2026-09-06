@@ -308,7 +308,11 @@ const fn stack(count: u32, item: Item) -> Stack {
     Stack { item, count }
 }
 
-const fn assembler(inputs: &'static [Stack], outputs: &'static [Stack], ticks: u32) -> BuildingType {
+const fn assembler(
+    inputs: &'static [Stack],
+    outputs: &'static [Stack],
+    ticks: u32,
+) -> BuildingType {
     BuildingType::Assembler(Recipe {
         inputs,
         outputs,

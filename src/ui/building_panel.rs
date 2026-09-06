@@ -11,6 +11,7 @@
 
 use crate::building::{BuildingType, Flow, Port};
 use crate::fleet::Fleet;
+use crate::production::{Running, Stopped, WaitingOn};
 use crate::ui::selection::{Picked, Selection};
 use crate::ui::{panel, panel_row, panel_text, PanelCorner, BODY_TEXT, HEADING_TEXT, KEYED_TEXT};
 use bevy::ecs::system::SystemParam;
@@ -35,6 +36,16 @@ pub struct BuildingPanelPlugin;
 #[derive(Component)]
 struct BuildingPanel;
 
+/// A building that has just started a run or just stopped, which is what the reading is of.
+type ProductionMoved = Or<(Changed<Running>, Changed<Stopped>)>;
+
+/// What the panel says about the building itself: what it is, and what it is doing about it.
+struct Reading {
+    heading: String,
+    doing: &'static str,
+    rows: Vec<PortRow>,
+}
+
 /// One line of the panel: what the port is, what its fleet was told, and whether it is picked out.
 struct PortRow {
     port: String,
@@ -45,7 +56,16 @@ struct PortRow {
 /// Everything the panel reads to say what a building is doing.
 #[derive(SystemParam)]
 struct WhatToSay<'w, 's> {
-    buildings: Query<'w, 's, (&'static BuildingType, &'static Children)>,
+    buildings: Query<
+        'w,
+        's,
+        (
+            &'static BuildingType,
+            &'static Children,
+            Option<&'static Running>,
+            Option<&'static Stopped>,
+        ),
+    >,
     kinds: Query<'w, 's, &'static BuildingType>,
     ports: Query<'w, 's, (&'static Port, Option<&'static Fleet>)>,
     homes: Query<'w, 's, &'static ChildOf>,
@@ -67,50 +87,51 @@ fn redraw_the_panel(
     mut commands: Commands,
     selection: Res<Selection>,
     moved: Query<(), Changed<Fleet>>,
+    stirred: Query<(), ProductionMoved>,
     panels: Query<Entity, With<BuildingPanel>>,
     saying: WhatToSay,
 ) {
-    if !selection.is_changed() && moved.is_empty() {
+    let picked = selection.building();
+    let started_or_stopped = picked.is_some_and(|building| stirred.contains(building));
+    if !selection.is_changed() && moved.is_empty() && !started_or_stopped {
         return;
     }
-    let reading = selection
-        .building()
-        .and_then(|building| saying.reading_of(building, selection.port()));
+    let reading = picked.and_then(|building| saying.reading_of(building, selection.port()));
     let standing = panels.iter().next();
 
     match (reading, standing) {
         (None, Some(panel)) => commands.entity(panel).despawn(),
         (None, None) => {}
-        (Some((heading, rows)), Some(panel)) => {
+        (Some(reading), Some(panel)) => {
             commands
                 .entity(panel)
                 .despawn_related::<Children>()
-                .with_children(|panel| fill_the_panel(panel, &heading, &rows));
+                .with_children(|panel| fill_the_panel(panel, &reading));
         }
-        (Some((heading, rows)), None) => {
+        (Some(reading), None) => {
             commands
                 .spawn((
                     BuildingPanel,
                     panel(PanelCorner::BottomRight, Val::Px(PANEL_WIDTH)),
                 ))
-                .with_children(|panel| fill_the_panel(panel, &heading, &rows));
+                .with_children(|panel| fill_the_panel(panel, &reading));
         }
     }
 }
 
 impl WhatToSay<'_, '_> {
     /// What the panel says about `building`, given which of its ports the player picked out.
-    fn reading_of(
-        &self,
-        building: Entity,
-        picked_out: Option<Entity>,
-    ) -> Option<(String, Vec<PortRow>)> {
-        let (kind, ports) = self.buildings.get(building).ok()?;
+    fn reading_of(&self, building: Entity, picked_out: Option<Entity>) -> Option<Reading> {
+        let (kind, ports, running, stopped) = self.buildings.get(building).ok()?;
         let rows = ports
             .iter()
             .filter_map(|port| self.row_of(port, picked_out == Some(port)))
             .collect();
-        Some((kind.label(), rows))
+        Some(Reading {
+            heading: kind.label(),
+            doing: doing(running, stopped),
+            rows,
+        })
     }
 
     fn row_of(&self, port: Entity, picked_out: bool) -> Option<PortRow> {
@@ -151,9 +172,21 @@ impl WhatToSay<'_, '_> {
     }
 }
 
-fn fill_the_panel(panel: &mut ChildSpawnerCommands, heading: &str, rows: &[PortRow]) {
-    panel.spawn(panel_text(heading.to_string(), HEADING_TEXT, Val::Auto));
-    for row in rows {
+/// What the panel says a building is making of its recipe, which is what a stalled chain is read
+/// off. A building the tick has not looked at yet carries neither mark, and has yet to try.
+fn doing(running: Option<&Running>, stopped: Option<&Stopped>) -> &'static str {
+    match (running, stopped) {
+        (Some(_), _) => "Running",
+        (None, Some(Stopped(WaitingOn::AnInput))) => "Waiting on an input",
+        (None, Some(Stopped(WaitingOn::OutletRoom))) => "Waiting on room to put its output",
+        (None, None) => "Yet to run",
+    }
+}
+
+fn fill_the_panel(panel: &mut ChildSpawnerCommands, reading: &Reading) {
+    panel.spawn(panel_text(reading.heading.clone(), HEADING_TEXT, Val::Auto));
+    panel.spawn(panel_text(reading.doing.to_string(), BODY_TEXT, Val::Auto));
+    for row in &reading.rows {
         panel.spawn(panel_row()).with_children(|line| {
             line.spawn(panel_text(
                 format!("{}{}", PICKED_OUT[usize::from(row.picked_out)], row.port),
