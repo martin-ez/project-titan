@@ -24,6 +24,7 @@ fn main() {
         .add_plugins(fleet::FleetPlugin)
         .add_plugins(input::PlayerInputPlugin)
         .add_plugins(map::MapPlugin)
+        .add_plugins(road::JunctionSignalPlugin)
         .add_plugins(road::RoadPlugin)
         .add_plugins(rover::RoverPlugin)
         .add_plugins(simulation::SimulationPlugin)
