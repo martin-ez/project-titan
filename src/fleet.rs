@@ -1478,7 +1478,9 @@ mod tests {
     }
 
     fn rovers_of(app: &App, port: Entity) -> u32 {
-        fleet_of(app, port).expect("the port was given a fleet").rovers
+        fleet_of(app, port)
+            .expect("the port was given a fleet")
+            .rovers
     }
 
     /// Give the map a pool of `size` rovers, in place of the one the game ships with.
