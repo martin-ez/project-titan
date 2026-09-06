@@ -4,7 +4,9 @@ use crate::common::initialize::{initialize_system, Initialize, NeedsInitializati
 use crate::diagnostics::DebugGizmos;
 use crate::input::{PlayerAction, PlayerInput};
 use crate::map::{HexCoordinates, LatticeNode, MapTile, MAP_TILE_INRADIUS, MAP_TILE_SIZE};
+use crate::simulation::Ticks;
 use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
+use crate::ui::selection::{Picked, Selection};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use std::cmp::{Ordering, Reverse};
@@ -57,6 +59,21 @@ const JUNCTION_PULLBACK: f32 = MAP_TILE_SIZE / 4.;
 /// Two crossings closer than this have no room between them for either of their turns, so the
 /// second is refused rather than laid over the first.
 const JUNCTION_EXTENT: f32 = 2. * JUNCTION_PULLBACK;
+
+/// How many ticks the favoured road holds the green on a junction the player has just signalled.
+///
+/// One rover crosses a junction a tick, so this is how long a queue the favoured road clears
+/// before the green moves on. Every other leg holds it for a single tick.
+const OPENING_GREEN: u32 = 8;
+
+/// The shortest green a leg can be tuned down to, which is one rover's turn through the junction.
+const SHORTEST_GREEN: u32 = 1;
+
+/// The key that puts a signal on the junction the player picked out, and takes it off again.
+const SIGNAL_KEY: KeyCode = KeyCode::KeyG;
+
+/// The keys that shorten and lengthen the green of the junction the player picked out.
+const GREEN_KEYS: [(KeyCode, i32); 2] = [(KeyCode::BracketLeft, -1), (KeyCode::BracketRight, 1)];
 
 /// How closely a fitted turn has to meet the leg it reaches to be laid as one arc.
 ///
@@ -147,6 +164,12 @@ const GIVING_WAY_COLOUR: Color = Color::srgb(0.9, 0.7, 0.25);
 
 /// The colour a leg with priority over the others is marked in
 const PRIORITY_COLOUR: Color = Color::srgb(0.35, 0.85, 0.45);
+
+/// The colour the one leg of a signalled junction holding the green is marked in
+const GREEN_COLOUR: Color = Color::srgb(0.3, 1., 0.35);
+
+/// The colour every other leg of a signalled junction is marked in, being held at red
+const RED_COLOUR: Color = Color::srgb(0.9, 0.2, 0.2);
 
 /// The colour the link from a tile to the road serving it is drawn in
 const SERVED_COLOUR: Color = Color::srgb(0.4, 0.95, 0.7);
@@ -354,9 +377,12 @@ pub struct EndsAtJunction {
 
 /// How a junction chooses which of the rovers waiting on its legs goes through next.
 ///
-/// The junction holds the answer rather than the handover deciding it, so a signal or a
-/// roundabout is another policy at the same point rather than another kind of junction. Which
-/// leg it names is decided by the tick, never by the order the world stores its rovers in.
+/// The junction holds the answer rather than the handover deciding it, so a roundabout is another
+/// policy at the same point rather than another kind of junction. Which leg it names is decided by
+/// the tick, never by the order the world stores its rovers in.
+///
+/// It is what the roads' own history decided. A [`Signal`] is what the player asked for instead,
+/// and lays over it rather than replacing it.
 #[derive(Component, Clone, Debug, PartialEq)]
 pub enum JunctionPolicy {
     /// Every leg in turn, the tick saying which of them is asked first.
@@ -364,6 +390,37 @@ pub enum JunctionPolicy {
     /// Traffic on one road goes first, and every other leg gives way to it.
     GiveWayTo(Entity),
 }
+
+/// The keys that put a [`Signal`] on the junction the player picked out, and time it.
+///
+/// It is kept apart from [`RoadPlugin`] because it is the one thing here that needs the player's
+/// selection to do its work, and a road network that could not be built without the interface
+/// looking at it would be a subsystem that does not own itself (invariant 4). What it writes is
+/// the road's own component, declared beside it rather than in the panel that will read it.
+pub struct JunctionSignalPlugin;
+
+/// A signal the player has put on a junction, holding every leg but one of them red.
+///
+/// It sits beside the [`JunctionPolicy`] rather than replacing it, because the policy is derived
+/// from which road was there first and that order is kept nowhere: a signal that overwrote it
+/// could never come off without the junction losing the right of way its roads had earned.
+///
+/// The green is given per road rather than per leg, because a leg is worked out afresh from the
+/// geometry whenever any junction changes and a road crossed twice renumbers them. A road is what
+/// the player pointed at, and what [`JunctionPolicy::GiveWayTo`] is keyed by already.
+#[derive(Component, Clone, Debug, PartialEq)]
+pub struct Signal {
+    favouring: Entity,
+    green: u32,
+}
+
+/// What the debug view reads off a junction to draw it: where it reaches, and who is let through.
+type JunctionDrawing = (
+    &'static Junction,
+    Option<&'static JunctionLegs>,
+    Option<&'static JunctionPolicy>,
+    Option<&'static Signal>,
+);
 
 /// A road that has been measured against the roads already laid for the places it crosses them.
 #[derive(Component)]
@@ -891,6 +948,30 @@ impl PlaceOnTheRoad {
     }
 }
 
+impl Junction {
+    /// Whether `place` falls on the ground the junction takes, which is what picks one out.
+    ///
+    /// The pull-back is the radius, being the reach the legs are already taken back by and the
+    /// circle the debug view already draws, so what the player can point at is what they can see.
+    pub fn reaches(&self, place: Vec3) -> bool {
+        self.at.distance(place) <= JUNCTION_PULLBACK
+    }
+
+    /// The roads that meet here, in the order the crossings were noted.
+    ///
+    /// One entry a road however many of its arcs reach the crossing, because a signal is given to
+    /// a road rather than to an arm and the player cycles through what there is to favour.
+    pub fn roads(&self) -> Vec<Entity> {
+        let mut roads: Vec<Entity> = Vec::new();
+        for crossing in &self.across {
+            if !roads.contains(&crossing.road) {
+                roads.push(crossing.road);
+            }
+        }
+        roads
+    }
+}
+
 impl JunctionLegs {
     /// The ways through the junction open to a rover arriving on `leg`, straightest way first.
     ///
@@ -956,6 +1037,72 @@ impl JunctionPolicy {
             .copied()
             .filter(|&leg| favoured.is_none_or(|road| legs.road_of(leg) == Some(road)))
             .min_by_key(|&leg| (leg + count - asked) % count)
+    }
+}
+
+impl Signal {
+    /// A signal favouring `road`, green on it for as long as a junction newly signalled holds it.
+    pub fn favouring(road: Entity) -> Self {
+        Self {
+            favouring: road,
+            green: OPENING_GREEN,
+        }
+    }
+
+    /// The road its longer green is given to.
+    pub fn favours(&self) -> Entity {
+        self.favouring
+    }
+
+    /// Lengthen or shorten the green by `asked`, never below a single tick.
+    ///
+    /// A leg green for no ticks at all is a road closed rather than a road waiting, and closing a
+    /// road is what taking it up is for.
+    pub fn tune(&mut self, asked: i32) {
+        self.green = self.green.saturating_add_signed(asked).max(SHORTEST_GREEN);
+    }
+
+    /// Which of the legs a rover is waiting on the signal lets through on `tick`.
+    ///
+    /// Every leg holds the green in turn for the run of ticks its road is given, and exactly one
+    /// leg holds it at a time — so every other leg is red, and a red leg lets nobody out. A green
+    /// spent on a leg nobody is waiting on is spent all the same, which is the whole of what a
+    /// signal costs and the whole of what makes timing one worth doing.
+    ///
+    /// The run is walked in leg order, which the geometry settles, so the answer never depends on
+    /// the order the world stores its rovers or its roads in (invariant 2).
+    pub fn who_goes_next(
+        &self,
+        legs: &JunctionLegs,
+        waiting: &[usize],
+        tick: u64,
+    ) -> Option<usize> {
+        let green = self.green_on(legs, tick)?;
+        waiting.contains(&green).then_some(green)
+    }
+
+    fn green_on(&self, legs: &JunctionLegs, tick: u64) -> Option<usize> {
+        let cycle: u64 = (0..legs.0.len()).map(|leg| self.held_by(legs, leg)).sum();
+        if cycle == 0 {
+            return None;
+        }
+
+        let mut into = tick % cycle;
+        for leg in 0..legs.0.len() {
+            let held = self.held_by(legs, leg);
+            if into < held {
+                return Some(leg);
+            }
+            into -= held;
+        }
+        None
+    }
+
+    fn held_by(&self, legs: &JunctionLegs, leg: usize) -> u64 {
+        match legs.road_of(leg) == Some(self.favouring) {
+            true => self.green.max(SHORTEST_GREEN) as u64,
+            false => SHORTEST_GREEN as u64,
+        }
     }
 }
 
@@ -1462,6 +1609,99 @@ fn cut_the_roads_where_they_cross(
                     .entity(junction)
                     .insert((Junction { at, across }, policy));
             }
+        }
+    }
+}
+
+impl Plugin for JunctionSignalPlugin {
+    fn build(&self, app: &mut App) {
+        app.declare_bindings([
+            Binding {
+                input: BindingInput::Key(SIGNAL_KEY),
+                action: "Signal the junction you picked out, road by road",
+                context: BindingContext::Tool(PlayerAction::Select),
+            },
+            Binding {
+                input: BindingInput::Key(GREEN_KEYS[0].0),
+                action: "Shorten the green of the junction you picked out",
+                context: BindingContext::Tool(PlayerAction::Select),
+            },
+            Binding {
+                input: BindingInput::Key(GREEN_KEYS[1].0),
+                action: "Lengthen the green of the junction you picked out",
+                context: BindingContext::Tool(PlayerAction::Select),
+            },
+        ])
+        .add_systems(
+            Update,
+            (
+                signal_the_junction_the_player_picked_out,
+                time_the_signal_the_player_picked_out,
+            )
+                .chain()
+                .after(Picked),
+        );
+    }
+}
+
+/// Put a signal on the junction the player picked out, move it to the next road, or take it off.
+///
+/// One key walks the whole of what there is to say: a junction with no signal takes one favouring
+/// the first road that meets there, and each press after that hands the green to the next road
+/// until there are none left, when the signal comes off and the junction is back on the right of
+/// way its roads were laid with. The policy is never written, so what the player put on is the
+/// only thing they can take off again.
+fn signal_the_junction_the_player_picked_out(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    action: Res<State<PlayerAction>>,
+    selection: Res<Selection>,
+    junctions: Query<(&Junction, Option<&Signal>)>,
+) {
+    if *action.get() != PlayerAction::Select || !keys.just_pressed(SIGNAL_KEY) {
+        return;
+    }
+    let Some(picked) = selection.junction() else {
+        return;
+    };
+    let Ok((junction, signal)) = junctions.get(picked) else {
+        return;
+    };
+
+    let roads = junction.roads();
+    let favouring = match signal {
+        None => roads.first().copied(),
+        Some(signal) => roads
+            .iter()
+            .position(|&road| road == signal.favours())
+            .and_then(|holding| roads.get(holding + 1))
+            .copied(),
+    };
+    match favouring {
+        Some(road) => commands.entity(picked).insert(Signal::favouring(road)),
+        None => commands.entity(picked).remove::<Signal>(),
+    };
+}
+
+/// Lengthen or shorten the green of the junction the player picked out.
+fn time_the_signal_the_player_picked_out(
+    keys: Res<ButtonInput<KeyCode>>,
+    action: Res<State<PlayerAction>>,
+    selection: Res<Selection>,
+    mut signals: Query<&mut Signal>,
+) {
+    if *action.get() != PlayerAction::Select {
+        return;
+    }
+    let Some(mut signal) = selection
+        .junction()
+        .and_then(|junction| signals.get_mut(junction).ok())
+    else {
+        return;
+    };
+    for (key, asked) in GREEN_KEYS {
+        if keys.just_pressed(key) {
+            signal.tune(asked);
         }
     }
 }
@@ -2217,15 +2457,18 @@ fn where_the_circles_meet(one: &Arc, other: &Arc) -> Vec<Vec3> {
 fn forget_a_removed_road_at_the_junctions_on_it(
     removed: On<Remove, Road>,
     mut commands: Commands,
-    mut junctions: Query<(Entity, &mut Junction)>,
+    mut junctions: Query<(Entity, &mut Junction, Option<&Signal>)>,
 ) {
-    for (entity, mut junction) in &mut junctions {
+    for (entity, mut junction, signal) in &mut junctions {
         if !junction
             .across
             .iter()
             .any(|crossing| crossing.road == removed.entity)
         {
             continue;
+        }
+        if signal.is_some_and(|signal| signal.favours() == removed.entity) {
+            commands.entity(entity).remove::<Signal>();
         }
         junction
             .across
@@ -2342,18 +2585,22 @@ fn ring_around(centre: Vec3, radius: f32) -> impl Iterator<Item = Vec3> {
     })
 }
 
-/// Mark how far every junction reaches, its legs, and which of them the policy lets go first.
+/// Mark how far every junction reaches, its legs, and which of them is being let through.
 ///
 /// A crossing is a point on both roads rather than anything either of them stores, so a road
 /// drawn over another looks exactly like a road drawn beside it until the junction is drawn. The
 /// circle is the pull-back the junction takes its legs back by, which is the ground the turns
 /// through it are fitted over. Nor does anything say which arms it gathered into one leg, or
 /// which of them a rover waits on, so the arrows say both.
+///
+/// Which leg a signal holds green moves with game time, so it is drawn only where there is a
+/// simulation to read a tick from — the road network stands on its own without one (invariant 4).
 fn draw_the_junctions(
+    ticks: Option<Res<Ticks>>,
     mut gizmos: Gizmos<DebugGizmos>,
-    junctions: Query<(&Junction, Option<&JunctionLegs>, Option<&JunctionPolicy>)>,
+    junctions: Query<JunctionDrawing>,
 ) {
-    for (junction, legs, policy) in &junctions {
+    for (junction, legs, policy, signal) in &junctions {
         gizmos.circle(
             Isometry3d::new(junction.at + GIZMO_LIFT, Quat::from_rotation_x(FRAC_PI_2)),
             JUNCTION_PULLBACK,
@@ -2363,21 +2610,34 @@ fn draw_the_junctions(
         let Some(legs) = legs else {
             continue;
         };
-        for leg in &legs.0 {
+        let green = signal
+            .zip(ticks.as_deref())
+            .and_then(|(signal, ticks)| signal.green_on(legs, ticks.0));
+        for (index, leg) in legs.0.iter().enumerate() {
             gizmos.arrow(
                 junction.at + GIZMO_LIFT,
                 junction.at + GIZMO_LIFT + leg.heading * MAP_TILE_INRADIUS * LEG_MARK,
-                colour_of(leg, policy),
+                colour_of(index, leg, policy, green),
             );
         }
     }
 }
 
-/// The colour a leg is marked in, which says whether the policy makes it give way or go first.
-fn colour_of(leg: &JunctionLeg, policy: Option<&JunctionPolicy>) -> Color {
-    match policy {
-        Some(JunctionPolicy::GiveWayTo(road)) if *road == leg.road => PRIORITY_COLOUR,
-        Some(JunctionPolicy::GiveWayTo(_)) => GIVING_WAY_COLOUR,
+/// The colour a leg is marked in, which says what is letting a rover on it through, and when.
+///
+/// A signalled junction says it leg by leg, one green among reds, so the cycle is watched running
+/// rather than read off a number (invariant 5). An unsignalled one says which road goes first.
+fn colour_of(
+    index: usize,
+    leg: &JunctionLeg,
+    policy: Option<&JunctionPolicy>,
+    green: Option<usize>,
+) -> Color {
+    match (green, policy) {
+        (Some(green), _) if green == index => GREEN_COLOUR,
+        (Some(_), _) => RED_COLOUR,
+        (None, Some(JunctionPolicy::GiveWayTo(road))) if *road == leg.road => PRIORITY_COLOUR,
+        (None, Some(JunctionPolicy::GiveWayTo(_))) => GIVING_WAY_COLOUR,
         _ => JUNCTION_COLOUR,
     }
 }
@@ -2597,7 +2857,8 @@ mod tests {
     use crate::common::initialize::InitializationFailed;
     use crate::diagnostics::DebugGizmosPlugin;
     use crate::map::{Deposit, MAP_TILE_SIZE};
-    use crate::testing::{headless_app, tick};
+    use crate::testing::{headless_app, press_key, release_key, tick};
+    use crate::ui::selection::SelectionPlugin;
     use std::collections::HashSet;
 
     /// How closely two world positions have to agree to be the same place.
@@ -2685,7 +2946,14 @@ mod tests {
         let mut app = headless_app();
         app.insert_state(tool)
             .insert_resource(PlayerInput::default())
-            .add_plugins((DebugGizmosPlugin, CleanupPlugin, RoadPlugin, BuildingPlugin));
+            .add_plugins((
+                DebugGizmosPlugin,
+                CleanupPlugin,
+                RoadPlugin,
+                JunctionSignalPlugin,
+                BuildingPlugin,
+                SelectionPlugin,
+            ));
         app
     }
 
@@ -4369,6 +4637,264 @@ mod tests {
         tick(&mut app);
 
         assert_eq!(the_policy(&mut app), JunctionPolicy::TakeTurns);
+    }
+
+    /// The legs of the one junction in the world, as the thing a signal is asked against.
+    fn the_arms(app: &mut App) -> JunctionLegs {
+        JunctionLegs(the_legs(app))
+    }
+
+    /// How long a run of ticks each leg in turn holds the green for, over `ticks` of a signal.
+    ///
+    /// The last run is dropped, being however much of one the count stopped part way through.
+    fn greens_run_by(signal: &Signal, legs: &JunctionLegs, ticks: u64) -> Vec<(usize, u32)> {
+        let waiting: Vec<usize> = (0..legs.0.len()).collect();
+        let mut runs: Vec<(usize, u32)> = Vec::new();
+        for tick in 0..ticks {
+            let green = signal
+                .who_goes_next(legs, &waiting, tick)
+                .expect("a leg holds the green while every leg is waiting");
+            match runs.last_mut() {
+                Some((leg, held)) if *leg == green => *held += 1,
+                _ => runs.push((green, 1)),
+            }
+        }
+        runs.pop();
+        runs
+    }
+
+    #[test]
+    fn a_signal_holds_the_green_on_the_favoured_road_for_the_run_it_was_given() {
+        let (mut app, crossed, _) = a_crossed_road();
+        let legs = the_arms(&mut app);
+        let signal = Signal::favouring(crossed);
+
+        for (leg, held) in greens_run_by(&signal, &legs, 8 * (OPENING_GREEN as u64 + 1)) {
+            if legs.road_of(leg) == Some(crossed) {
+                assert_eq!(held, OPENING_GREEN, "leg {leg} of the favoured road");
+            }
+        }
+    }
+
+    #[test]
+    fn a_signal_holds_the_green_on_every_other_road_for_a_single_tick() {
+        let (mut app, crossed, crossing) = a_crossed_road();
+        let legs = the_arms(&mut app);
+        let signal = Signal::favouring(crossed);
+
+        for (leg, held) in greens_run_by(&signal, &legs, 8 * (OPENING_GREEN as u64 + 1)) {
+            if legs.road_of(leg) == Some(crossing) {
+                assert_eq!(held, SHORTEST_GREEN, "leg {leg} of the road giving way");
+            }
+        }
+    }
+
+    #[test]
+    fn every_leg_of_a_signalled_junction_comes_round_to_the_green() {
+        let (mut app, crossed, _) = a_crossed_road();
+        let legs = the_arms(&mut app);
+        let signal = Signal::favouring(crossed);
+
+        let seen: Vec<usize> = greens_run_by(&signal, &legs, 8 * (OPENING_GREEN as u64 + 1))
+            .into_iter()
+            .map(|(leg, _)| leg)
+            .collect();
+        for leg in 0..legs.0.len() {
+            assert!(seen.contains(&leg), "leg {leg} never took a turn");
+        }
+    }
+
+    #[test]
+    fn a_green_spent_on_a_leg_nobody_waits_on_lets_nobody_through() {
+        let (mut app, crossed, _) = a_crossed_road();
+        let legs = the_arms(&mut app);
+        let signal = Signal::favouring(crossed);
+        let every_leg: Vec<usize> = (0..legs.0.len()).collect();
+
+        for tick in 0..8 * (OPENING_GREEN as u64 + 1) {
+            let green = signal
+                .who_goes_next(&legs, &every_leg, tick)
+                .expect("a leg holds the green");
+            let others: Vec<usize> = every_leg
+                .iter()
+                .copied()
+                .filter(|&it| it != green)
+                .collect();
+
+            assert_eq!(signal.who_goes_next(&legs, &others, tick), None);
+        }
+    }
+
+    #[test]
+    fn which_leg_a_signal_lets_through_does_not_depend_on_the_order_it_is_asked_in() {
+        let (mut app, crossed, _) = a_crossed_road();
+        let legs = the_arms(&mut app);
+        let signal = Signal::favouring(crossed);
+        let forth: Vec<usize> = (0..legs.0.len()).collect();
+        let back: Vec<usize> = forth.iter().rev().copied().collect();
+
+        for tick in 0..8 * (OPENING_GREEN as u64 + 1) {
+            assert_eq!(
+                signal.who_goes_next(&legs, &forth, tick),
+                signal.who_goes_next(&legs, &back, tick),
+                "on tick {tick}"
+            );
+        }
+    }
+
+    /// Press `key`, let the world see it, then let it go.
+    fn tap_key(app: &mut App, key: KeyCode) {
+        press_key(app, key);
+        tick(app);
+        release_key(app, key);
+        tick(app);
+    }
+
+    /// Pick the one junction in the world out with the select tool.
+    fn pick_out_the_junction(app: &mut App) -> Entity {
+        let junction = the_junction_entity(app);
+        let at = component_of::<Junction>(app, junction)
+            .map(|junction| junction.at)
+            .expect("the junction stands somewhere");
+        {
+            let mut input = app.world_mut().resource_mut::<PlayerInput>();
+            input.tap = true;
+            input.world_cursor_position = Some(at);
+        }
+        tick(app);
+        app.world_mut().resource_mut::<PlayerInput>().tap = false;
+        junction
+    }
+
+    /// The signal on the one junction in the world, or nothing while it holds none.
+    fn the_signal(app: &mut App) -> Option<Signal> {
+        let junction = the_junction_entity(app);
+        component_of::<Signal>(app, junction).cloned()
+    }
+
+    #[test]
+    fn signalling_the_junction_picked_out_favours_the_first_road_that_meets_there() {
+        let (mut app, ..) = a_crossed_road();
+        let junction = pick_out_the_junction(&mut app);
+        let first = component_of::<Junction>(&app, junction)
+            .map(|junction| junction.roads()[0])
+            .expect("the junction knows its roads");
+
+        tap_key(&mut app, SIGNAL_KEY);
+
+        assert_eq!(
+            the_signal(&mut app).map(|signal| signal.favours()),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn signalling_a_junction_again_hands_the_green_to_the_next_road() {
+        let (mut app, ..) = a_crossed_road();
+        let junction = pick_out_the_junction(&mut app);
+        let roads = component_of::<Junction>(&app, junction)
+            .map(Junction::roads)
+            .expect("the junction knows its roads");
+
+        tap_key(&mut app, SIGNAL_KEY);
+        tap_key(&mut app, SIGNAL_KEY);
+
+        assert_eq!(
+            the_signal(&mut app).map(|signal| signal.favours()),
+            Some(roads[1])
+        );
+    }
+
+    #[test]
+    fn signalling_past_the_last_road_takes_the_signal_off_again() {
+        let (mut app, ..) = a_crossed_road();
+        let junction = pick_out_the_junction(&mut app);
+        let roads = component_of::<Junction>(&app, junction)
+            .map(Junction::roads)
+            .expect("the junction knows its roads");
+
+        for _ in 0..roads.len() + 1 {
+            tap_key(&mut app, SIGNAL_KEY);
+        }
+
+        assert_eq!(the_signal(&mut app), None);
+    }
+
+    #[test]
+    fn taking_a_signal_off_leaves_the_junction_the_right_of_way_it_was_laid_with() {
+        let (mut app, crossed, _) = a_crossed_road();
+        let junction = pick_out_the_junction(&mut app);
+        let roads = component_of::<Junction>(&app, junction)
+            .map(Junction::roads)
+            .expect("the junction knows its roads");
+
+        for _ in 0..roads.len() + 1 {
+            tap_key(&mut app, SIGNAL_KEY);
+        }
+
+        assert_eq!(the_policy(&mut app), JunctionPolicy::GiveWayTo(crossed));
+    }
+
+    #[test]
+    fn the_player_lengthens_the_green_of_the_junction_they_picked_out() {
+        let (mut app, ..) = a_crossed_road();
+        pick_out_the_junction(&mut app);
+        tap_key(&mut app, SIGNAL_KEY);
+
+        tap_key(&mut app, GREEN_KEYS[1].0);
+
+        assert_eq!(
+            the_signal(&mut app).map(|signal| signal.green),
+            Some(OPENING_GREEN + 1)
+        );
+    }
+
+    #[test]
+    fn a_signal_whose_road_is_taken_up_is_taken_off_with_it() {
+        let (mut app, _, crossing) = a_crossed_road();
+        let junction = pick_out_the_junction(&mut app);
+        let roads = component_of::<Junction>(&app, junction)
+            .map(Junction::roads)
+            .expect("the junction knows its roads");
+        let presses = roads
+            .iter()
+            .position(|&road| road == crossing)
+            .expect("the road crosses")
+            + 1;
+        for _ in 0..presses {
+            tap_key(&mut app, SIGNAL_KEY);
+        }
+
+        app.world_mut().entity_mut(crossing).despawn();
+        tick(&mut app);
+
+        assert_eq!(component_of::<Signal>(&app, junction), None);
+    }
+
+    #[test]
+    fn shortening_a_signals_green_never_takes_it_below_a_single_tick() {
+        let (_, crossed, _) = a_crossed_road();
+        let mut signal = Signal::favouring(crossed);
+
+        for _ in 0..OPENING_GREEN + 4 {
+            signal.tune(-1);
+        }
+
+        assert_eq!(signal.green, SHORTEST_GREEN);
+    }
+
+    #[test]
+    fn lengthening_a_signals_green_gives_the_favoured_road_a_longer_run() {
+        let (mut app, crossed, _) = a_crossed_road();
+        let legs = the_arms(&mut app);
+        let mut signal = Signal::favouring(crossed);
+        signal.tune(4);
+
+        for (leg, held) in greens_run_by(&signal, &legs, 8 * (OPENING_GREEN as u64 + 5)) {
+            if legs.road_of(leg) == Some(crossed) {
+                assert_eq!(held, OPENING_GREEN + 4, "leg {leg} of the favoured road");
+            }
+        }
     }
 
     #[test]

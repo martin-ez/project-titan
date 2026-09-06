@@ -280,6 +280,7 @@ fn key_label(key: KeyCode) -> String {
         KeyCode::KeyD => "D",
         KeyCode::KeyQ => "Q",
         KeyCode::KeyE => "E",
+        KeyCode::KeyG => "G",
         KeyCode::KeyR => "R",
         KeyCode::ShiftLeft => "Shift",
         KeyCode::ControlLeft => "Ctrl",
@@ -293,6 +294,8 @@ fn key_label(key: KeyCode) -> String {
         KeyCode::Period => ".",
         KeyCode::Minus => "-",
         KeyCode::Equal => "+",
+        KeyCode::BracketLeft => "[",
+        KeyCode::BracketRight => "]",
         KeyCode::F1 => "F1",
         KeyCode::F2 => "F2",
         KeyCode::F3 => "F3",
@@ -568,6 +571,9 @@ mod tests {
             .add_plugins(crate::simulation::SimulationPlugin)
             .add_plugins(crate::camera::CameraPlugin)
             .add_plugins(crate::road::RoadPlugin)
+            .add_plugins(crate::road::JunctionSignalPlugin)
+            .add_plugins(crate::ui::selection::SelectionPlugin)
+            .add_plugins(crate::fleet::FleetPlugin)
             .add_plugins(crate::building::BuildingPlugin)
             .add_plugins(crate::ui::settings_panel::SettingsPanelPlugin);
 
