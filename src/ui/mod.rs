@@ -7,15 +7,18 @@
 //! control needs behaviour rather than a look, `bevy_ui_widgets` is the styling-free upstream it
 //! comes from — `EditableText` and the rest are `bevy_ui`'s, not Feathers'.
 //!
-//! A panel reads the world to decide what to draw and never writes it: the only way the player
-//! changes the game is the action a press already goes through (invariant 4). What every panel is
-//! drawn in is here, so two of them cannot drift into two looks.
+//! A panel that reads the game out never writes it: the only way the player changes the game is
+//! the action a press already goes through (invariant 4). A settings panel is the one that does
+//! write, and only ever the settings resource it is an editor of — a sensitivity is a setting on
+//! the player's own input, not a fact a rover could observe. What every panel is drawn in is
+//! here, so two of them cannot drift into two looks.
 
 use bevy::prelude::*;
 
 pub mod building_panel;
 pub mod legend;
 pub mod selection;
+pub mod settings_panel;
 
 /// How far a panel sits from the corner of the screen it is pinned to, in logical pixels
 const PANEL_INSET: f32 = 8.0;
@@ -42,6 +45,8 @@ pub const BODY_TEXT: Color = Color::srgb(0.86, 0.87, 0.90);
 pub enum PanelCorner {
     /// Against the top and left edges.
     TopLeft,
+    /// Against the top and right edges.
+    TopRight,
     /// Against the bottom and right edges.
     BottomRight,
 }
@@ -51,6 +56,7 @@ pub fn panel(corner: PanelCorner, width: Val) -> impl Bundle {
     let inset = Val::Px(PANEL_INSET);
     let (top, bottom, left, right) = match corner {
         PanelCorner::TopLeft => (inset, Val::Auto, inset, Val::Auto),
+        PanelCorner::TopRight => (inset, Val::Auto, Val::Auto, inset),
         PanelCorner::BottomRight => (Val::Auto, inset, Val::Auto, inset),
     };
     (
