@@ -7,13 +7,17 @@
 //! shared by three tiles, so the answer is held to the building on the tile under the cursor,
 //! which is what keeps one node from naming two ports.
 //!
+//! A junction is the one thing here the grid cannot answer, standing at a distance along an arc
+//! rather than on a node of the lattice. It is picked out by the ground it takes — [`Junction::reaches`],
+//! which is the circle the debug view draws — and ahead of any building, being the smaller target.
+//!
 //! Nothing here writes the game. It says what the player is pointing at; the tools that change
 //! what they picked out live with the components they change.
 
 use crate::building::{BuildingTiles, BuildingType, Port};
 use crate::input::{PlayerAction, PlayerInput};
 use crate::map::{HexCoordinates, LatticeNode, MapTile};
-use crate::road::RoadEndpoint;
+use crate::road::{Junction, RoadEndpoint};
 use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -28,18 +32,20 @@ pub struct SelectionPlugin;
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Picked;
 
-/// The building the player picked out, and the port of it they picked out with it.
+/// What the player picked out: a building and a port of it, or a junction of the road.
 ///
 /// A port is picked out only alongside the building it belongs to, so a selection naming a port
-/// names the building too. Both are entities the world may take away underneath it, which is why
-/// nothing outside this module builds one.
+/// names the building too. A junction is picked out instead of either, being a thing of the road
+/// rather than of the map. All of them are entities the world may take away underneath it, which
+/// is why nothing outside this module builds one.
 #[derive(Resource, Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection {
     building: Option<Entity>,
     port: Option<Entity>,
+    junction: Option<Entity>,
 }
 
-/// The building and port the cursor is over, for a tool that acts on what the player points at.
+/// What the cursor is over, for a tool that acts on what the player points at.
 #[derive(SystemParam)]
 pub struct PointedAt<'w, 's> {
     input: Res<'w, PlayerInput>,
@@ -47,6 +53,7 @@ pub struct PointedAt<'w, 's> {
     tiles: Query<'w, 's, &'static MapTile>,
     children: Query<'w, 's, &'static Children>,
     ports: Query<'w, 's, &'static RoadEndpoint, With<Port>>,
+    junctions: Query<'w, 's, (Entity, &'static Junction)>,
 }
 
 impl Selection {
@@ -59,18 +66,45 @@ impl Selection {
     pub fn port(&self) -> Option<Entity> {
         self.port
     }
+
+    /// The junction picked out, or nothing while the player picked something off the road.
+    pub fn junction(&self) -> Option<Entity> {
+        self.junction
+    }
 }
 
 impl PointedAt<'_, '_> {
-    /// What the cursor is over, which is nothing at all when it is not over a building.
+    /// What the cursor is over, which is nothing at all when it is over neither road nor building.
+    ///
+    /// A junction answers ahead of a building because it is the smaller target of the two and
+    /// stands on ground a building may also be standing on, so a road crossing a built-up tile
+    /// stays something the player can point at.
     pub fn under_the_cursor(&self) -> Selection {
+        if let Some(junction) = self.junction_under_the_cursor() {
+            return Selection {
+                junction: Some(junction),
+                ..Selection::default()
+            };
+        }
         let Some((tile, building)) = self.building_under_the_cursor() else {
             return Selection::default();
         };
         Selection {
             building: Some(building),
             port: self.port_of(building, tile),
+            junction: None,
         }
+    }
+
+    fn junction_under_the_cursor(&self) -> Option<Entity> {
+        let at = self.input.world_cursor_position?;
+        self.junctions
+            .iter()
+            .filter(|(_, junction)| junction.reaches(at))
+            .min_by(|(_, one), (_, other)| {
+                one.at.distance(at).total_cmp(&other.at.distance(at))
+            })
+            .map(|(entity, _)| entity)
     }
 
     fn building_under_the_cursor(&self) -> Option<(HexCoordinates, Entity)> {
@@ -100,7 +134,7 @@ impl Plugin for SelectionPlugin {
         app.init_resource::<Selection>()
             .declare_bindings([Binding {
                 input: BindingInput::Mouse(MouseButton::Left),
-                action: "Pick out the building, or the port, under the cursor",
+                action: "Pick out the junction, building or port under the cursor",
                 context: BindingContext::Tool(PlayerAction::Select),
             }])
             .add_systems(
@@ -144,7 +178,14 @@ fn forget_a_selection_that_left_the_world(
     mut selection: ResMut<Selection>,
     buildings: Query<&BuildingType>,
     ports: Query<&Port>,
+    junctions: Query<&Junction>,
 ) {
+    if selection
+        .junction
+        .is_some_and(|junction| junctions.get(junction).is_err())
+    {
+        selection.junction = None;
+    }
     let Some(building) = selection.building else {
         return;
     };
@@ -171,8 +212,8 @@ mod tests {
     use crate::building::BuildingPlugin;
     use crate::common::cleanup::CleanupPlugin;
     use crate::diagnostics::DebugGizmosPlugin;
-    use crate::map::{HexCoordinates, TileCorner};
-    use crate::road::RoadPlugin;
+    use crate::map::{HexCoordinates, TileCorner, MAP_TILE_SIZE};
+    use crate::road::{Road, RoadPlugin};
     use crate::testing::{headless_app, tick};
 
     /// The tile the building under test stands on, in offset-row coordinates.
@@ -276,6 +317,74 @@ mod tests {
                     .is_some_and(|endpoint| endpoint.standing_on() == node)
             })
             .expect("a port stands on that corner")
+    }
+
+    /// A run of tiles a road is laid along, in offset-row coordinates.
+    const ALONG: [(i32, i32); 4] = [(1, 0), (2, 0), (3, 0), (4, 0)];
+
+    /// A run of tiles crossing that road at its second tile, in offset-row coordinates.
+    const ACROSS: [(i32, i32); 3] = [(2, -1), (2, 0), (2, 1)];
+
+    /// Lay two roads across each other, and answer with the junction and where it stands.
+    fn a_crossroads(app: &mut App) -> (Entity, Vec3) {
+        for run in [ALONG.as_slice(), ACROSS.as_slice()] {
+            let nodes = run
+                .iter()
+                .map(|&offsets| LatticeNode::from_tile(tile_of(offsets)))
+                .collect();
+            app.world_mut().spawn(Road {
+                nodes,
+                leaving: None,
+                one_way: false,
+            });
+        }
+        tick(app);
+        tick(app);
+
+        let mut found: Vec<(Entity, Vec3)> = app
+            .world_mut()
+            .query::<(Entity, &Junction)>()
+            .iter(app.world())
+            .map(|(entity, junction)| (entity, junction.at))
+            .collect();
+        let one = found.pop();
+        assert!(found.is_empty(), "more than one junction");
+        one.expect("the roads cross")
+    }
+
+    #[test]
+    fn a_click_on_a_junction_picks_it_out() {
+        let mut app = selection_app();
+        let (junction, at) = a_crossroads(&mut app);
+        hold(&mut app, PlayerAction::Select);
+
+        click_at(&mut app, None, at);
+
+        assert_eq!(selected(&app).junction(), Some(junction));
+    }
+
+    #[test]
+    fn a_click_off_every_junction_picks_none_of_them() {
+        let mut app = selection_app();
+        let (_, at) = a_crossroads(&mut app);
+        hold(&mut app, PlayerAction::Select);
+
+        click_at(&mut app, None, at + Vec3::X * MAP_TILE_SIZE);
+
+        assert_eq!(selected(&app).junction(), None);
+    }
+
+    #[test]
+    fn a_junction_the_world_no_longer_holds_is_let_go_of() {
+        let mut app = selection_app();
+        let (junction, at) = a_crossroads(&mut app);
+        hold(&mut app, PlayerAction::Select);
+        click_at(&mut app, None, at);
+
+        app.world_mut().entity_mut(junction).despawn();
+        tick(&mut app);
+
+        assert_eq!(selected(&app).junction(), None);
     }
 
     #[test]

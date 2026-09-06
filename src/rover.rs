@@ -951,8 +951,11 @@ mod tests {
     /// timing rather than how far down the road the measurement stopped.
     const TICKS_UNDER_A_SIGNAL: u64 = 300;
 
-    /// A green long enough that the road not holding it waits on the signal rather than on itself.
-    const A_LONG_GREEN: u32 = 30;
+    /// How much longer than the run a junction is signalled with the green is tuned to.
+    ///
+    /// Long enough that the road not holding the green waits on the signal rather than on its own
+    /// queue closing up, which is the only way the timing is what the measurement separates.
+    const A_LONGER_GREEN: i32 = 22;
 
     /// How far ahead a run of ticks is looked for before the signal has plainly not got one.
     const TICKS_SEARCHED: u64 = 512;
@@ -2515,18 +2518,19 @@ mod tests {
         let road = road_through(&mut app, favoured);
 
         signal_favouring(&mut app, junction, road);
-        lengthen_the_green(&mut app, junction, A_LONG_GREEN);
+        lengthen_the_green(&mut app, junction, A_LONGER_GREEN);
         drive_for(&mut app, TICKS_UNDER_A_SIGNAL as u32);
 
         down_the_straight.crossed(&app)
     }
 
-    /// Tune the signal on `junction` until its favoured road holds the green for `green` ticks.
-    fn lengthen_the_green(app: &mut App, junction: Entity, green: u32) {
-        let mut signalled = app.world_mut().entity_mut(junction);
-        let mut signal = signalled.get_mut::<Signal>().expect("the junction is signalled");
-        let asked = green as i32 - signal.green() as i32;
-        signal.tune(asked);
+    /// Lengthen the green of the signal on `junction` by `asked` ticks.
+    fn lengthen_the_green(app: &mut App, junction: Entity, asked: i32) {
+        app.world_mut()
+            .entity_mut(junction)
+            .get_mut::<Signal>()
+            .expect("the junction is signalled")
+            .tune(asked);
     }
 
     #[test]
