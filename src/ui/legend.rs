@@ -12,34 +12,19 @@
 
 use crate::building::ChosenBuildingType;
 use crate::input::PlayerAction;
+use crate::ui::{
+    panel, panel_font, panel_row, panel_text, PanelCorner, BODY_TEXT, HEADING_TEXT, KEYED_TEXT,
+};
 use bevy::prelude::*;
 
 /// Key binding that shows and hides the legend
 const LEGEND_KEY: KeyCode = KeyCode::F1;
-/// How far the panel sits from the corner of the screen, in logical pixels
-const PANEL_INSET: f32 = 8.0;
-/// How much space the panel keeps between its edge and its rows, in logical pixels
-const PANEL_PADDING: f32 = 10.0;
-/// How round the panel's corners are, in logical pixels
-const PANEL_RADIUS: f32 = 4.0;
-/// What the panel is drawn on, dark enough to read text over whatever the world puts behind it
-const PANEL_BACKGROUND: Color = Color::srgba(0.04, 0.04, 0.06, 0.85);
-/// How much space sits between one row and the next, in logical pixels
-const ROW_GAP: f32 = 2.0;
 /// How much space sits above a heading, holding it off the rows before it, in logical pixels
 const HEADING_GAP: f32 = 10.0;
 /// How wide the column naming what the player presses is, in logical pixels
 const KEY_COLUMN_WIDTH: f32 = 92.0;
 /// How wide the panel is, in logical pixels, held fixed so no heading can resize it
 const PANEL_WIDTH: f32 = 320.0;
-/// How large the legend's text is, in logical pixels
-const TEXT_SIZE: f32 = 12.0;
-/// The colour a heading is written in
-const HEADING_COLOR: Color = Color::srgb(0.62, 0.78, 0.98);
-/// The colour a key is written in
-const KEY_COLOR: Color = Color::srgb(0.98, 0.90, 0.66);
-/// The colour an action is written in
-const ACTION_COLOR: Color = Color::srgb(0.86, 0.87, 0.90);
 
 /// What the player presses to reach a command.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -209,25 +194,8 @@ fn spawn_legend(
     placing: Option<String>,
 ) {
     commands
-        .spawn((Legend, panel()))
+        .spawn((Legend, panel(PanelCorner::TopLeft, Val::Px(PANEL_WIDTH))))
         .with_children(|panel| fill_the_panel(panel, bindings, held, placing.as_deref()));
-}
-
-fn panel() -> impl Bundle {
-    (
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(PANEL_INSET),
-            left: Val::Px(PANEL_INSET),
-            width: Val::Px(PANEL_WIDTH),
-            flex_direction: FlexDirection::Column,
-            padding: UiRect::all(Val::Px(PANEL_PADDING)),
-            row_gap: Val::Px(ROW_GAP),
-            border_radius: BorderRadius::all(Val::Px(PANEL_RADIUS)),
-            ..default()
-        },
-        BackgroundColor(PANEL_BACKGROUND),
-    )
 }
 
 /// Lay the declared bindings out, the ones on offer whatever is held first and a tool's own after.
@@ -243,13 +211,13 @@ fn fill_the_panel(
     {
         panel.spawn(heading_row(heading(context, held, placing), place));
         for binding in bindings.0.iter().filter(|it| it.context == context) {
-            panel.spawn(row()).with_children(|row| {
-                row.spawn(cell(
+            panel.spawn(panel_row()).with_children(|row| {
+                row.spawn(panel_text(
                     input_label(binding.input),
-                    KEY_COLOR,
+                    KEYED_TEXT,
                     Val::Px(KEY_COLUMN_WIDTH),
                 ));
-                row.spawn(cell(binding.action.to_string(), ACTION_COLOR, Val::Auto));
+                row.spawn(panel_text(binding.action.to_string(), BODY_TEXT, Val::Auto));
             });
         }
     }
@@ -262,32 +230,9 @@ fn heading_row(heading: String, place: usize) -> impl Bundle {
             ..default()
         },
         Text(heading),
-        legend_font(),
-        TextColor(HEADING_COLOR),
+        panel_font(),
+        TextColor(HEADING_TEXT),
     )
-}
-
-fn row() -> impl Bundle {
-    Node {
-        flex_direction: FlexDirection::Row,
-        ..default()
-    }
-}
-
-fn cell(text: String, color: Color, width: Val) -> impl Bundle {
-    (
-        Node { width, ..default() },
-        Text(text),
-        legend_font(),
-        TextColor(color),
-    )
-}
-
-fn legend_font() -> TextFont {
-    TextFont {
-        font_size: FontSize::Px(TEXT_SIZE),
-        ..default()
-    }
 }
 
 fn contexts_in_declaration_order(bindings: &PlayerBindings) -> Vec<BindingContext> {
@@ -342,6 +287,8 @@ fn key_label(key: KeyCode) -> String {
         KeyCode::Escape => "Esc",
         KeyCode::Comma => ",",
         KeyCode::Period => ".",
+        KeyCode::Minus => "-",
+        KeyCode::Equal => "+",
         KeyCode::F1 => "F1",
         KeyCode::F3 => "F3",
         KeyCode::F4 => "F4",
