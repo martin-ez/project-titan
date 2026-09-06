@@ -286,6 +286,10 @@ fn key_label(key: KeyCode) -> String {
         KeyCode::ControlLeft => "Ctrl",
         KeyCode::Space => "Space",
         KeyCode::Escape => "Esc",
+        KeyCode::ArrowUp => "↑",
+        KeyCode::ArrowDown => "↓",
+        KeyCode::ArrowLeft => "←",
+        KeyCode::ArrowRight => "→",
         KeyCode::Comma => ",",
         KeyCode::Period => ".",
         KeyCode::Minus => "-",
@@ -293,6 +297,7 @@ fn key_label(key: KeyCode) -> String {
         KeyCode::BracketLeft => "[",
         KeyCode::BracketRight => "]",
         KeyCode::F1 => "F1",
+        KeyCode::F2 => "F2",
         KeyCode::F3 => "F3",
         KeyCode::F4 => "F4",
         other => return format!("{other:?}"),
@@ -569,7 +574,8 @@ mod tests {
             .add_plugins(crate::road::JunctionSignalPlugin)
             .add_plugins(crate::ui::selection::SelectionPlugin)
             .add_plugins(crate::fleet::FleetPlugin)
-            .add_plugins(crate::building::BuildingPlugin);
+            .add_plugins(crate::building::BuildingPlugin)
+            .add_plugins(crate::ui::settings_panel::SettingsPanelPlugin);
 
         let bindings = app.world().resource::<PlayerBindings>();
         let mut claimed: Vec<(BindingInput, BindingContext)> = Vec::new();
@@ -610,6 +616,11 @@ mod tests {
                     action: "Turn the building you are about to place",
                     context: BindingContext::Always,
                 },
+                Binding {
+                    input: BindingInput::Key(KeyCode::ArrowDown),
+                    action: "Pick the setting below",
+                    context: BindingContext::Always,
+                },
             ],
         );
         tick(&mut app);
@@ -618,10 +629,12 @@ mod tests {
         let legend = shown_legend(&mut app);
 
         assert!(legend.contains("Shift"), "{legend}");
+        assert!(legend.contains("↓"), "{legend}");
         assert!(!legend.contains("ShiftLeft"), "{legend}");
         assert!(!legend.contains("KeyQ"), "{legend}");
         assert!(!legend.contains("KeyE"), "{legend}");
         assert!(!legend.contains("KeyR"), "{legend}");
+        assert!(!legend.contains("ArrowDown"), "{legend}");
     }
 
     #[test]

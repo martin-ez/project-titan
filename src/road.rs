@@ -2852,11 +2852,11 @@ fn draw_the_lanes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::building::BuildingPlugin;
+    use crate::building::{BuildingPlugin, BuildingType, ChosenBuildingType};
     use crate::common::cleanup::CleanupPlugin;
     use crate::common::initialize::InitializationFailed;
     use crate::diagnostics::DebugGizmosPlugin;
-    use crate::map::MAP_TILE_SIZE;
+    use crate::map::{Deposit, MAP_TILE_SIZE};
     use crate::testing::{headless_app, press_key, release_key, tick};
     use crate::ui::selection::SelectionPlugin;
     use std::collections::HashSet;
@@ -3529,6 +3529,20 @@ mod tests {
     ///
     /// The building tool is what places one, so the test picks it up the way a player does rather
     /// than writing the building into the world behind the rule that refuses it.
+    /// Lay under `tile` the ground the type the tool is holding needs, an extractor standing
+    /// nowhere but a deposit of what it draws.
+    fn ground_for_the_chosen_type(app: &mut App, tile: Entity) {
+        let BuildingType::Extractor(material) =
+            app.world().resource::<ChosenBuildingType>().chosen()
+        else {
+            return;
+        };
+        app.world_mut().entity_mut(tile).insert(Deposit {
+            material,
+            richness: 1,
+        });
+    }
+
     fn put_a_building_on(app: &mut App, offset: (i32, i32)) -> Entity {
         let (col, row) = offset;
         let tile = app
@@ -3537,6 +3551,7 @@ mod tests {
                 coordinates: HexCoordinates::from_offset_row(col, row),
             })
             .id();
+        ground_for_the_chosen_type(app, tile);
         take_up(app, PlayerAction::EditBuildings);
         tap_on(app, tile);
         take_up(app, PlayerAction::EditRoads);
