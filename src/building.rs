@@ -181,17 +181,19 @@ pub struct Stack {
     pub count: u32,
 }
 
-/// What one run of a building takes in and what it puts out.
+/// What one run of a building takes in, what it puts out, and how long it takes.
 ///
-/// The quantities are `docs/production_tree.md`'s, which is where the balance they are chosen for
-/// is argued. A recipe may put out more than one thing: where a reaction really splits, one
-/// recipe makes both, so a byproduct nobody hauls away is a jam like any other.
+/// The quantities and the run time are `docs/production_tree.md`'s, which is where the balance
+/// they are chosen for is argued. A recipe may put out more than one thing: where a reaction
+/// really splits, one recipe makes both, so a byproduct nobody hauls away is a jam like any other.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Recipe {
     /// What one run consumes.
     pub inputs: &'static [Stack],
     /// What one run produces.
     pub outputs: &'static [Stack],
+    /// How many ticks of game time one run spends, a tick being the unit game time is measured in.
+    pub ticks: u32,
 }
 
 /// What a building is made to do, which is what decides the ports it stands.
@@ -306,8 +308,22 @@ const fn stack(count: u32, item: Item) -> Stack {
     Stack { item, count }
 }
 
-const fn assembler(inputs: &'static [Stack], outputs: &'static [Stack]) -> BuildingType {
-    BuildingType::Assembler(Recipe { inputs, outputs })
+const fn assembler(inputs: &'static [Stack], outputs: &'static [Stack], ticks: u32) -> BuildingType {
+    BuildingType::Assembler(Recipe {
+        inputs,
+        outputs,
+        ticks,
+    })
+}
+
+/// How many ticks one run of an extractor drawing `material` spends, per `docs/production_tree.md`.
+const fn drawn_in(material: RawMaterial) -> u32 {
+    match material {
+        RawMaterial::Ice => 32,
+        RawMaterial::CarbonMonoxide | RawMaterial::Nitrogen => 64,
+        RawMaterial::Silicon => 128,
+        RawMaterial::CobaltOre => 256,
+    }
 }
 
 const fn extracted(material: RawMaterial) -> &'static [Stack] {
@@ -393,10 +409,12 @@ impl BuildingType {
         assembler(
             &[stack(1, Item::Raw(RawMaterial::Ice))],
             &[stack(1, Item::Water)],
+            32,
         ),
         assembler(
             &[stack(1, Item::Water)],
             &[stack(2, Item::Hydrogen), stack(1, Item::Oxygen)],
+            64,
         ),
         assembler(
             &[
@@ -404,10 +422,12 @@ impl BuildingType {
                 stack(1, Item::Oxygen),
             ],
             &[stack(1, Item::CarbonDioxide)],
+            64,
         ),
         assembler(
             &[stack(1, Item::CarbonDioxide)],
             &[stack(1, Item::Carbon), stack(1, Item::Oxygen)],
+            64,
         ),
         assembler(
             &[
@@ -415,10 +435,12 @@ impl BuildingType {
                 stack(3, Item::Hydrogen),
             ],
             &[stack(1, Item::Ammonia)],
+            64,
         ),
         assembler(
             &[stack(1, Item::Raw(RawMaterial::Silicon))],
             &[stack(1, Item::SiliconWafer)],
+            128,
         ),
         assembler(
             &[
@@ -426,6 +448,7 @@ impl BuildingType {
                 stack(2, Item::Oxygen),
             ],
             &[stack(1, Item::Glass)],
+            128,
         ),
         assembler(
             &[
@@ -433,10 +456,12 @@ impl BuildingType {
                 stack(1, Item::Carbon),
             ],
             &[stack(1, Item::SiliconCarbide)],
+            128,
         ),
         assembler(
             &[stack(2, Item::Carbon)],
             &[stack(1, Item::ActivatedCharcoal)],
+            128,
         ),
         assembler(
             &[
@@ -445,18 +470,22 @@ impl BuildingType {
                 stack(2, Item::ActivatedCharcoal),
             ],
             &[stack(1, Item::FertilizedSoil)],
+            256,
         ),
         assembler(
             &[stack(2, Item::Raw(RawMaterial::CobaltOre))],
             &[stack(1, Item::RefinedCobalt)],
+            256,
         ),
         assembler(
             &[stack(2, Item::SiliconWafer), stack(1, Item::RefinedCobalt)],
             &[stack(1, Item::Electronics)],
+            256,
         ),
         assembler(
             &[stack(3, Item::Carbon), stack(6, Item::Hydrogen)],
             &[stack(1, Item::HydrocarbonPolymer)],
+            256,
         ),
         assembler(
             &[
@@ -465,6 +494,7 @@ impl BuildingType {
                 stack(1, Item::HydrocarbonPolymer),
             ],
             &[stack(1, Item::Battery)],
+            512,
         ),
         assembler(
             &[
@@ -473,6 +503,7 @@ impl BuildingType {
                 stack(2, Item::RefinedCobalt),
             ],
             &[stack(1, Item::FuelCell)],
+            512,
         ),
         assembler(
             &[
@@ -481,6 +512,7 @@ impl BuildingType {
                 stack(1, Item::HydrocarbonPolymer),
             ],
             &[stack(1, Item::DomeHabitatPanel)],
+            512,
         ),
         assembler(
             &[
@@ -489,6 +521,7 @@ impl BuildingType {
                 stack(4, Item::FertilizedSoil),
             ],
             &[stack(1, Item::HydroponicsBay)],
+            1024,
         ),
     ];
 
@@ -501,6 +534,7 @@ impl BuildingType {
             Self::Extractor(material) => Recipe {
                 inputs: &[],
                 outputs: extracted(material),
+                ticks: drawn_in(material),
             },
             Self::Assembler(recipe) => recipe,
         }
@@ -1041,12 +1075,14 @@ mod tests {
     const MELTER: BuildingType = BuildingType::Assembler(Recipe {
         inputs: &[stack(1, Item::Raw(RawMaterial::Ice))],
         outputs: &[stack(1, Item::Water)],
+        ticks: 32,
     });
 
     /// A type putting two items out of one, which is the shape a split reaction takes.
     const ELECTROLYSER: BuildingType = BuildingType::Assembler(Recipe {
         inputs: &[stack(1, Item::Water)],
         outputs: &[stack(2, Item::Hydrogen), stack(1, Item::Oxygen)],
+        ticks: 64,
     });
 
     /// A type drawing out of the ground, which takes nothing in at all.
