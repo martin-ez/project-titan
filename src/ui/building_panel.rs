@@ -6,11 +6,15 @@
 //! cannot disagree with the game it is a reading of. A panel that can is worse than none, because
 //! it is believed.
 //!
+//! The last row is the pool every fleet on the map is drawn from, so what a rover costs is read
+//! where it is spent, and a request the pool could not fill says so there.
+//!
 //! Nothing here writes. The keys that change an assignment are declared by `crate::fleet`, beside
 //! the component they change (invariant 4).
 
 use crate::building::{BuildingType, Flow, Port};
-use crate::fleet::Fleet;
+use crate::fleet::{Fleet, Refused, RoverPool};
+use crate::production::{Running, Stopped, WaitingOn};
 use crate::ui::selection::{Picked, Selection};
 use crate::ui::{panel, panel_row, panel_text, PanelCorner, BODY_TEXT, HEADING_TEXT, KEYED_TEXT};
 use bevy::ecs::system::SystemParam;
@@ -31,12 +35,18 @@ const UNASSIGNED: &str = "no rovers of its own";
 /// What a fleet with nothing on the network making what its port takes says instead of a source
 const UNSUPPLIED: &str = "nothing that makes it";
 
+/// What the panel says in place of the pool when the port picked out was refused a rover
+const REFUSED_A_ROVER: &str = "no rovers spare — take one off elsewhere";
+
 /// The panel reading out the building the player picked out.
 pub struct BuildingPanelPlugin;
 
 /// The panel on screen, of which there is at most one.
 #[derive(Component)]
 struct BuildingPanel;
+
+/// A building that has just started a run or just stopped, which is what the reading is of.
+type ProductionMoved = Or<(Changed<Running>, Changed<Stopped>)>;
 
 /// One line of the panel: what the port is, what its fleet was told, and whether it is picked out.
 struct PortRow {
@@ -45,13 +55,35 @@ struct PortRow {
     picked_out: bool,
 }
 
+/// What the panel says: the building picked out, what it is making of its recipe, what each of its
+/// ports is doing, and what is left of the rovers every fleet on the map draws from.
+struct Reading {
+    heading: String,
+    doing: &'static str,
+    rows: Vec<PortRow>,
+    pool: String,
+    refused: bool,
+}
+
 /// Everything the panel reads to say what a building is doing.
 #[derive(SystemParam)]
 struct WhatToSay<'w, 's> {
-    buildings: Query<'w, 's, (&'static BuildingType, &'static Children)>,
+    buildings: Query<
+        'w,
+        's,
+        (
+            &'static BuildingType,
+            &'static Children,
+            Option<&'static Running>,
+            Option<&'static Stopped>,
+        ),
+    >,
     kinds: Query<'w, 's, &'static BuildingType>,
     ports: Query<'w, 's, (&'static Port, Option<&'static Fleet>)>,
     homes: Query<'w, 's, &'static ChildOf>,
+    fleets: Query<'w, 's, &'static Fleet>,
+    pool: Res<'w, RoverPool>,
+    refused: Res<'w, Refused>,
 }
 
 impl Plugin for BuildingPanelPlugin {
@@ -60,60 +92,75 @@ impl Plugin for BuildingPanelPlugin {
     }
 }
 
-/// Draw the panel of whatever the player picked out, whenever that or a fleet has moved.
+/// Draw the panel of whatever the player picked out, whenever that, a fleet or the pool has moved.
 ///
 /// A fleet raised from anywhere at all redraws it, which is what makes the count on the panel the
-/// count the simulation is running rather than the last one the panel was told about. The panel
-/// keeps its entity and only its rows are built again, so one already on screen stays the one on
-/// screen rather than blinking out and back.
+/// count the simulation is running rather than the last one the panel was told about. A refusal
+/// moves no fleet and so would otherwise leave the screen saying what it said before the press.
+/// The panel keeps its entity and only its rows are built again, so one already on screen stays
+/// the one on screen rather than blinking out and back.
 fn redraw_the_panel(
     mut commands: Commands,
     selection: Res<Selection>,
     moved: Query<(), Changed<Fleet>>,
+    stirred: Query<(), ProductionMoved>,
     panels: Query<Entity, With<BuildingPanel>>,
     saying: WhatToSay,
 ) {
-    if !selection.is_changed() && moved.is_empty() {
+    let picked = selection.building();
+    let started_or_stopped = picked.is_some_and(|building| stirred.contains(building));
+    if !selection.is_changed()
+        && moved.is_empty()
+        && !saying.refused.is_changed()
+        && !started_or_stopped
+    {
         return;
     }
-    let reading = selection
-        .building()
-        .and_then(|building| saying.reading_of(building, selection.port()));
+    let reading = picked.and_then(|building| saying.reading_of(building, selection.port()));
     let standing = panels.iter().next();
 
     match (reading, standing) {
         (None, Some(panel)) => commands.entity(panel).despawn(),
         (None, None) => {}
-        (Some((heading, rows)), Some(panel)) => {
+        (Some(reading), Some(panel)) => {
             commands
                 .entity(panel)
                 .despawn_related::<Children>()
-                .with_children(|panel| fill_the_panel(panel, &heading, &rows));
+                .with_children(|panel| fill_the_panel(panel, &reading));
         }
-        (Some((heading, rows)), None) => {
+        (Some(reading), None) => {
             commands
                 .spawn((
                     BuildingPanel,
                     panel(PanelCorner::BottomRight, Val::Px(PANEL_WIDTH)),
                 ))
-                .with_children(|panel| fill_the_panel(panel, &heading, &rows));
+                .with_children(|panel| fill_the_panel(panel, &reading));
         }
     }
 }
 
 impl WhatToSay<'_, '_> {
     /// What the panel says about `building`, given which of its ports the player picked out.
-    fn reading_of(
-        &self,
-        building: Entity,
-        picked_out: Option<Entity>,
-    ) -> Option<(String, Vec<PortRow>)> {
-        let (kind, ports) = self.buildings.get(building).ok()?;
+    fn reading_of(&self, building: Entity, picked_out: Option<Entity>) -> Option<Reading> {
+        let (kind, ports, running, stopped) = self.buildings.get(building).ok()?;
         let rows = ports
             .iter()
             .filter_map(|port| self.row_of(port, picked_out == Some(port)))
             .collect();
-        Some((kind.label(), rows))
+        Some(Reading {
+            heading: kind.label(),
+            doing: doing(running, stopped),
+            rows,
+            pool: self.pool_reading(),
+            refused: picked_out.is_some() && self.refused.port() == picked_out,
+        })
+    }
+
+    /// What is left of the pool, which is its size less what every fleet on the map holds.
+    fn pool_reading(&self) -> String {
+        let assigned: u32 = self.fleets.iter().map(|fleet| fleet.rovers).sum();
+        let spare = self.pool.spare(assigned);
+        format!("{spare} of {} rovers spare", self.pool.size)
     }
 
     fn row_of(&self, port: Entity, picked_out: bool) -> Option<PortRow> {
@@ -158,9 +205,21 @@ impl WhatToSay<'_, '_> {
     }
 }
 
-fn fill_the_panel(panel: &mut ChildSpawnerCommands, heading: &str, rows: &[PortRow]) {
-    panel.spawn(panel_text(heading.to_string(), HEADING_TEXT, Val::Auto));
-    for row in rows {
+/// What the panel says a building is making of its recipe, which is what a stalled chain is read
+/// off. A building the tick has not looked at yet carries neither mark, and has yet to try.
+fn doing(running: Option<&Running>, stopped: Option<&Stopped>) -> &'static str {
+    match (running, stopped) {
+        (Some(_), _) => "Running",
+        (None, Some(Stopped(WaitingOn::AnInput))) => "Waiting on an input",
+        (None, Some(Stopped(WaitingOn::OutletRoom))) => "Waiting on room to put its output",
+        (None, None) => "Yet to run",
+    }
+}
+
+fn fill_the_panel(panel: &mut ChildSpawnerCommands, reading: &Reading) {
+    panel.spawn(panel_text(reading.heading.clone(), HEADING_TEXT, Val::Auto));
+    panel.spawn(panel_text(reading.doing.to_string(), BODY_TEXT, Val::Auto));
+    for row in &reading.rows {
         panel.spawn(panel_row()).with_children(|line| {
             line.spawn(panel_text(
                 format!("{}{}", PICKED_OUT[usize::from(row.picked_out)], row.port),
@@ -174,6 +233,11 @@ fn fill_the_panel(panel: &mut ChildSpawnerCommands, heading: &str, rows: &[PortR
             line.spawn(panel_text(row.fleet.clone(), BODY_TEXT, Val::Auto));
         });
     }
+    let (pool, colour) = match reading.refused {
+        true => (REFUSED_A_ROVER.to_string(), KEYED_TEXT),
+        false => (reading.pool.clone(), BODY_TEXT),
+    };
+    panel.spawn(panel_text(pool, colour, Val::Auto));
 }
 
 fn flow_label(flow: Flow) -> &'static str {
@@ -196,17 +260,25 @@ mod tests {
     use crate::building::{BuildingPlugin, BuildingTiles, ChosenBuildingType};
     use crate::common::cleanup::CleanupPlugin;
     use crate::diagnostics::DebugGizmosPlugin;
+    use crate::fleet::FleetPlugin;
     use crate::input::{PlayerAction, PlayerInput};
     use crate::map::{Deposit, HexCoordinates, MapTile, TileCorner};
-    use crate::road::{RoadEndpoint, RoadPlugin};
-    use crate::testing::{headless_app, tick};
+    use crate::road::{Road, RoadEndpoint, RoadPlugin};
+    use crate::testing::{headless_app, press_key, release_key, tick};
     use crate::ui::selection::SelectionPlugin;
 
     /// The tile the building the panel reads stands on, in offset-row coordinates.
     const READING: (i32, i32) = (0, 0);
 
     /// The tile the building it collects from stands on, in offset-row coordinates.
-    const SUPPLYING: (i32, i32) = (3, 0);
+    ///
+    /// Placed so its outlet stands on the very corner the melter's intake does, which is the
+    /// chaining the port layout is built for: one road node then serves both, and the supplier
+    /// the tick finds is the one the panel is asked to name.
+    const SUPPLYING: (i32, i32) = (-1, -1);
+
+    /// The tiles the road serving both buildings runs over, in offset-row coordinates.
+    const REACHING: [(i32, i32); 2] = [(0, 0), (1, 0)];
 
     /// A tile nothing stands on, in offset-row coordinates.
     const BARE: (i32, i32) = (6, 0);
@@ -217,8 +289,17 @@ mod tests {
     /// The corner a melter's intake stands on, which is `INTAKE_CORNERS[0]` unturned.
     const INTAKE: TileCorner = TileCorner::SouthWest;
 
-    /// The corner an extractor's outlet stands on, which is `OUTLET_CORNERS[0]` unturned.
-    const OUTLET: TileCorner = TileCorner::North;
+    /// How many rovers the player has in these tests, few enough to read the arithmetic off.
+    const A_POOL: u32 = 4;
+
+    /// A pool one rover spends outright, so the next request for one is refused.
+    const A_SPENT_POOL: u32 = 1;
+
+    /// How many rovers a fleet under test is given.
+    const A_ROVER: u32 = 1;
+
+    /// The key that asks the port picked out for another rover, which `crate::fleet` binds.
+    const ANOTHER_ROVER: KeyCode = KeyCode::Equal;
 
     fn panel_app() -> App {
         let mut app = headless_app();
@@ -229,10 +310,23 @@ mod tests {
                 BuildingPanelPlugin,
                 CleanupPlugin,
                 DebugGizmosPlugin,
+                FleetPlugin,
                 RoadPlugin,
                 SelectionPlugin,
             ));
         app
+    }
+
+    /// Give the map a pool of `size` rovers, in place of the one the game ships with.
+    fn pool_of(app: &mut App, size: u32) {
+        app.insert_resource(RoverPool { size });
+    }
+
+    fn tap_key(app: &mut App, key: KeyCode) {
+        press_key(app, key);
+        tick(app);
+        release_key(app, key);
+        tick(app);
     }
 
     fn tile_of(offsets: (i32, i32)) -> HexCoordinates {
@@ -385,38 +479,47 @@ mod tests {
         panel_lines(app).iter().any(|line| line.contains(wanted))
     }
 
-    /// An app holding a melter to read, an extractor to collect from, and the select tool.
+    /// An app holding a melter to read, an extractor supplying it, and the select tool.
     fn read_a_melter() -> (App, Entity, Entity) {
         let mut app = panel_app();
         let (melter, tile) = place(&mut app, READING, MELTER);
         place(&mut app, SUPPLYING, 0);
+        lay_road_through(&mut app, INTAKE, &REACHING);
         hold(&mut app, PlayerAction::Select);
         (app, melter, tile)
     }
 
-    /// Give the melter's intake a fleet of `rovers` collecting from the extractor's outlet.
-    fn assign(app: &mut App, melter: Entity, rovers: u32) -> Entity {
-        let intake = port_at(app, melter, INTAKE, READING);
-        let extractor = app
-            .world()
-            .resource::<BuildingTiles>()
-            .building_on(tile_of(SUPPLYING))
-            .expect("an extractor stands there");
-        let source = port_at(app, extractor, OUTLET, SUPPLYING);
-        app.world_mut().entity_mut(intake).insert(Fleet {
-            rovers,
-            source: Some(source),
-        });
-        intake
+    /// An app holding a melter nothing on the map supplies, and the select tool.
+    fn read_a_melter_nothing_supplies() -> (App, Entity, Entity) {
+        let mut app = panel_app();
+        let (melter, tile) = place(&mut app, READING, MELTER);
+        lay_road_through(&mut app, INTAKE, &REACHING);
+        hold(&mut app, PlayerAction::Select);
+        (app, melter, tile)
     }
 
-    /// Give the melter's intake a fleet of `rovers` with nothing found for it to collect from.
-    fn assign_unsupplied(app: &mut App, melter: Entity, rovers: u32) -> Entity {
+    /// Lay a road through the `corner` of each of `offsets`, and let it take its tiles.
+    fn lay_road_through(app: &mut App, corner: TileCorner, offsets: &[(i32, i32)]) {
+        let nodes = offsets
+            .iter()
+            .map(|&offset| corner.node_of(tile_of(offset)))
+            .collect();
+        app.world_mut().spawn(Road {
+            nodes,
+            leaving: None,
+            one_way: false,
+        });
+        tick(app);
+    }
+
+    /// Give the melter's intake a fleet of `rovers`, and let the tick find it the extractor.
+    fn assign(app: &mut App, melter: Entity, rovers: u32) -> Entity {
         let intake = port_at(app, melter, INTAKE, READING);
         app.world_mut().entity_mut(intake).insert(Fleet {
             rovers,
             source: None,
         });
+        tick(app);
         intake
     }
 
@@ -450,8 +553,8 @@ mod tests {
 
     #[test]
     fn a_fleet_with_nothing_making_what_its_port_takes_says_so() {
-        let (mut app, melter, tile) = read_a_melter();
-        assign_unsupplied(&mut app, melter, 2);
+        let (mut app, melter, tile) = read_a_melter_nothing_supplies();
+        assign(&mut app, melter, 2);
 
         pick_out_the_port(&mut app, tile, READING, INTAKE);
 
@@ -527,6 +630,60 @@ mod tests {
 
         assert_eq!(the_panel(&mut app), standing);
         assert!(says(&mut app, "3 rovers"), "{:?}", panel_lines(&mut app));
+    }
+
+    #[test]
+    fn the_panel_says_how_many_rovers_are_left_to_give() {
+        let (mut app, melter, tile) = read_a_melter();
+        pool_of(&mut app, A_POOL);
+        assign(&mut app, melter, A_ROVER);
+
+        pick_out_the_building(&mut app, tile, READING);
+
+        assert!(
+            says(&mut app, "3 of 4 rovers spare"),
+            "{:?}",
+            panel_lines(&mut app)
+        );
+    }
+
+    #[test]
+    fn the_panel_says_a_port_was_refused_a_rover() {
+        let (mut app, melter, tile) = read_a_melter();
+        pool_of(&mut app, A_SPENT_POOL);
+        assign(&mut app, melter, A_SPENT_POOL);
+        pick_out_the_port(&mut app, tile, READING, INTAKE);
+
+        tap_key(&mut app, ANOTHER_ROVER);
+
+        assert!(
+            says(&mut app, "no rovers spare"),
+            "{:?}",
+            panel_lines(&mut app)
+        );
+    }
+
+    #[test]
+    fn the_panel_forgets_a_refusal_once_the_player_has_picked_something_else_out() {
+        let (mut app, melter, tile) = read_a_melter();
+        pool_of(&mut app, A_SPENT_POOL);
+        assign(&mut app, melter, A_SPENT_POOL);
+        pick_out_the_port(&mut app, tile, READING, INTAKE);
+        tap_key(&mut app, ANOTHER_ROVER);
+
+        pick_out_the_building(&mut app, tile, READING);
+        pick_out_the_port(&mut app, tile, READING, INTAKE);
+
+        assert!(
+            !says(&mut app, "no rovers spare"),
+            "{:?}",
+            panel_lines(&mut app)
+        );
+        assert!(
+            says(&mut app, "0 of 1 rovers spare"),
+            "{:?}",
+            panel_lines(&mut app)
+        );
     }
 
     #[test]

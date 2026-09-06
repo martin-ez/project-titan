@@ -21,6 +21,7 @@ use crate::rover::{Cargo, Route, Rover, RoversDriven, SentTo, Stranded};
 use crate::simulation::Simulation;
 use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
 use crate::ui::selection::{Picked, Selection};
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use std::collections::HashMap;
 
@@ -40,8 +41,40 @@ const FLEET_COLOUR: Color = Color::srgb(0.6, 0.5, 0.9);
 /// The keys that change the selected port's fleet, and how many rovers each asks for.
 const FLEET_KEYS: [(KeyCode, i32); 2] = [(KeyCode::Minus, -1), (KeyCode::Equal, 1)];
 
+/// How many rovers the player has to give out across the whole map.
+///
+/// Scarce against the map as it stands: a couple of chains can be served well or several badly,
+/// so which building gets a rover is a trade from the second one onwards. What the number ought
+/// to grow with is progression's answer rather than this one's.
+const ROVER_POOL: u32 = 12;
+
 /// The rovers each port has been given, and the shuttle they run.
 pub struct FleetPlugin;
+
+/// The set the shuttles run in, so a system reading a port after they collected can follow them.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FleetsServed;
+
+/// How many rovers the player has, all told.
+///
+/// One pool behind every [`Fleet`] on the map, which is what makes giving a rover to one port the
+/// same act as taking it off another. What is spare is derived from the fleets themselves rather
+/// than tallied here: a port that leaves the world takes its claim with it, and a tally kept
+/// beside them is one that can disagree with them.
+#[derive(Resource)]
+pub struct RoverPool {
+    /// How many rovers there are to give out.
+    pub size: u32,
+}
+
+/// The port whose last request for a rover the pool could not fill.
+///
+/// A refused request writes nothing to the world — the count it asked to raise stays where it
+/// was — so without a record of it the screen says the same thing before the press as after, and
+/// the player is told nothing. It is a fact about the frame a key arrived on, read by what draws
+/// and by no tick (invariant 2).
+#[derive(Resource, Default, PartialEq)]
+pub struct Refused(Option<Entity>);
 
 /// The rovers a port has been given, and the port they were found to collect from.
 ///
@@ -99,9 +132,57 @@ struct Retired;
 /// A rover with nothing to do: no route, no order for one, and not stopped for want of one.
 type StandingIdle = (Without<Route>, Without<SentTo>, Without<Stranded>);
 
+/// The intake the player has picked out to give rovers to, if that is what they have picked out.
+///
+/// The tool they hold, what they picked and whether it takes goods in are one question rather
+/// than three, because every one of them has to answer before a key means anything.
+#[derive(SystemParam)]
+struct PickedOutIntake<'w, 's> {
+    action: Res<'w, State<PlayerAction>>,
+    selection: Res<'w, Selection>,
+    ports: Query<'w, 's, &'static Port>,
+}
+
+impl PickedOutIntake<'_, '_> {
+    /// The port a key is aimed at, which is an intake picked out with the select tool and nothing
+    /// else — a fleet being a shuttle that brings a building what it takes in.
+    fn port(&self) -> Option<Entity> {
+        if *self.action.get() != PlayerAction::Select {
+            return None;
+        }
+        let port = self.selection.port()?;
+        self.ports
+            .get(port)
+            .is_ok_and(|door| door.flow == Flow::Intake)
+            .then_some(port)
+    }
+}
+
+impl Default for RoverPool {
+    fn default() -> Self {
+        Self { size: ROVER_POOL }
+    }
+}
+
+impl RoverPool {
+    /// How many of the pool are still to give, `assigned` being what the fleets hold between them.
+    pub fn spare(&self, assigned: u32) -> u32 {
+        self.size.saturating_sub(assigned)
+    }
+}
+
+impl Refused {
+    /// The port that last asked for a rover the pool had none of, if one did.
+    pub fn port(&self) -> Option<Entity> {
+        self.0
+    }
+}
+
 impl Plugin for FleetPlugin {
     fn build(&self, app: &mut App) {
-        app.add_observer(take_the_rovers_of_a_fleet_that_is_gone_off_the_road)
+        app.init_resource::<RoverPool>()
+            .init_resource::<Refused>()
+            .add_observer(take_the_rovers_of_a_fleet_that_is_gone_off_the_road)
             .add_observer(give_back_the_place_of_a_rover_that_left_the_world)
             .declare_bindings([
                 Binding {
@@ -127,12 +208,14 @@ impl Plugin for FleetPlugin {
                     set_the_idle_rovers_off_again,
                 )
                     .chain()
+                    .in_set(FleetsServed)
                     .after(RoversDriven)
                     .in_set(Simulation),
             )
             .add_systems(
                 Update,
                 (
+                    forget_a_refusal_when_the_player_picks_something_else_out,
                     set_the_rovers_the_player_asked_for,
                     draw_the_way_a_fleet_collects_along,
                 )
@@ -146,41 +229,57 @@ impl Plugin for FleetPlugin {
 ///
 /// The count written is the one the simulation reads on the next tick, so what the player asked
 /// for and what is running are one number rather than two that can disagree. An intake given its
-/// first rover gains its fleet here, that count being the whole of what the player says about it:
-/// where those rovers collect from is the tick's to find. Only an intake takes one, a fleet being
-/// a shuttle that brings a building what it takes in, and one asked for a rover it does not have
-/// is left without a fleet rather than given an empty one.
+/// first rover gains its fleet here, where those rovers collect from being the tick's to find
+/// rather than the player's to say.
+///
+/// Every fleet's count together is what the pool has been spent on, so a rover put on one port is
+/// one another cannot have, and one taken off is free to the next that asks on the same frame. A
+/// request the pool cannot fill leaves the count where it was and is recorded as refused.
 fn set_the_rovers_the_player_asked_for(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
-    action: Res<State<PlayerAction>>,
-    selection: Res<Selection>,
-    ports: Query<&Port>,
+    picked_out: PickedOutIntake,
+    pool: Res<RoverPool>,
+    mut refused: ResMut<Refused>,
     mut fleets: Query<&mut Fleet>,
 ) {
-    if *action.get() != PlayerAction::Select {
-        return;
-    }
-    let Some(port) = selection.port() else {
+    let Some(port) = picked_out.port() else {
         return;
     };
-    if !ports.get(port).is_ok_and(|door| door.flow == Flow::Intake) {
-        return;
-    }
+    let spare = pool.spare(fleets.iter().map(|fleet| fleet.rovers).sum());
     for (key, asked) in FLEET_KEYS {
         if !keys.just_pressed(key) {
             continue;
         }
+        if asked.is_positive() && spare < asked.unsigned_abs() {
+            refused.set_if_neq(Refused(Some(port)));
+            continue;
+        }
         match fleets.get_mut(port) {
             Ok(mut fleet) => fleet.rovers = fleet.rovers.saturating_add_signed(asked),
-            Err(_) if asked > 0 => {
+            Err(_) if asked.is_positive() => {
                 commands.entity(port).insert(Fleet {
                     rovers: asked.unsigned_abs(),
                     source: None,
                 });
             }
-            Err(_) => {}
+            Err(_) => continue,
         }
+        refused.set_if_neq(Refused(None));
+    }
+}
+
+/// Forget a refusal once the player has picked something else out.
+///
+/// A refusal is about the port that asked for a rover, so one that outlives the picking of
+/// another leaves the player reading about a request they made somewhere else. It is dropped
+/// rather than carried over: what is spare may well have moved by the time they come back.
+fn forget_a_refusal_when_the_player_picks_something_else_out(
+    selection: Res<Selection>,
+    mut refused: ResMut<Refused>,
+) {
+    if selection.is_changed() {
+        refused.set_if_neq(Refused(None));
     }
 }
 
@@ -1530,6 +1629,13 @@ mod tests {
     /// The tiles the road serving the assigned building's intake runs over.
     const REACHING: [(i32, i32); 2] = [(0, 0), (1, 0)];
 
+    /// The tile a second building competing for the same rovers stands on, in offset-row
+    /// coordinates. Far enough off `REACHING` that no road reaches it and no corner is shared.
+    const ALSO_ASSIGNED: (i32, i32) = (0, 2);
+
+    /// A pool one rover spends outright, so what any second port asks for is asked of nothing.
+    const A_POOL_OF_ONE: u32 = 1;
+
     fn hold(app: &mut App, tool: PlayerAction) {
         app.world_mut()
             .resource_mut::<NextState<PlayerAction>>()
@@ -1648,6 +1754,25 @@ mod tests {
         app.world().entity(port).get::<Fleet>()
     }
 
+    fn rovers_of(app: &App, port: Entity) -> u32 {
+        fleet_of(app, port)
+            .expect("the port was given a fleet")
+            .rovers
+    }
+
+    /// Give the map a pool of `size` rovers, in place of the one the game ships with.
+    fn pool_of(app: &mut App, size: u32) {
+        app.insert_resource(RoverPool { size });
+    }
+
+    /// Stand a second melter on `ALSO_ASSIGNED`, answering with its intake and its tile.
+    fn a_second_melter(app: &mut App) -> (Entity, Entity) {
+        hold(app, PlayerAction::EditBuildings);
+        let (melter, ground) = place(app, ALSO_ASSIGNED, MELTER);
+        hold(app, PlayerAction::Select);
+        (port_on(app, melter, INTAKE_CORNER, ALSO_ASSIGNED), ground)
+    }
+
     #[test]
     fn asking_an_intake_for_a_rover_gives_it_a_fleet() {
         let (mut app, ground, intake) = assignment_app();
@@ -1736,6 +1861,71 @@ mod tests {
         tap_key(&mut app, FLEET_KEYS[1].0);
 
         assert!(fleet_of(&app, intake).is_none());
+    }
+
+    #[test]
+    fn a_port_is_refused_a_rover_the_pool_cannot_supply() {
+        let (mut app, ground, intake) = assignment_app();
+        pool_of(&mut app, A_POOL_OF_ONE);
+        assign(&mut app, intake, A_POOL_OF_ONE);
+        pick_out(&mut app, ground, ASSIGNED, INTAKE_CORNER);
+
+        tap_key(&mut app, FLEET_KEYS[1].0);
+
+        assert_eq!(rovers_of(&app, intake), A_POOL_OF_ONE);
+    }
+
+    #[test]
+    fn an_intake_asking_for_its_first_rover_is_refused_when_the_pool_is_spent() {
+        let (mut app, _, intake) = assignment_app();
+        pool_of(&mut app, A_POOL_OF_ONE);
+        assign(&mut app, intake, A_POOL_OF_ONE);
+        let (other, other_ground) = a_second_melter(&mut app);
+        pick_out(&mut app, other_ground, ALSO_ASSIGNED, INTAKE_CORNER);
+
+        tap_key(&mut app, FLEET_KEYS[1].0);
+
+        assert!(
+            fleet_of(&app, other).is_none(),
+            "a port with no fleet took a rover the pool did not have"
+        );
+    }
+
+    #[test]
+    fn a_rover_taken_off_one_port_can_be_given_to_another() {
+        let (mut app, ground, intake) = assignment_app();
+        pool_of(&mut app, A_POOL_OF_ONE);
+        let (other, other_ground) = a_second_melter(&mut app);
+        assign(&mut app, intake, A_POOL_OF_ONE);
+        assign(&mut app, other, 0);
+        pick_out(&mut app, other_ground, ALSO_ASSIGNED, INTAKE_CORNER);
+        tap_key(&mut app, FLEET_KEYS[1].0);
+        assert_eq!(rovers_of(&app, other), 0, "the pool was spent already");
+
+        pick_out(&mut app, ground, ASSIGNED, INTAKE_CORNER);
+        tap_key(&mut app, FLEET_KEYS[0].0);
+        pick_out(&mut app, other_ground, ALSO_ASSIGNED, INTAKE_CORNER);
+        tap_key(&mut app, FLEET_KEYS[1].0);
+
+        assert_eq!(rovers_of(&app, other), A_POOL_OF_ONE);
+    }
+
+    #[test]
+    fn taking_a_port_off_the_map_gives_its_rovers_back_to_the_pool() {
+        let (mut app, _, intake) = assignment_app();
+        pool_of(&mut app, A_POOL_OF_ONE);
+        let (other, other_ground) = a_second_melter(&mut app);
+        assign(&mut app, intake, A_POOL_OF_ONE);
+        assign(&mut app, other, 0);
+        pick_out(&mut app, other_ground, ALSO_ASSIGNED, INTAKE_CORNER);
+        tap_key(&mut app, FLEET_KEYS[1].0);
+        assert_eq!(rovers_of(&app, other), 0, "the pool was spent already");
+
+        app.world_mut().entity_mut(intake).insert(Destroy);
+        tick(&mut app);
+        tap_key(&mut app, FLEET_KEYS[1].0);
+
+        assert_eq!(rovers_of(&app, other), A_POOL_OF_ONE);
     }
 
     #[test]
