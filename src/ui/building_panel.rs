@@ -25,8 +25,11 @@ const PORT_COLUMN_WIDTH: f32 = 120.0;
 /// What marks the row of the port the player picked out, and what stands in its place otherwise
 const PICKED_OUT: [&str; 2] = ["  ", "▸ "];
 
-/// What an intake with nowhere to collect from says instead of a count
-const UNPOINTED: &str = "right-click a port to collect from";
+/// What an intake nobody has given a rover says instead of a count
+const UNASSIGNED: &str = "no rovers of its own";
+
+/// What a fleet with nothing on the network making what its port takes says instead of a source
+const UNSUPPLIED: &str = "nothing that makes it";
 
 /// The panel reading out the building the player picked out.
 pub struct BuildingPanelPlugin;
@@ -126,15 +129,19 @@ impl WhatToSay<'_, '_> {
         if door.flow == Flow::Outlet {
             return String::new();
         }
-        match fleet {
-            Some(fleet) => format!("{} ← {}", rovers(fleet.rovers), self.name_of(fleet.source)),
-            None => UNPOINTED.to_string(),
-        }
+        let Some(fleet) = fleet else {
+            return UNASSIGNED.to_string();
+        };
+        let collecting = match fleet.source {
+            Some(source) => self.name_of(source),
+            None => UNSUPPLIED.to_string(),
+        };
+        format!("{} ← {}", rovers(fleet.rovers), collecting)
     }
 
     /// What to call the port a fleet collects from: the building standing it, and what it hands
-    /// over. A player names a source by pointing at it, so what they are shown back is where they
-    /// pointed rather than the entity they never saw.
+    /// over. A source is found rather than pointed at, so what the player is shown is a place on
+    /// the map they can go and look at rather than the entity behind it.
     fn name_of(&self, port: Entity) -> String {
         let Ok((door, _)) = self.ports.get(port) else {
             return "somewhere that is gone".to_string();
@@ -396,9 +403,20 @@ mod tests {
             .building_on(tile_of(SUPPLYING))
             .expect("an extractor stands there");
         let source = port_at(app, extractor, OUTLET, SUPPLYING);
-        app.world_mut()
-            .entity_mut(intake)
-            .insert(Fleet { rovers, source });
+        app.world_mut().entity_mut(intake).insert(Fleet {
+            rovers,
+            source: Some(source),
+        });
+        intake
+    }
+
+    /// Give the melter's intake a fleet of `rovers` with nothing found for it to collect from.
+    fn assign_unsupplied(app: &mut App, melter: Entity, rovers: u32) -> Entity {
+        let intake = port_at(app, melter, INTAKE, READING);
+        app.world_mut().entity_mut(intake).insert(Fleet {
+            rovers,
+            source: None,
+        });
         intake
     }
 
@@ -422,12 +440,23 @@ mod tests {
     }
 
     #[test]
-    fn an_intake_with_nowhere_to_collect_from_says_so() {
+    fn an_intake_nobody_has_given_a_rover_says_so() {
         let (mut app, _, tile) = read_a_melter();
 
         pick_out_the_building(&mut app, tile, READING);
 
-        assert!(says(&mut app, UNPOINTED), "{:?}", panel_lines(&mut app));
+        assert!(says(&mut app, UNASSIGNED), "{:?}", panel_lines(&mut app));
+    }
+
+    #[test]
+    fn a_fleet_with_nothing_making_what_its_port_takes_says_so() {
+        let (mut app, melter, tile) = read_a_melter();
+        assign_unsupplied(&mut app, melter, 2);
+
+        pick_out_the_port(&mut app, tile, READING, INTAKE);
+
+        assert!(says(&mut app, "2 rovers"), "{:?}", panel_lines(&mut app));
+        assert!(says(&mut app, UNSUPPLIED), "{:?}", panel_lines(&mut app));
     }
 
     #[test]
