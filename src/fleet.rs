@@ -1494,9 +1494,11 @@ mod tests {
     fn a_fleet_too_large_for_its_road_delivers_less_than_one_that_fits() {
         let delivered = |rovers: u32| {
             let (mut app, source, home) = haulage_app();
+            produce_at(&mut app, source);
+            consume_at(&mut app, home);
             assign(&mut app, home, rovers, source);
             run(&mut app, TICKS_MEASURED);
-            held_at(&app, home)
+            taken_in(&app, home)
         };
 
         let fits = delivered(A_FLEET_THAT_FITS);
