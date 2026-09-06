@@ -112,7 +112,9 @@ pub struct HexCoordinates {
 /// six neighbours at that spacing whether it is a centre or a corner. So a road is placed on the
 /// same integers a tile is, at twice the resolution, and invariant 3 holds for a road without a
 /// second coordinate system to keep in step with the first.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// Ordered by its integers, so a set of nodes has one order that is a fact of the grid rather
+/// than of the world that stored them — which is what a tie between two places is settled by.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct LatticeNode {
     i: i32,
     j: i32,

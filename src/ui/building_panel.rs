@@ -29,8 +29,11 @@ const PORT_COLUMN_WIDTH: f32 = 120.0;
 /// What marks the row of the port the player picked out, and what stands in its place otherwise
 const PICKED_OUT: [&str; 2] = ["  ", "▸ "];
 
-/// What an intake with nowhere to collect from says instead of a count
-const UNPOINTED: &str = "right-click a port to collect from";
+/// What an intake nobody has given a rover says instead of a count
+const UNASSIGNED: &str = "no rovers of its own";
+
+/// What a fleet with nothing on the network making what its port takes says instead of a source
+const UNSUPPLIED: &str = "nothing that makes it";
 
 /// What the panel says in place of the pool when the port picked out was refused a rover
 const REFUSED_A_ROVER: &str = "no rovers spare — take one off elsewhere";
@@ -173,15 +176,19 @@ impl WhatToSay<'_, '_> {
         if door.flow == Flow::Outlet {
             return String::new();
         }
-        match fleet {
-            Some(fleet) => format!("{} ← {}", rovers(fleet.rovers), self.name_of(fleet.source)),
-            None => UNPOINTED.to_string(),
-        }
+        let Some(fleet) = fleet else {
+            return UNASSIGNED.to_string();
+        };
+        let collecting = match fleet.source {
+            Some(source) => self.name_of(source),
+            None => UNSUPPLIED.to_string(),
+        };
+        format!("{} ← {}", rovers(fleet.rovers), collecting)
     }
 
     /// What to call the port a fleet collects from: the building standing it, and what it hands
-    /// over. A player names a source by pointing at it, so what they are shown back is where they
-    /// pointed rather than the entity they never saw.
+    /// over. A source is found rather than pointed at, so what the player is shown is a place on
+    /// the map they can go and look at rather than the entity behind it.
     fn name_of(&self, port: Entity) -> String {
         let Ok((door, _)) = self.ports.get(port) else {
             return "somewhere that is gone".to_string();
@@ -256,7 +263,7 @@ mod tests {
     use crate::fleet::FleetPlugin;
     use crate::input::{PlayerAction, PlayerInput};
     use crate::map::{Deposit, HexCoordinates, MapTile, TileCorner};
-    use crate::road::{RoadEndpoint, RoadPlugin};
+    use crate::road::{Road, RoadEndpoint, RoadPlugin};
     use crate::testing::{headless_app, press_key, release_key, tick};
     use crate::ui::selection::SelectionPlugin;
 
@@ -264,7 +271,14 @@ mod tests {
     const READING: (i32, i32) = (0, 0);
 
     /// The tile the building it collects from stands on, in offset-row coordinates.
-    const SUPPLYING: (i32, i32) = (3, 0);
+    ///
+    /// Placed so its outlet stands on the very corner the melter's intake does, which is the
+    /// chaining the port layout is built for: one road node then serves both, and the supplier
+    /// the tick finds is the one the panel is asked to name.
+    const SUPPLYING: (i32, i32) = (-1, -1);
+
+    /// The tiles the road serving both buildings runs over, in offset-row coordinates.
+    const REACHING: [(i32, i32); 2] = [(0, 0), (1, 0)];
 
     /// A tile nothing stands on, in offset-row coordinates.
     const BARE: (i32, i32) = (6, 0);
@@ -274,9 +288,6 @@ mod tests {
 
     /// The corner a melter's intake stands on, which is `INTAKE_CORNERS[0]` unturned.
     const INTAKE: TileCorner = TileCorner::SouthWest;
-
-    /// The corner an extractor's outlet stands on, which is `OUTLET_CORNERS[0]` unturned.
-    const OUTLET: TileCorner = TileCorner::North;
 
     /// How many rovers the player has in these tests, few enough to read the arithmetic off.
     const A_POOL: u32 = 4;
@@ -468,27 +479,47 @@ mod tests {
         panel_lines(app).iter().any(|line| line.contains(wanted))
     }
 
-    /// An app holding a melter to read, an extractor to collect from, and the select tool.
+    /// An app holding a melter to read, an extractor supplying it, and the select tool.
     fn read_a_melter() -> (App, Entity, Entity) {
         let mut app = panel_app();
         let (melter, tile) = place(&mut app, READING, MELTER);
         place(&mut app, SUPPLYING, 0);
+        lay_road_through(&mut app, INTAKE, &REACHING);
         hold(&mut app, PlayerAction::Select);
         (app, melter, tile)
     }
 
-    /// Give the melter's intake a fleet of `rovers` collecting from the extractor's outlet.
+    /// An app holding a melter nothing on the map supplies, and the select tool.
+    fn read_a_melter_nothing_supplies() -> (App, Entity, Entity) {
+        let mut app = panel_app();
+        let (melter, tile) = place(&mut app, READING, MELTER);
+        lay_road_through(&mut app, INTAKE, &REACHING);
+        hold(&mut app, PlayerAction::Select);
+        (app, melter, tile)
+    }
+
+    /// Lay a road through the `corner` of each of `offsets`, and let it take its tiles.
+    fn lay_road_through(app: &mut App, corner: TileCorner, offsets: &[(i32, i32)]) {
+        let nodes = offsets
+            .iter()
+            .map(|&offset| corner.node_of(tile_of(offset)))
+            .collect();
+        app.world_mut().spawn(Road {
+            nodes,
+            leaving: None,
+            one_way: false,
+        });
+        tick(app);
+    }
+
+    /// Give the melter's intake a fleet of `rovers`, and let the tick find it the extractor.
     fn assign(app: &mut App, melter: Entity, rovers: u32) -> Entity {
         let intake = port_at(app, melter, INTAKE, READING);
-        let extractor = app
-            .world()
-            .resource::<BuildingTiles>()
-            .building_on(tile_of(SUPPLYING))
-            .expect("an extractor stands there");
-        let source = port_at(app, extractor, OUTLET, SUPPLYING);
-        app.world_mut()
-            .entity_mut(intake)
-            .insert(Fleet { rovers, source });
+        app.world_mut().entity_mut(intake).insert(Fleet {
+            rovers,
+            source: None,
+        });
+        tick(app);
         intake
     }
 
@@ -512,12 +543,23 @@ mod tests {
     }
 
     #[test]
-    fn an_intake_with_nowhere_to_collect_from_says_so() {
+    fn an_intake_nobody_has_given_a_rover_says_so() {
         let (mut app, _, tile) = read_a_melter();
 
         pick_out_the_building(&mut app, tile, READING);
 
-        assert!(says(&mut app, UNPOINTED), "{:?}", panel_lines(&mut app));
+        assert!(says(&mut app, UNASSIGNED), "{:?}", panel_lines(&mut app));
+    }
+
+    #[test]
+    fn a_fleet_with_nothing_making_what_its_port_takes_says_so() {
+        let (mut app, melter, tile) = read_a_melter_nothing_supplies();
+        assign(&mut app, melter, 2);
+
+        pick_out_the_port(&mut app, tile, READING, INTAKE);
+
+        assert!(says(&mut app, "2 rovers"), "{:?}", panel_lines(&mut app));
+        assert!(says(&mut app, UNSUPPLIED), "{:?}", panel_lines(&mut app));
     }
 
     #[test]

@@ -483,6 +483,27 @@ pub struct RoadNetwork<'w, 's> {
     endpoints: Query<'w, 's, &'static RoadEndpoint>,
     frontier: Local<'s, BinaryHeap<Reverse<Reached>>>,
     walked: Local<'s, HashMap<Entity, Step>>,
+    sought: Local<'s, Vec<Sought>>,
+    reached_soonest: Local<'s, Option<Arrival>>,
+}
+
+/// One of the places a walk looking for the nearest of several was given to look for.
+///
+/// It carries where it stands on the network rather than being asked for it again as the walk
+/// goes, and the place it was given in that list, which is what settles a tie between two of them.
+#[derive(Clone, Copy)]
+struct Sought {
+    segment: Entity,
+    along: f32,
+    rank: usize,
+    endpoint: Entity,
+}
+
+/// The soonest of those places the walk has reached so far, and what reaching it cost.
+struct Arrival {
+    cost: f32,
+    rank: usize,
+    endpoint: Entity,
 }
 
 /// A segment the search has reached, ordered by what it costs to reach and then by when it was.
@@ -533,6 +554,7 @@ impl RoadNetwork<'_, '_> {
 
         self.walked.clear();
         self.frontier.clear();
+        self.sought.clear();
         let mut found = 0;
         let left_of_it = (setting_off.ends_at() - along).max(0.);
         let set_off = left_of_it / setting_off.speed_limit();
@@ -557,6 +579,109 @@ impl RoadNetwork<'_, '_> {
             );
         }
         None
+    }
+
+    /// Which of `among` a rover standing `along` `from` reaches soonest, if it reaches any.
+    ///
+    /// One walk outward rather than one route costed per candidate: the network opens from where
+    /// the rover stands, each place is scored as the walk reaches the stretch serving it, and the
+    /// walk stops once nothing left on the frontier can be reached any sooner. Where two are
+    /// reached for the same cost the earlier of `among` wins, so the order the caller hands them
+    /// over in is the whole of the tie and nothing here is settled by the order the world stores
+    /// its entities in (invariant 2).
+    pub fn quickest_of(&mut self, from: Entity, along: f32, among: &[Entity]) -> Option<Entity> {
+        let (setting_off, ..) = self.segments.get(from).ok()?;
+        let (starts_at, ends_at) = (setting_off.starts_at(), setting_off.ends_at());
+        let speed_limit = setting_off.speed_limit();
+
+        self.sought.clear();
+        *self.reached_soonest = None;
+        for (rank, &endpoint) in among.iter().enumerate() {
+            let served = self
+                .endpoints
+                .get(endpoint)
+                .ok()
+                .and_then(RoadEndpoint::served_by);
+            if let Some(served) = served {
+                self.sought.push(Sought {
+                    segment: served.segment,
+                    along: served.along,
+                    rank,
+                    endpoint,
+                });
+            }
+        }
+        if self.sought.is_empty() {
+            return None;
+        }
+
+        self.walked.clear();
+        self.frontier.clear();
+        let mut found = 0;
+        self.reach(from, (starts_at - along) / speed_limit);
+        self.open(
+            from,
+            None,
+            (ends_at - along).max(0.) / speed_limit,
+            &mut found,
+        );
+
+        while let Some(Reverse(reached)) = self.frontier.pop() {
+            let beaten = self
+                .reached_soonest
+                .as_ref()
+                .is_some_and(|soonest| soonest.cost <= reached.cost);
+            if beaten {
+                break;
+            }
+            let Some(step) = self.walked.get_mut(&reached.segment) else {
+                continue;
+            };
+            if step.expanded || step.cost < reached.cost {
+                continue;
+            }
+            step.expanded = true;
+            self.open(
+                reached.segment,
+                Some(reached.segment),
+                reached.cost,
+                &mut found,
+            );
+        }
+        self.reached_soonest.take().map(|soonest| soonest.endpoint)
+    }
+
+    /// Score against the soonest reached so far every sought place `segment` serves, having spent
+    /// `entry` to get to where that segment starts.
+    ///
+    /// A place behind the rover on the stretch it is already standing on scores less than nothing
+    /// and is passed over: it is reached by driving round to it, which the walk costs when it
+    /// offers that stretch a place of its own.
+    fn reach(&mut self, segment: Entity, entry: f32) {
+        if self.sought.is_empty() {
+            return;
+        }
+        let Ok((piece, ..)) = self.segments.get(segment) else {
+            return;
+        };
+        let (starts_at, speed_limit) = (piece.starts_at(), piece.speed_limit());
+        for index in 0..self.sought.len() {
+            let sought = self.sought[index];
+            if sought.segment != segment {
+                continue;
+            }
+            let cost = entry + (sought.along - starts_at) / speed_limit;
+            let sooner = self.reached_soonest.as_ref().is_none_or(|soonest| {
+                cost < soonest.cost || (cost == soonest.cost && sought.rank < soonest.rank)
+            });
+            if cost >= 0. && sooner {
+                *self.reached_soonest = Some(Arrival {
+                    cost,
+                    rank: sought.rank,
+                    endpoint: sought.endpoint,
+                });
+            }
+        }
     }
 
     /// Offer every segment a rover leaving `leaving` may drive onto a place in the search.
@@ -599,6 +724,7 @@ impl RoadNetwork<'_, '_> {
             return;
         };
         let cost = spent + segment.length() / segment.speed_limit();
+        self.reach(onward, spent);
         if self
             .walked
             .get(&onward)
