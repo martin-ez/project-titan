@@ -5,7 +5,7 @@ use crate::diagnostics::DebugGizmos;
 use crate::map::MAP_TILE_SIZE;
 use crate::road::{
     EndsAtJunction, JunctionLegs, JunctionPolicy, NextSegment, PlaceOnTheRoad, RoadEndpoint,
-    RoadNetwork, RoadSegment, RoadsLaid, SegmentCut, ROVER_ROOM,
+    RoadNetwork, RoadSegment, RoadsLaid, SegmentCut, Signal, ROVER_ROOM,
 };
 use crate::simulation::{Simulation, Ticks};
 use bevy::ecs::system::SystemParam;
@@ -379,11 +379,14 @@ fn find_the_route_a_rover_was_sent_on(
 /// junction reaches back through it onto the roads behind.
 ///
 /// A rover already stranded is not offered a turn: it is going nowhere either way.
+///
+/// A junction the player has signalled is asked the signal instead of the policy underneath it,
+/// which is the whole of what a signal does to the handover.
 fn let_the_rovers_through(
     mut commands: Commands,
     ticks: Res<Ticks>,
     mut traffic: ResMut<Traffic>,
-    junctions: Query<(&JunctionLegs, &JunctionPolicy)>,
+    junctions: Query<(&JunctionLegs, &JunctionPolicy, Option<&Signal>)>,
     segments: Query<(&RoadSegment, Option<&EndsAtJunction>)>,
     mut rovers: Query<
         (Entity, &mut Rover, &WaitingAtJunction, Option<&mut Route>),
@@ -412,14 +415,18 @@ fn let_the_rovers_through(
         let queue = &held[from..from + queue];
         from += queue.len();
 
-        let Ok((legs, policy)) = junctions.get(junction) else {
+        let Ok((legs, policy, signal)) = junctions.get(junction) else {
             continue;
         };
         legs_waiting.clear();
         legs_waiting.extend(queue.iter().map(|&(_, leg, ..)| leg));
         legs_waiting.dedup();
 
-        let Some(leg) = policy.who_goes_next(legs, legs_waiting, ticks.0) else {
+        let goes_next = match signal {
+            Some(signal) => signal.who_goes_next(legs, legs_waiting, ticks.0),
+            None => policy.who_goes_next(legs, legs_waiting, ticks.0),
+        };
+        let Some(leg) = goes_next else {
             continue;
         };
         let Some(&(.., rover)) = queue.iter().find(|&&(_, waiting, ..)| waiting == leg) else {
@@ -933,6 +940,22 @@ mod tests {
 
     /// How far along a segment, as a share of it, a rover stands to reach the end in one tick.
     const ABOUT_TO_ARRIVE: f32 = 0.99;
+
+    /// How many ticks a leg is held at red for, to watch what the queue behind it does.
+    const TICKS_HELD: u64 = 12;
+
+    /// How many ticks a junction under a signal is measured over.
+    ///
+    /// Long enough for the traffic set off at the top of both lanes to reach the junction and for
+    /// a well timed signal to have cleared what it was given, so what the count separates is the
+    /// timing rather than how far down the road the measurement stopped.
+    const TICKS_UNDER_A_SIGNAL: u64 = 300;
+
+    /// A green long enough that the road not holding it waits on the signal rather than on itself.
+    const A_LONG_GREEN: u32 = 30;
+
+    /// How far ahead a run of ticks is looked for before the signal has plainly not got one.
+    const TICKS_SEARCHED: u64 = 512;
 
     /// A frame far too short to carry a tick of the fixed clock.
     const SHORT_FRAME: Duration = Duration::from_micros(100);
@@ -2206,7 +2229,7 @@ mod tests {
         let mut app = a_crossed_road();
         let arriving = arriving_from(&mut app, STRAIGHT[0]);
         let rover = waiting_on(&mut app, arriving);
-        let across = crossing_road(&mut app);
+        let across = road_through(&mut app, &CROSSING);
         tick(&mut app);
 
         app.world_mut().entity_mut(across).despawn();
@@ -2216,9 +2239,9 @@ mod tests {
         assert_ne!(place_of(&app, rover).0, arriving, "a rover held at nothing");
     }
 
-    /// The road laid across `STRAIGHT`, of which there is one.
-    fn crossing_road(app: &mut App) -> Entity {
-        let wanted = tiles(&CROSSING)[0].world_position();
+    /// The road laid through `offsets`, of which there is one.
+    fn road_through(app: &mut App, offsets: &[(i32, i32)]) -> Entity {
+        let wanted = tiles(offsets)[0].world_position();
         let roads: Vec<(Entity, Vec<Entity>)> = app
             .world_mut()
             .query_filtered::<(Entity, &Children), With<Road>>()
@@ -2238,6 +2261,272 @@ mod tests {
             .min_by(|(_, one), (_, other)| one.total_cmp(other))
             .map(|(road, _)| road)
             .expect("a road was laid")
+    }
+
+    /// The junction the segment `arriving` runs into.
+    fn junction_of(app: &App, arriving: Entity) -> Entity {
+        app.world()
+            .entity(arriving)
+            .get::<EndsAtJunction>()
+            .expect("the segment reaches a junction")
+            .junction
+    }
+
+    /// Put a signal favouring `road` on `junction`.
+    fn signal_favouring(app: &mut App, junction: Entity, road: Entity) {
+        app.world_mut()
+            .entity_mut(junction)
+            .insert(Signal::favouring(road));
+    }
+
+    /// The first tick from which `leg` runs `ticks` ticks all green, or all red.
+    fn a_run_of(app: &App, junction: Entity, leg: usize, ticks: u64, green: bool) -> u64 {
+        let standing = app.world().entity(junction);
+        let signal = standing.get::<Signal>().expect("the junction is signalled");
+        let legs = standing.get::<JunctionLegs>().expect("the junction has legs");
+
+        (1..TICKS_SEARCHED)
+            .find(|&from| {
+                (0..ticks)
+                    .all(|on| (signal.who_goes_next(legs, &[leg], from + on) == Some(leg)) == green)
+            })
+            .expect("the signal comes round to the leg")
+    }
+
+    /// Set the world's tick so the next `ticks` of them all find `leg` held at red.
+    fn hold_red_for(app: &mut App, junction: Entity, leg: usize, ticks: u64) {
+        let from = a_run_of(app, junction, leg, ticks, false);
+        app.world_mut().resource_mut::<Ticks>().0 = from - 1;
+    }
+
+    /// Set the world's tick so the next one finds `leg` holding the green.
+    fn hold_green(app: &mut App, junction: Entity, leg: usize) {
+        let from = a_run_of(app, junction, leg, 1, true);
+        app.world_mut().resource_mut::<Ticks>().0 = from - 1;
+    }
+
+    /// A one-way road and a one-way road laid across it a frame later, which gives way to it.
+    fn a_one_way_crossed_road() -> App {
+        let mut app = rover_app();
+        lay_one_way_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+        lay_one_way_road(&mut app, &CROSSING);
+        tick(&mut app);
+        app
+    }
+
+    /// A queue standing on the run of road up to a junction, and the stretches it covers.
+    struct Queued {
+        approach: Vec<Entity>,
+        standing_on_it: Vec<Entity>,
+    }
+
+    impl Queued {
+        /// How many of its rovers have left the approach, which is how many crossed.
+        fn crossed(&self, app: &App) -> usize {
+            self.standing_on_it
+                .iter()
+                .filter(|&&rover| !self.approach.contains(&place_of(app, rover).0))
+                .count()
+        }
+    }
+
+    /// The segments a rover setting off from `from` drives before it reaches a junction.
+    fn the_approach_from(app: &App, from: Entity) -> Vec<Entity> {
+        let mut approach = vec![from];
+        let mut walking = from;
+        for _ in 0..LAP_SEGMENTS {
+            if app.world().entity(walking).get::<EndsAtJunction>().is_some() {
+                return approach;
+            }
+            walking = next_of(app, walking).expect("the lane reaches a junction");
+            approach.push(walking);
+        }
+        panic!("the lane reaches a junction")
+    }
+
+    /// Fill every segment a rover setting off from `lane` drives before the junction, nose to tail.
+    fn fill_the_approach_from(app: &mut App, lane: Entity) -> Queued {
+        let approach = the_approach_from(app, lane);
+        let mut standing = Vec::new();
+        for &segment in &approach {
+            let end = place_along(app, segment, 1.);
+            for back in 0..capacity_of(app, segment) {
+                standing.push(spawn_rover(app, segment, end - back as f32 * ROVER_ROOM));
+            }
+        }
+        Queued {
+            approach,
+            standing_on_it: standing,
+        }
+    }
+
+    /// How far apart the closest two rovers standing on any one segment are.
+    fn closest_two_on_a_segment(app: &mut App) -> f32 {
+        let mut standing: Vec<(Entity, f32)> = app
+            .world_mut()
+            .query::<&Rover>()
+            .iter(app.world())
+            .map(|rover| (rover.segment, rover.along))
+            .collect();
+        standing.sort_by(|one, other| one.0.cmp(&other.0).then(one.1.total_cmp(&other.1)));
+
+        standing
+            .windows(2)
+            .filter(|pair| pair[0].0 == pair[1].0)
+            .map(|pair| pair[1].1 - pair[0].1)
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    /// How many rovers are standing on the road anywhere.
+    fn rovers_in(app: &mut App) -> usize {
+        app.world_mut().query::<&Rover>().iter(app.world()).count()
+    }
+
+    #[test]
+    fn a_rover_on_a_leg_the_signal_holds_red_does_not_leave_its_segment() {
+        let mut app = a_crossed_road();
+        let arriving = arriving_from(&mut app, STRAIGHT[0]);
+        let rover = waiting_on(&mut app, arriving);
+        tick(&mut app);
+
+        let junction = junction_of(&app, arriving);
+        let crossing = road_through(&mut app, &CROSSING);
+        let leg = leg_of(&app, arriving);
+        signal_favouring(&mut app, junction, crossing);
+        hold_red_for(&mut app, junction, leg, 1);
+        tick(&mut app);
+
+        assert_eq!(place_of(&app, rover).0, arriving, "a rover let out on red");
+    }
+
+    #[test]
+    fn a_signal_lets_the_green_leg_through_ahead_of_the_road_that_had_right_of_way() {
+        let mut app = a_crossed_road();
+        let down_the_straight = arriving_from(&mut app, STRAIGHT[0]);
+        let across = arriving_from(&mut app, CROSSING[0]);
+        let giving_way = waiting_on(&mut app, across);
+        let with_priority = waiting_on(&mut app, down_the_straight);
+        tick(&mut app);
+
+        let junction = junction_of(&app, across);
+        let crossing = road_through(&mut app, &CROSSING);
+        let leg = leg_of(&app, across);
+        signal_favouring(&mut app, junction, crossing);
+        hold_green(&mut app, junction, leg);
+        tick(&mut app);
+
+        assert_ne!(place_of(&app, giving_way).0, across, "the green leg held");
+        assert_eq!(
+            place_of(&app, with_priority).0,
+            down_the_straight,
+            "right of way beat the red"
+        );
+    }
+
+    /// A one-way crossroads whose straight leg is held red, with a queue standing up to it.
+    fn a_queue_stopped_at_a_red() -> (App, Queued) {
+        let mut app = a_one_way_crossed_road();
+        let arriving = arriving_from(&mut app, STRAIGHT[0]);
+        let lane = segment_from(&mut app, tiles(&STRAIGHT)[0]);
+        let junction = junction_of(&app, arriving);
+        let crossing = road_through(&mut app, &CROSSING);
+        let leg = leg_of(&app, arriving);
+
+        signal_favouring(&mut app, junction, crossing);
+        let held = fill_the_approach_from(&mut app, lane);
+        hold_red_for(&mut app, junction, leg, TICKS_HELD);
+        (app, held)
+    }
+
+    #[test]
+    fn rovers_held_behind_a_red_signal_never_stand_closer_than_a_rovers_room() {
+        let (mut app, _) = a_queue_stopped_at_a_red();
+
+        drive_for(&mut app, TICKS_HELD as u32);
+
+        let closest = closest_two_on_a_segment(&mut app);
+        assert!(closest >= ROVER_ROOM - TOLERANCE, "{closest} between two");
+    }
+
+    #[test]
+    fn no_rover_is_lost_while_a_signal_holds_its_leg_at_red() {
+        let (mut app, _) = a_queue_stopped_at_a_red();
+        let set_off = rovers_in(&mut app);
+
+        drive_for(&mut app, TICKS_HELD as u32);
+
+        assert_eq!(rovers_in(&mut app), set_off);
+    }
+
+    #[test]
+    fn a_queue_held_at_a_red_signal_gets_none_of_its_rovers_through() {
+        let (mut app, held) = a_queue_stopped_at_a_red();
+
+        drive_for(&mut app, TICKS_HELD as u32);
+
+        assert_eq!(held.crossed(&app), 0, "a rover let out on red");
+    }
+
+    #[test]
+    fn a_signal_favouring_the_busy_road_passes_more_than_one_favouring_the_quiet_one() {
+        let busy = crossed_under_a_signal(&STRAIGHT);
+        let quiet = crossed_under_a_signal(&CROSSING);
+
+        assert!(
+            busy > quiet,
+            "{busy} through favouring the busy road against {quiet} favouring the quiet one"
+        );
+    }
+
+    /// A one-way crossroads with a stream of rovers driving down each road towards it.
+    ///
+    /// Both roads are given the same traffic, so the only thing two runs of this differ by is
+    /// which of them the green was handed to.
+    fn a_streaming_crossroads() -> (App, Queued, Queued) {
+        let mut app = a_one_way_crossed_road();
+        let down_the_straight = segment_from(&mut app, tiles(&STRAIGHT)[0]);
+        let across = segment_from(&mut app, tiles(&CROSSING)[0]);
+        let straight = stream_down(&mut app, down_the_straight, A_QUEUE);
+        let crossing = stream_down(&mut app, across, A_QUEUE);
+        (app, straight, crossing)
+    }
+
+    /// Set `count` rovers off from the start of `lane`, and say what road they have to cross.
+    fn stream_down(app: &mut App, lane: Entity, count: u32) -> Queued {
+        let approach = the_approach_from(app, lane);
+        let standing_on_it = (0..count).map(|_| set_down_on(app, lane, 0.)).collect();
+        Queued {
+            approach,
+            standing_on_it,
+        }
+    }
+
+    /// How many of the traffic on `STRAIGHT` crosses while a long green is given to `favoured`.
+    ///
+    /// The green is tuned well past the run a junction is signalled with, because a green only
+    /// costs the road that is not holding it once it is longer than the wait that road would have
+    /// had anyway: at eight ticks each road is still limited by how fast its own queue closes up
+    /// on the junction, and the timing is not yet what decides anything.
+    fn crossed_under_a_signal(favoured: &[(i32, i32)]) -> usize {
+        let (mut app, down_the_straight, _) = a_streaming_crossroads();
+        let arriving = arriving_from(&mut app, STRAIGHT[0]);
+        let junction = junction_of(&app, arriving);
+        let road = road_through(&mut app, favoured);
+
+        signal_favouring(&mut app, junction, road);
+        lengthen_the_green(&mut app, junction, A_LONG_GREEN);
+        drive_for(&mut app, TICKS_UNDER_A_SIGNAL as u32);
+
+        down_the_straight.crossed(&app)
+    }
+
+    /// Tune the signal on `junction` until its favoured road holds the green for `green` ticks.
+    fn lengthen_the_green(app: &mut App, junction: Entity, green: u32) {
+        let mut signalled = app.world_mut().entity_mut(junction);
+        let mut signal = signalled.get_mut::<Signal>().expect("the junction is signalled");
+        let asked = green as i32 - signal.green() as i32;
+        signal.tune(asked);
     }
 
     #[test]
