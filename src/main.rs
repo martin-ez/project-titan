@@ -6,6 +6,7 @@ mod diagnostics;
 mod fleet;
 mod input;
 mod map;
+mod production;
 mod road;
 mod rover;
 mod simulation;
@@ -24,6 +25,7 @@ fn main() {
         .add_plugins(fleet::FleetPlugin)
         .add_plugins(input::PlayerInputPlugin)
         .add_plugins(map::MapPlugin)
+        .add_plugins(production::ProductionPlugin)
         .add_plugins(road::JunctionSignalPlugin)
         .add_plugins(road::RoadPlugin)
         .add_plugins(rover::RoverPlugin)

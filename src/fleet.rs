@@ -48,6 +48,10 @@ const ROVER_POOL: u32 = 12;
 /// The rovers each port has been given, and the shuttle they run.
 pub struct FleetPlugin;
 
+/// The set the shuttles run in, so a system reading a port after they collected can follow them.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FleetsServed;
+
 /// How many rovers the player has, all told.
 ///
 /// One pool behind every [`Fleet`] on the map, which is what makes giving a rover to one port the
@@ -168,6 +172,7 @@ impl Plugin for FleetPlugin {
                     set_the_idle_rovers_off_again,
                 )
                     .chain()
+                    .in_set(FleetsServed)
                     .after(RoversDriven)
                     .in_set(Simulation),
             )
