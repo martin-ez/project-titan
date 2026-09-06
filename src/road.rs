@@ -73,8 +73,7 @@ const SHORTEST_GREEN: u32 = 1;
 const SIGNAL_KEY: KeyCode = KeyCode::KeyG;
 
 /// The keys that shorten and lengthen the green of the junction the player picked out.
-const GREEN_KEYS: [(KeyCode, i32); 2] =
-    [(KeyCode::BracketLeft, -1), (KeyCode::BracketRight, 1)];
+const GREEN_KEYS: [(KeyCode, i32); 2] = [(KeyCode::BracketLeft, -1), (KeyCode::BracketRight, 1)];
 
 /// How closely a fitted turn has to meet the leg it reaches to be laid as one arc.
 ///
@@ -403,19 +402,25 @@ pub struct JunctionSignalPlugin;
 /// A signal the player has put on a junction, holding every leg but one of them red.
 ///
 /// It sits beside the [`JunctionPolicy`] rather than replacing it, because the policy is derived
-/// from which road was already there when the crossing was laid, and that order is kept nowhere.
-/// A signal that overwrote it could never be taken off again without the junction quietly losing
-/// the right of way its roads had earned.
+/// from which road was there first and that order is kept nowhere: a signal that overwrote it
+/// could never come off without the junction losing the right of way its roads had earned.
 ///
-/// The green is given per road rather than per leg. A leg is worked out afresh from the geometry
-/// whenever any junction changes, so a road crossed a second time renumbers them and a timing held
-/// against a leg number would land on whichever leg inherited it. A road is what the player
-/// pointed at, and it is what [`JunctionPolicy::GiveWayTo`] is keyed by already.
+/// The green is given per road rather than per leg, because a leg is worked out afresh from the
+/// geometry whenever any junction changes and a road crossed twice renumbers them. A road is what
+/// the player pointed at, and what [`JunctionPolicy::GiveWayTo`] is keyed by already.
 #[derive(Component, Clone, Debug, PartialEq)]
 pub struct Signal {
     favouring: Entity,
     green: u32,
 }
+
+/// What the debug view reads off a junction to draw it: where it reaches, and who is let through.
+type JunctionDrawing = (
+    &'static Junction,
+    Option<&'static JunctionLegs>,
+    Option<&'static JunctionPolicy>,
+    Option<&'static Signal>,
+);
 
 /// A road that has been measured against the roads already laid for the places it crosses them.
 #[derive(Component)]
@@ -1054,10 +1059,7 @@ impl Signal {
     /// A leg green for no ticks at all is a road closed rather than a road waiting, and closing a
     /// road is what taking it up is for.
     pub fn tune(&mut self, asked: i32) {
-        self.green = self
-            .green
-            .saturating_add_signed(asked)
-            .max(SHORTEST_GREEN);
+        self.green = self.green.saturating_add_signed(asked).max(SHORTEST_GREEN);
     }
 
     /// Which of the legs a rover is waiting on the signal lets through on `tick`.
@@ -2591,18 +2593,12 @@ fn ring_around(centre: Vec3, radius: f32) -> impl Iterator<Item = Vec3> {
 /// through it are fitted over. Nor does anything say which arms it gathered into one leg, or
 /// which of them a rover waits on, so the arrows say both.
 ///
-/// Which leg a signal is holding green moves with game time, so it is drawn only where there is a
-/// simulation to read a tick from: the road network stands on its own without one, and a plugin
-/// that cannot be built without another is one that does not own itself (invariant 4).
+/// Which leg a signal holds green moves with game time, so it is drawn only where there is a
+/// simulation to read a tick from — the road network stands on its own without one (invariant 4).
 fn draw_the_junctions(
     ticks: Option<Res<Ticks>>,
     mut gizmos: Gizmos<DebugGizmos>,
-    junctions: Query<(
-        &Junction,
-        Option<&JunctionLegs>,
-        Option<&JunctionPolicy>,
-        Option<&Signal>,
-    )>,
+    junctions: Query<JunctionDrawing>,
 ) {
     for (junction, legs, policy, signal) in &junctions {
         gizmos.circle(
@@ -2861,8 +2857,8 @@ mod tests {
     use crate::common::initialize::InitializationFailed;
     use crate::diagnostics::DebugGizmosPlugin;
     use crate::map::MAP_TILE_SIZE;
-    use crate::ui::selection::SelectionPlugin;
     use crate::testing::{headless_app, press_key, release_key, tick};
+    use crate::ui::selection::SelectionPlugin;
     use std::collections::HashSet;
 
     /// How closely two world positions have to agree to be the same place.
@@ -4704,7 +4700,11 @@ mod tests {
             let green = signal
                 .who_goes_next(&legs, &every_leg, tick)
                 .expect("a leg holds the green");
-            let others: Vec<usize> = every_leg.iter().copied().filter(|&it| it != green).collect();
+            let others: Vec<usize> = every_leg
+                .iter()
+                .copied()
+                .filter(|&it| it != green)
+                .collect();
 
             assert_eq!(signal.who_goes_next(&legs, &others, tick), None);
         }
@@ -4767,7 +4767,10 @@ mod tests {
 
         tap_key(&mut app, SIGNAL_KEY);
 
-        assert_eq!(the_signal(&mut app).map(|signal| signal.favours()), Some(first));
+        assert_eq!(
+            the_signal(&mut app).map(|signal| signal.favours()),
+            Some(first)
+        );
     }
 
     #[test]
@@ -4838,7 +4841,11 @@ mod tests {
         let roads = component_of::<Junction>(&app, junction)
             .map(Junction::roads)
             .expect("the junction knows its roads");
-        let presses = roads.iter().position(|&road| road == crossing).expect("the road crosses") + 1;
+        let presses = roads
+            .iter()
+            .position(|&road| road == crossing)
+            .expect("the road crosses")
+            + 1;
         for _ in 0..presses {
             tap_key(&mut app, SIGNAL_KEY);
         }

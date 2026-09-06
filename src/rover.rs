@@ -374,14 +374,11 @@ fn find_the_route_a_rover_was_sent_on(
 /// One a tick, so a junction is a place where traffic has to take its turn rather than a point
 /// rovers pass through together. Which leg goes is the policy's answer and the tick's rotation,
 /// never the order the world stores its rovers in (invariant 2). The ones not let through keep
-/// their place and their arrival, so the longest wait on a leg is served first when its turn
-/// comes — and so does one whose way out has no room for it, which is how a road jammed beyond a
-/// junction reaches back through it onto the roads behind.
+/// their place and their arrival, so the longest wait on a leg is served first — and so does one
+/// whose way out has no room, which is how a jam beyond a junction reaches back through it.
 ///
-/// A rover already stranded is not offered a turn: it is going nowhere either way.
-///
-/// A junction the player has signalled is asked the signal instead of the policy underneath it,
-/// which is the whole of what a signal does to the handover.
+/// A junction the player has signalled is asked its signal instead. A rover already stranded is
+/// not offered a turn either way.
 fn let_the_rovers_through(
     mut commands: Commands,
     ticks: Res<Ticks>,
@@ -2286,7 +2283,9 @@ mod tests {
     fn a_run_of(app: &App, junction: Entity, leg: usize, ticks: u64, green: bool) -> u64 {
         let standing = app.world().entity(junction);
         let signal = standing.get::<Signal>().expect("the junction is signalled");
-        let legs = standing.get::<JunctionLegs>().expect("the junction has legs");
+        let legs = standing
+            .get::<JunctionLegs>()
+            .expect("the junction has legs");
 
         (1..TICKS_SEARCHED)
             .find(|&from| {
@@ -2339,7 +2338,12 @@ mod tests {
         let mut approach = vec![from];
         let mut walking = from;
         for _ in 0..LAP_SEGMENTS {
-            if app.world().entity(walking).get::<EndsAtJunction>().is_some() {
+            if app
+                .world()
+                .entity(walking)
+                .get::<EndsAtJunction>()
+                .is_some()
+            {
                 return approach;
             }
             walking = next_of(app, walking).expect("the lane reaches a junction");

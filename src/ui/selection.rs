@@ -101,9 +101,7 @@ impl PointedAt<'_, '_> {
         self.junctions
             .iter()
             .filter(|(_, junction)| junction.reaches(at))
-            .min_by(|(_, one), (_, other)| {
-                one.at.distance(at).total_cmp(&other.at.distance(at))
-            })
+            .min_by(|(_, one), (_, other)| one.at.distance(at).total_cmp(&other.at.distance(at)))
             .map(|(entity, _)| entity)
     }
 
