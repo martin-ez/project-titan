@@ -1,10 +1,22 @@
+//! What the player puts on a tile, and the rule about which tile will have it.
+//!
+//! A tile takes one building, and only where the ground suits it. A deposit tile is reserved
+//! ground: it takes an extractor drawing the material under it and refuses everything else,
+//! rather than letting a factory bury a deposit and leave the player to remember it is down
+//! there. A map laid out to be read before it is built on rewards reading only if what it says
+//! is binding, and covering a deposit over is otherwise a mistake the game gives no sign of.
+//!
+//! A road may still run over a deposit, being no building. The corner an extractor stands its
+//! outlet on is shared by three tiles, so a road reaches it without crossing the deposit at all.
+
 use crate::common::cleanup::Destroy;
 use crate::common::cursor::CursorSurface;
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use crate::diagnostics::DebugGizmos;
 use crate::input::{PlayerAction, PlayerInput, TURN_KEY};
 use crate::map::{
-    HexCoordinates, LatticeNode, MapTile, RawMaterial, TileCorner, MAP_TILE_INRADIUS, MAP_TILE_SIZE,
+    Deposit, HexCoordinates, LatticeNode, MapTile, RawMaterial, TileCorner, MAP_TILE_INRADIUS,
+    MAP_TILE_SIZE,
 };
 use crate::road::{RoadEndpoint, RoadTiles};
 use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
@@ -589,12 +601,34 @@ impl Plugin for BuildingPlugin {
     }
 }
 
-/// Whether `tile` will take a building, which is the whole of the rule and is asked in one place.
+/// Whether `tile` will take a building of `kind`, which is the whole of the rule and is asked in
+/// one place.
 ///
 /// A road is read off the tile it runs over rather than measured out of its arcs, so the answer
 /// costs a lookup however many roads are on the map.
-fn takes_a_building(tile: HexCoordinates, buildings: &BuildingTiles, roads: &RoadTiles) -> bool {
-    buildings.building_on(tile).is_none() && roads.roads_over(tile).is_empty()
+fn takes_a_building(
+    kind: BuildingType,
+    tile: HexCoordinates,
+    deposit: Option<&Deposit>,
+    buildings: &BuildingTiles,
+    roads: &RoadTiles,
+) -> bool {
+    buildings.building_on(tile).is_none()
+        && roads.roads_over(tile).is_empty()
+        && stands_on_the_ground_it_needs(kind, deposit)
+}
+
+/// Whether the ground a tile holds is the ground a building of `kind` is built to stand on.
+///
+/// An extractor draws one material and must stand over that one; an assembler brings its
+/// materials in on rovers and stands anywhere the ground is bare, a deposit being reserved for
+/// the machine that can reach it.
+fn stands_on_the_ground_it_needs(kind: BuildingType, deposit: Option<&Deposit>) -> bool {
+    match (kind, deposit) {
+        (BuildingType::Extractor(drawn), Some(deposit)) => deposit.material == drawn,
+        (BuildingType::Extractor(_), None) => false,
+        (BuildingType::Assembler(_), deposit) => deposit.is_none(),
+    }
 }
 
 /// Give up the tile a building held, whichever way it left the world.
@@ -631,7 +665,9 @@ fn turn_the_building_to_place(
 /// A tile takes one building and then refuses, so a tap on a tile that is already built on does
 /// nothing rather than stacking a second on top of the first. A road running over the tile refuses
 /// it the same way, whether the road stops there or only crosses it on the way somewhere else:
-/// there is no room for a building on ground a rover drives over (invariant 1).
+/// there is no room for a building on ground a rover drives over (invariant 1). What the ground
+/// itself holds refuses the rest, which is what makes where a deposit lies a thing the player
+/// plans around.
 fn place_building_system(
     mut commands: Commands,
     player_input: Res<PlayerInput>,
@@ -639,7 +675,7 @@ fn place_building_system(
     roads: Res<RoadTiles>,
     to_place: BuildingToPlace,
     mut buildings: ResMut<BuildingTiles>,
-    tiles: Query<&MapTile>,
+    tiles: Query<(&MapTile, Option<&Deposit>)>,
 ) {
     if !player_input.tap || *action.get() != PlayerAction::EditBuildings {
         return;
@@ -647,14 +683,14 @@ fn place_building_system(
     let Some(entity) = player_input.cursor_tile else {
         return;
     };
-    let Ok(tile) = tiles.get(entity) else {
+    let Ok((tile, deposit)) = tiles.get(entity) else {
         return;
     };
-    if !takes_a_building(tile.coordinates, &buildings, &roads) {
+    let kind = to_place.kind();
+    if !takes_a_building(kind, tile.coordinates, deposit, &buildings, &roads) {
         return;
     }
 
-    let kind = to_place.kind();
     let building = commands
         .spawn((
             Building {
@@ -724,25 +760,33 @@ fn remove_building_system(
 ///
 /// A refused tap is otherwise a click that does nothing, which reads as a game that missed it
 /// rather than a tile that is taken. Marking it while the tool is held says so before the player
-/// clicks, and says it the same way whether a building or a road is what is in the way.
+/// clicks, and says it the same way whatever is in the way — a building, a road, or ground the
+/// type in hand was not built to stand on.
 fn draw_the_refused_tile(
     mut gizmos: Gizmos<DebugGizmos>,
     player_input: Res<PlayerInput>,
     action: Res<State<PlayerAction>>,
     roads: Res<RoadTiles>,
+    to_place: BuildingToPlace,
     buildings: Res<BuildingTiles>,
-    tiles: Query<&MapTile>,
+    tiles: Query<(&MapTile, Option<&Deposit>)>,
 ) {
     if *action.get() != PlayerAction::EditBuildings {
         return;
     }
-    let Some(tile) = player_input
+    let Some((tile, deposit)) = player_input
         .cursor_tile
         .and_then(|entity| tiles.get(entity).ok())
     else {
         return;
     };
-    if takes_a_building(tile.coordinates, &buildings, &roads) {
+    if takes_a_building(
+        to_place.kind(),
+        tile.coordinates,
+        deposit,
+        &buildings,
+        &roads,
+    ) {
         return;
     }
 
@@ -802,18 +846,24 @@ fn draw_the_ports_to_place(
     to_place: BuildingToPlace,
     roads: Res<RoadTiles>,
     buildings: Res<BuildingTiles>,
-    tiles: Query<&MapTile>,
+    tiles: Query<(&MapTile, Option<&Deposit>)>,
 ) {
     if *action.get() != PlayerAction::EditBuildings {
         return;
     }
-    let Some(tile) = player_input
+    let Some((tile, deposit)) = player_input
         .cursor_tile
         .and_then(|entity| tiles.get(entity).ok())
     else {
         return;
     };
-    if !takes_a_building(tile.coordinates, &buildings, &roads) {
+    if !takes_a_building(
+        to_place.kind(),
+        tile.coordinates,
+        deposit,
+        &buildings,
+        &roads,
+    ) {
         return;
     }
 
@@ -880,11 +930,15 @@ mod tests {
     /// so a rule tested only against one of those is a rule tested only at the nodes.
     const SPANNING: [(i32, i32); 2] = [(0, 0), (5, 0)];
 
+    /// A world with the building tool holding an assembler, which stands on the bare tiles these
+    /// tests spawn. The catalogue opens on an extractor, and one of those is refused everywhere
+    /// but a deposit — ground the tests about the ground lay themselves.
     fn building_app(action: PlayerAction) -> App {
         let mut app = headless_app();
         app.insert_state(action)
             .insert_resource(PlayerInput::default())
             .add_plugins((BuildingPlugin, CleanupPlugin, DebugGizmosPlugin, RoadPlugin));
+        choose(&mut app, MELTER);
         app
     }
 
@@ -912,6 +966,16 @@ mod tests {
                 coordinates: HexCoordinates::from_offset_row(col, row),
             })
             .id()
+    }
+
+    /// Spawn a tile with `material` in the ground under it, which is what makes it a deposit.
+    fn spawn_deposit_tile(app: &mut App, col: i32, row: i32, material: RawMaterial) -> Entity {
+        let tile = spawn_tile(app, col, row);
+        app.world_mut().entity_mut(tile).insert(Deposit {
+            material,
+            richness: 1,
+        });
+        tile
     }
 
     /// Click on `tile`, then let the tap go, so a second frame is not a second click.
@@ -987,6 +1051,9 @@ mod tests {
 
     /// A type drawing out of the ground, which takes nothing in at all.
     const ICE_EXTRACTOR: BuildingType = BuildingType::Extractor(RawMaterial::Ice);
+
+    /// What `BuildingType::ALL[1]` draws, which is the ground one step through the catalogue needs.
+    const SECOND_MATERIAL: RawMaterial = RawMaterial::CarbonMonoxide;
 
     fn tile_at(offset: (i32, i32)) -> HexCoordinates {
         HexCoordinates::from_offset_row(offset.0, offset.1)
@@ -1714,6 +1781,75 @@ mod tests {
         assert_eq!(buildings(&mut app), [HexCoordinates::from_offset_row(1, 1)]);
     }
 
+    #[test]
+    fn an_extractor_stands_on_a_deposit_of_the_material_it_draws() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        choose(&mut app, ICE_EXTRACTOR);
+        let tile = spawn_deposit_tile(&mut app, 0, 0, RawMaterial::Ice);
+
+        tap_on(&mut app, Some(tile));
+
+        assert_eq!(buildings(&mut app), [HexCoordinates::from_offset_row(0, 0)]);
+    }
+
+    #[test]
+    fn an_extractor_is_refused_on_a_deposit_of_another_material() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        choose(&mut app, ICE_EXTRACTOR);
+        let tile = spawn_deposit_tile(&mut app, 0, 0, RawMaterial::Silicon);
+
+        tap_on(&mut app, Some(tile));
+
+        assert!(buildings(&mut app).is_empty());
+    }
+
+    #[test]
+    fn an_extractor_is_refused_on_bare_ground() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        choose(&mut app, ICE_EXTRACTOR);
+        let tile = spawn_tile(&mut app, 0, 0);
+
+        tap_on(&mut app, Some(tile));
+
+        assert!(buildings(&mut app).is_empty());
+    }
+
+    #[test]
+    fn an_assembler_is_refused_on_a_deposit_tile() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        choose(&mut app, MELTER);
+        let tile = spawn_deposit_tile(&mut app, 0, 0, RawMaterial::Ice);
+
+        tap_on(&mut app, Some(tile));
+
+        assert!(buildings(&mut app).is_empty());
+    }
+
+    #[test]
+    fn an_assembler_stands_on_bare_ground() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        choose(&mut app, MELTER);
+        let tile = spawn_tile(&mut app, 0, 0);
+
+        tap_on(&mut app, Some(tile));
+
+        assert_eq!(buildings(&mut app), [HexCoordinates::from_offset_row(0, 0)]);
+    }
+
+    #[test]
+    fn a_deposit_tile_an_extractor_left_takes_another_one() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        choose(&mut app, ICE_EXTRACTOR);
+        let tile = spawn_deposit_tile(&mut app, 0, 0, RawMaterial::Ice);
+
+        tap_on(&mut app, Some(tile));
+        secondary_tap_on(&mut app, Some(tile));
+        tick(&mut app);
+        tap_on(&mut app, Some(tile));
+
+        assert_eq!(buildings(&mut app), [HexCoordinates::from_offset_row(0, 0)]);
+    }
+
     /// What `kind` moves through its ports one way, taken off the ports it stands.
     fn items_through(kind: BuildingType, flow: Flow) -> Vec<Item> {
         kind.ports()
@@ -1829,7 +1965,8 @@ mod tests {
     #[test]
     fn the_tool_places_the_type_the_player_stepped_to() {
         let mut app = building_app(PlayerAction::EditBuildings);
-        let tile = spawn_tile(&mut app, 0, 0);
+        choose(&mut app, BuildingType::ALL[0]);
+        let tile = spawn_deposit_tile(&mut app, 0, 0, SECOND_MATERIAL);
 
         press_key(&mut app, CHOOSE_KEYS[1].0);
         tick(&mut app);
@@ -1846,6 +1983,7 @@ mod tests {
     #[test]
     fn stepping_back_from_the_first_type_goes_round_to_the_last() {
         let mut app = building_app(PlayerAction::EditBuildings);
+        choose(&mut app, BuildingType::ALL[0]);
 
         press_key(&mut app, CHOOSE_KEYS[0].0);
         tick(&mut app);
@@ -1859,6 +1997,7 @@ mod tests {
     #[test]
     fn stepping_while_another_tool_is_held_changes_nothing() {
         let mut app = building_app(PlayerAction::EditRoads);
+        choose(&mut app, BuildingType::ALL[0]);
 
         press_key(&mut app, CHOOSE_KEYS[1].0);
         tick(&mut app);

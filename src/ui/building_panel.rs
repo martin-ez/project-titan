@@ -190,7 +190,7 @@ mod tests {
     use crate::common::cleanup::CleanupPlugin;
     use crate::diagnostics::DebugGizmosPlugin;
     use crate::input::{PlayerAction, PlayerInput};
-    use crate::map::{HexCoordinates, MapTile, TileCorner};
+    use crate::map::{Deposit, HexCoordinates, MapTile, TileCorner};
     use crate::road::{RoadEndpoint, RoadPlugin};
     use crate::testing::{headless_app, tick};
     use crate::ui::selection::SelectionPlugin;
@@ -240,12 +240,27 @@ mod tests {
             .id()
     }
 
+    /// Lay under `tile` the ground the type the tool is holding needs, an extractor standing
+    /// nowhere but a deposit of what it draws.
+    fn ground_for_the_chosen_type(app: &mut App, tile: Entity) {
+        let BuildingType::Extractor(material) =
+            app.world().resource::<ChosenBuildingType>().chosen()
+        else {
+            return;
+        };
+        app.world_mut().entity_mut(tile).insert(Deposit {
+            material,
+            richness: 1,
+        });
+    }
+
     /// Put the `steps`th type of the catalogue on `offsets`, answering with it and its tile.
     fn place(app: &mut App, offsets: (i32, i32), steps: isize) -> (Entity, Entity) {
         app.world_mut()
             .resource_mut::<ChosenBuildingType>()
             .step(steps);
         let tile = spawn_tile(app, offsets);
+        ground_for_the_chosen_type(app, tile);
         click_at(app, tile, tile_of(offsets).world_position());
         app.world_mut()
             .resource_mut::<ChosenBuildingType>()
