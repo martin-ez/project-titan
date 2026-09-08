@@ -32,9 +32,9 @@ const HANDOVERS_PER_TICK: usize = 8;
 /// How much a rover's speed may change from one tick to the next, in world units a tick a tick.
 ///
 /// A forty-eighth of the open road's limit, settled by play testing: a rover pulls away from a
-/// port over forty-eight ticks and three quarters of a tile, which reads as a machine getting
-/// under way rather than as one starting late. Per tick and not per second, because running the
-/// world faster runs more ticks rather than longer ones (invariant 2).
+/// port over forty-eight ticks and three eighths of a tile, which reads as a machine getting under
+/// way rather than as one starting late. Per tick and not per second, because running the world
+/// faster runs more ticks rather than longer ones (invariant 2).
 const ROVER_ACCELERATION: f32 = STRAIGHT_SPEED_LIMIT / 48.;
 
 /// How much road a rover travelling at the open road's limit needs to brake to a stop.
@@ -322,6 +322,9 @@ impl Traffic {
     }
 
     /// Record a rover standing `at` a distance along `segment`, going at `speed`.
+    ///
+    /// Two rovers standing at the same distance leave the slower of the two, so what comes out
+    /// does not depend on the order the world happened to store them in (invariant 2).
     fn joined(&mut self, segment: Entity, at: f32, speed: f32) {
         let on_it = self.0.entry(segment).or_insert(OnASegment {
             carrying: 0,
@@ -329,9 +332,11 @@ impl Traffic {
             rear_speed: speed,
         });
         on_it.carrying += 1;
-        if at <= on_it.rear {
+        if at < on_it.rear {
             on_it.rear = at;
             on_it.rear_speed = speed;
+        } else if at == on_it.rear {
+            on_it.rear_speed = on_it.rear_speed.min(speed);
         }
     }
 
@@ -774,7 +779,7 @@ fn drive_the_rovers(
             traffic.left(rover.segment);
             rover.segment = onward;
             rover.along = road.starts_at();
-            traffic.joined(onward, rover.along, target);
+            traffic.joined(onward, rover.along, target.min(road.speed_limit()));
         }
 
         rover.speed = covered;
@@ -1104,6 +1109,19 @@ mod tests {
 
     /// How little ground a rover has to cover in a tick to be standing still.
     const AT_REST: f32 = 1e-4;
+
+    /// How far apart two rovers are set down to watch what a queue does while it is moving.
+    ///
+    /// A little over the room a rover takes, so the queue starts as tight as the road allows and
+    /// what the run shows is whether it stays that way or opens out.
+    const A_TIGHT_QUEUE: f32 = ROVER_ROOM * 1.125;
+
+    /// How far apart a queue that is still moving may stand and still be a queue.
+    ///
+    /// Twice a rover's room. A rover braking for the one ahead as though it were a wall would need
+    /// a whole braking distance instead, which is three times that again, so this separates the
+    /// two without resting on either figure exactly.
+    const A_CRUISING_QUEUE: f32 = 2. * ROVER_ROOM;
 
     /// How many ticks a rover is watched over to see it pull away from a standing start.
     const TICKS_OFF_THE_MARK: u32 = 4;
@@ -2226,6 +2244,34 @@ mod tests {
             "{} of road on a bend allowing {limit}",
             covered.iter().fold(0f32, |most, &step| most.max(step))
         );
+    }
+
+    /// How fast `rover` is going along the stretch it is on.
+    fn speed_of(app: &App, rover: Entity) -> f32 {
+        app.world()
+            .entity(rover)
+            .get::<Rover>()
+            .expect("the rover is still there")
+            .speed
+    }
+
+    #[test]
+    fn a_queue_still_moving_stands_a_rovers_room_apart_rather_than_a_braking_distance() {
+        let mut app = road_app();
+        let lane = segment_from(&mut app, tiles(&STRAIGHT)[0]);
+        let start = place_along(&app, lane, 0.);
+        let leading = spawn_rover(&mut app, lane, start + A_TIGHT_QUEUE);
+        let following = spawn_rover(&mut app, lane, start);
+
+        drive_for(&mut app, TICKS_TRACED as u32);
+
+        let running = speed_of(&app, following);
+        assert!(
+            (running - the_open_road()).abs() < TOLERANCE,
+            "the rover behind is going {running} rather than cruising"
+        );
+        let gap = driven_from(&app, leading, lane) - driven_from(&app, following, lane);
+        assert!(gap < A_CRUISING_QUEUE, "{gap} of road between them");
     }
 
     #[test]
