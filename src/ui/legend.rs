@@ -37,13 +37,25 @@ pub enum BindingInput {
     Scroll,
 }
 
-/// When a binding applies.
+/// Where a binding sits on the legend, which is the heading its row is drawn under.
+///
+/// Where a command sits and when it answers are two questions: the settings panel's adjust keys
+/// belong under `Panels` whatever the player is doing, and answer only while that panel is up.
+/// This is the first of the two, and [`BindingCondition`] the second.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum BindingContext {
-    /// Whatever the player is holding.
-    Always,
-    /// Only while this tool is held.
+pub enum BindingCategory {
+    /// Picking up one tool or another.
+    Tools,
+    /// Carried by one tool, and doing nothing under the others.
     Tool(PlayerAction),
+    /// Putting the panels on screen and driving them.
+    Panels,
+    /// Moving the camera over the surface.
+    Camera,
+    /// Changing how fast the world runs.
+    Simulation,
+    /// The debug views drawn over the game.
+    Debug,
 }
 
 /// One command the player can reach, and what reaches it.
@@ -52,14 +64,40 @@ pub struct Binding {
     pub input: BindingInput,
     /// What pressing it does, as the legend says it.
     pub action: &'static str,
-    /// When pressing it does that.
-    pub context: BindingContext,
+    /// Where the legend lists it.
+    pub category: BindingCategory,
+}
+
+/// The categories the panel lays out, in the order it lays them out
+const CATEGORIES: [BindingCategory; 8] = [
+    BindingCategory::Tools,
+    BindingCategory::Tool(PlayerAction::Select),
+    BindingCategory::Tool(PlayerAction::EditRoads),
+    BindingCategory::Tool(PlayerAction::EditBuildings),
+    BindingCategory::Panels,
+    BindingCategory::Camera,
+    BindingCategory::Simulation,
+    BindingCategory::Debug,
+];
+
+impl BindingCategory {
+    fn label(self) -> String {
+        match self {
+            BindingCategory::Tools => "Tools".to_string(),
+            BindingCategory::Tool(tool) => tool.label().to_string(),
+            BindingCategory::Panels => "Panels".to_string(),
+            BindingCategory::Camera => "Camera & movement".to_string(),
+            BindingCategory::Simulation => "Simulation".to_string(),
+            BindingCategory::Debug => "Debug".to_string(),
+        }
+    }
 }
 
 /// Every binding the plugins have declared, in the order they declared them.
 ///
-/// Declaration order is display order, so a plugin's rows stay together and the legend does not
-/// reshuffle when an unrelated one is added.
+/// [`CATEGORIES`] is the order the panel reads in, and declaration order the order within one of
+/// them, so a plugin's rows stay together and the legend does not reshuffle when an unrelated
+/// plugin is added ahead of it.
 #[derive(Resource, Default)]
 pub struct PlayerBindings(Vec<Binding>);
 
@@ -96,7 +134,7 @@ impl Plugin for LegendPlugin {
                 input: BindingInput::Key(LEGEND_KEY),
                 asks: ShowTheLegend,
                 action: "Show or hide this legend",
-                context: BindingContext::Always,
+                category: BindingCategory::Panels,
             }])
             .add_systems(Startup, open_the_legend)
             .add_systems(
@@ -210,12 +248,9 @@ fn fill_the_panel(
     held: Option<PlayerAction>,
     placing: Option<&str>,
 ) {
-    for (place, context) in contexts_in_declaration_order(bindings)
-        .into_iter()
-        .enumerate()
-    {
-        panel.spawn(heading_row(heading(context, held, placing), place));
-        for binding in bindings.0.iter().filter(|it| it.context == context) {
+    for (place, category) in categories_declared(bindings).into_iter().enumerate() {
+        panel.spawn(heading_row(heading(category, held, placing), place));
+        for binding in bindings.0.iter().filter(|it| it.category == category) {
             panel.spawn(panel_row()).with_children(|row| {
                 row.spawn(panel_text(
                     input_label(binding.input),
@@ -240,29 +275,26 @@ fn heading_row(heading: String, place: usize) -> impl Bundle {
     )
 }
 
-fn contexts_in_declaration_order(bindings: &PlayerBindings) -> Vec<BindingContext> {
-    let mut seen: Vec<BindingContext> = Vec::new();
-    for binding in &bindings.0 {
-        if !seen.contains(&binding.context) {
-            seen.push(binding.context);
-        }
-    }
-    seen.sort_by_key(|context| matches!(context, BindingContext::Tool(_)));
-    seen
+fn categories_declared(bindings: &PlayerBindings) -> Vec<BindingCategory> {
+    CATEGORIES
+        .into_iter()
+        .filter(|category| bindings.0.iter().any(|it| it.category == *category))
+        .collect()
 }
 
 /// What the rows beneath it are for, and what the held tool is set to place.
 ///
 /// A tool that places whatever it last placed, with no way to see which that is, is one the
 /// player builds by trial and error, so the heading of the held tool names the choice it carries.
-fn heading(context: BindingContext, held: Option<PlayerAction>, placing: Option<&str>) -> String {
-    match (context, placing) {
-        (BindingContext::Always, _) => "Anytime".to_string(),
-        (BindingContext::Tool(tool), Some(placing)) if held == Some(tool) => {
+fn heading(category: BindingCategory, held: Option<PlayerAction>, placing: Option<&str>) -> String {
+    match (category, placing) {
+        (BindingCategory::Tool(tool), Some(placing)) if held == Some(tool) => {
             format!("{} (held) — {placing}", tool.label())
         }
-        (BindingContext::Tool(tool), _) if held == Some(tool) => format!("{} (held)", tool.label()),
-        (BindingContext::Tool(tool), _) => tool.label().to_string(),
+        (BindingCategory::Tool(tool), _) if held == Some(tool) => {
+            format!("{} (held)", tool.label())
+        }
+        _ => category.label(),
     }
 }
 
@@ -477,12 +509,12 @@ mod tests {
                 Binding {
                     input: BindingInput::Key(KeyCode::KeyQ),
                     action: "Refuel the rover",
-                    context: BindingContext::Always,
+                    category: BindingCategory::Tools,
                 },
                 Binding {
                     input: BindingInput::Scroll,
                     action: "Zoom the camera",
-                    context: BindingContext::Always,
+                    category: BindingCategory::Tools,
                 },
             ],
         );
@@ -503,7 +535,7 @@ mod tests {
             [Binding {
                 input: BindingInput::Mouse(MouseButton::Left),
                 action: "Place a road node",
-                context: BindingContext::Tool(PlayerAction::EditRoads),
+                category: BindingCategory::Tool(PlayerAction::EditRoads),
             }],
         );
         tick(&mut app);
@@ -548,7 +580,7 @@ mod tests {
             [Binding {
                 input: BindingInput::Mouse(MouseButton::Left),
                 action: "Put a building on the tile",
-                context: BindingContext::Tool(PlayerAction::EditBuildings),
+                category: BindingCategory::Tool(PlayerAction::EditBuildings),
             }],
         );
         app
@@ -612,9 +644,9 @@ mod tests {
             .add_plugins(crate::ui::settings_panel::SettingsPanelPlugin);
 
         let bindings = app.world().resource::<PlayerBindings>();
-        let mut claimed: Vec<(BindingInput, BindingContext)> = Vec::new();
+        let mut claimed: Vec<(BindingInput, BindingCategory)> = Vec::new();
         for binding in &bindings.0 {
-            let claim = (binding.input, binding.context);
+            let claim = (binding.input, binding.category);
             assert!(
                 !claimed.contains(&claim),
                 "{} is on an input another command already answers to",
@@ -633,27 +665,27 @@ mod tests {
                 Binding {
                     input: BindingInput::Key(KeyCode::ShiftLeft),
                     action: "Orbit the camera",
-                    context: BindingContext::Always,
+                    category: BindingCategory::Tools,
                 },
                 Binding {
                     input: BindingInput::Key(KeyCode::KeyQ),
                     action: "Choose the type before this one",
-                    context: BindingContext::Always,
+                    category: BindingCategory::Tools,
                 },
                 Binding {
                     input: BindingInput::Key(KeyCode::KeyE),
                     action: "Choose the type after this one",
-                    context: BindingContext::Always,
+                    category: BindingCategory::Tools,
                 },
                 Binding {
                     input: BindingInput::Key(TURN_KEY),
                     action: "Turn the building you are about to place",
-                    context: BindingContext::Always,
+                    category: BindingCategory::Tools,
                 },
                 Binding {
                     input: BindingInput::Key(KeyCode::ArrowDown),
                     action: "Pick the setting below",
-                    context: BindingContext::Always,
+                    category: BindingCategory::Tools,
                 },
             ],
         );
@@ -679,7 +711,7 @@ mod tests {
             [Binding {
                 input: BindingInput::Mouse(MouseButton::Left),
                 action: "Place a road node",
-                context: BindingContext::Always,
+                category: BindingCategory::Tools,
             }],
         );
         tick(&mut app);
@@ -703,7 +735,7 @@ mod tests {
             [Binding {
                 input: BindingInput::Mouse(MouseButton::Left),
                 action: "Place a road node",
-                context: BindingContext::Tool(PlayerAction::EditRoads),
+                category: BindingCategory::Tool(PlayerAction::EditRoads),
             }],
         );
         tick(&mut app);

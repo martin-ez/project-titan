@@ -13,7 +13,7 @@
 
 use crate::camera::CameraSensitivity;
 use crate::input::{DeclareCommands, PlayerCommand, Requested};
-use crate::ui::legend::{BindingContext, BindingInput};
+use crate::ui::legend::{BindingCategory, BindingInput};
 use crate::ui::{panel, panel_row, panel_text, PanelCorner, BODY_TEXT, HEADING_TEXT, KEYED_TEXT};
 use bevy::prelude::*;
 use std::ops::Range;
@@ -147,19 +147,19 @@ impl Plugin for SettingsPanelPlugin {
                 input: BindingInput::Key(SETTINGS_KEY),
                 asks: ShowTheSettings,
                 action: "Show or hide the camera settings",
-                context: BindingContext::Always,
+                category: BindingCategory::Panels,
             }])
             .declare_commands(PICK_KEYS.map(|(key, asks, action)| PlayerCommand {
                 input: BindingInput::Key(key),
                 asks,
                 action,
-                context: BindingContext::Always,
+                category: BindingCategory::Panels,
             }))
             .declare_commands(ADJUST_KEYS.map(|(key, asks, action)| PlayerCommand {
                 input: BindingInput::Key(key),
                 asks,
                 action,
-                context: BindingContext::Always,
+                category: BindingCategory::Panels,
             }))
             .add_systems(
                 Update,

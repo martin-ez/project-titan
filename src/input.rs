@@ -1,6 +1,6 @@
 use crate::common::cursor::{CursorHit, CursorRayCast};
 use crate::map::{LatticeNode, MapTile};
-use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
+use crate::ui::legend::{Binding, BindingCategory, BindingInput, DeclareBindings};
 use bevy::ecs::system::SystemParam;
 use bevy::input::InputSystems;
 use bevy::prelude::*;
@@ -255,22 +255,22 @@ impl Plugin for PlayerInputPlugin {
             .declare_bindings(TOOL_KEYS.map(|(key, tool)| Binding {
                 input: BindingInput::Key(key),
                 action: tool.label(),
-                context: BindingContext::Always,
+                category: BindingCategory::Tools,
             }))
             .declare_bindings(CAMERA_MODIFIERS.map(|(input, movement)| Binding {
                 input,
                 action: movement.label(),
-                context: BindingContext::Always,
+                category: BindingCategory::Camera,
             }))
             .declare_bindings(MOVEMENT_KEYS.map(|(key, _, action)| Binding {
                 input: BindingInput::Key(key),
                 action,
-                context: BindingContext::Always,
+                category: BindingCategory::Camera,
             }))
             .declare_bindings([Binding {
                 input: BindingInput::Key(FINISH_KEY),
                 action: "Finish what you are placing",
-                context: BindingContext::Always,
+                category: BindingCategory::Tools,
             }])
             .add_systems(Startup, (spawn_indicator, hide_the_cursor))
             .add_systems(

@@ -5,7 +5,7 @@ use crate::diagnostics::DebugGizmos;
 use crate::input::{DeclareCommands, PlayerAction, PlayerCommand, PlayerInput, Requested};
 use crate::map::{HexCoordinates, LatticeNode, MapTile, MAP_TILE_INRADIUS, MAP_TILE_SIZE};
 use crate::simulation::Ticks;
-use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
+use crate::ui::legend::{Binding, BindingCategory, BindingInput, DeclareBindings};
 use crate::ui::selection::{Picked, Selection};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -817,12 +817,12 @@ impl Plugin for RoadPlugin {
                 Binding {
                     input: BindingInput::Mouse(MouseButton::Left),
                     action: "Place a road node, or finish on a road already there",
-                    context: BindingContext::Tool(PlayerAction::EditRoads),
+                    category: BindingCategory::Tool(PlayerAction::EditRoads),
                 },
                 Binding {
                     input: BindingInput::Mouse(MouseButton::Right),
                     action: "Finish the road, or take off the arc under the cursor",
-                    context: BindingContext::Tool(PlayerAction::EditRoads),
+                    category: BindingCategory::Tool(PlayerAction::EditRoads),
                 },
             ])
             .add_observer(release_the_tiles_of_a_removed_road)
@@ -1765,13 +1765,13 @@ impl Plugin for JunctionSignalPlugin {
             input: BindingInput::Key(SIGNAL_KEY),
             asks: SignalTheJunction,
             action: "Signal the junction you picked out, road by road",
-            context: BindingContext::Tool(PlayerAction::Select),
+            category: BindingCategory::Tool(PlayerAction::Select),
         }])
         .declare_commands(GREEN_KEYS.map(|(key, asks, action)| PlayerCommand {
             input: BindingInput::Key(key),
             asks,
             action,
-            context: BindingContext::Tool(PlayerAction::Select),
+            category: BindingCategory::Tool(PlayerAction::Select),
         }))
         .add_systems(
             Update,

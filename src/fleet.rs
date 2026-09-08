@@ -19,7 +19,7 @@ use crate::map::LatticeNode;
 use crate::road::{RoadEndpoint, RoadNetwork, RoadTiles};
 use crate::rover::{Cargo, Route, Rover, RoversDriven, SentTo, Stranded};
 use crate::simulation::Simulation;
-use crate::ui::legend::{BindingContext, BindingInput};
+use crate::ui::legend::{BindingCategory, BindingInput};
 use crate::ui::selection::{Picked, Selection};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -204,7 +204,7 @@ impl Plugin for FleetPlugin {
                 input: BindingInput::Key(key),
                 asks,
                 action,
-                context: BindingContext::Tool(PlayerAction::Select),
+                category: BindingCategory::Tool(PlayerAction::Select),
             }))
             .add_systems(
                 FixedUpdate,

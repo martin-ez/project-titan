@@ -1,5 +1,5 @@
 use crate::input::{CameraMovement, PlayerInput};
-use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
+use crate::ui::legend::{Binding, BindingCategory, BindingInput, DeclareBindings};
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use std::f32::consts::{PI, TAU};
@@ -74,7 +74,7 @@ impl Plugin for CameraPlugin {
         app.declare_bindings([Binding {
             input: BindingInput::Scroll,
             action: "Zoom the camera",
-            context: BindingContext::Always,
+            category: BindingCategory::Camera,
         }])
         .init_resource::<CameraSensitivity>()
         .add_systems(Startup, spawn_camera)

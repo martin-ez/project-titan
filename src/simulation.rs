@@ -1,5 +1,5 @@
 use crate::input::{CommandsRead, DeclareCommands, PlayerCommand, Requested};
-use crate::ui::legend::{BindingContext, BindingInput};
+use crate::ui::legend::{BindingCategory, BindingInput};
 use bevy::diagnostic::{Diagnostic, DiagnosticPath, Diagnostics, RegisterDiagnostic};
 use bevy::input::InputSystems;
 use bevy::prelude::*;
@@ -74,13 +74,13 @@ impl Plugin for SimulationPlugin {
                     input: BindingInput::Key(WARP_FASTER_KEY),
                     asks: WarpStep::Faster,
                     action: "Run the world faster",
-                    context: BindingContext::Always,
+                    category: BindingCategory::Simulation,
                 },
                 PlayerCommand {
                     input: BindingInput::Key(WARP_SLOWER_KEY),
                     asks: WarpStep::Slower,
                     action: "Run the world slower, down to stopped",
-                    context: BindingContext::Always,
+                    category: BindingCategory::Simulation,
                 },
             ])
             .register_diagnostic(Diagnostic::new(TICKS_PER_SECOND).with_suffix(" ticks/s"))

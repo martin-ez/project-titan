@@ -18,7 +18,7 @@ use crate::building::{BuildingTiles, BuildingType, Port};
 use crate::input::{PlayerAction, PlayerInput};
 use crate::map::{HexCoordinates, LatticeNode, MapTile};
 use crate::road::{Junction, RoadEndpoint};
-use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
+use crate::ui::legend::{Binding, BindingCategory, BindingInput, DeclareBindings};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
@@ -133,7 +133,7 @@ impl Plugin for SelectionPlugin {
             .declare_bindings([Binding {
                 input: BindingInput::Mouse(MouseButton::Left),
                 action: "Pick out the junction, building or port under the cursor",
-                context: BindingContext::Tool(PlayerAction::Select),
+                category: BindingCategory::Tool(PlayerAction::Select),
             }])
             .add_systems(
                 Update,
