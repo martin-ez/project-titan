@@ -1,6 +1,6 @@
 use crate::input::{DeclareCommands, PlayerCommand, Requested};
 use crate::simulation::TICKS_PER_SECOND;
-use crate::ui::legend::{BindingContext, BindingInput};
+use crate::ui::legend::{BindingCategory, BindingInput};
 use bevy::dev_tools::diagnostics_overlay::{DiagnosticsOverlay, DiagnosticsOverlayPlugin};
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
 use bevy::prelude::*;
@@ -39,7 +39,7 @@ fn declare_the_overlay_command(app: &mut App) -> &mut App {
         input: BindingInput::Key(DIAGNOSTICS_OVERLAY_KEY),
         asks: ShowTheOverlay,
         action: "Show or hide the frame and tick rates",
-        context: BindingContext::Always,
+        category: BindingCategory::Debug,
     }])
 }
 
@@ -98,7 +98,7 @@ impl Plugin for DebugGizmosPlugin {
             input: BindingInput::Key(DEBUG_GIZMOS_KEY),
             asks: ShowTheGizmos,
             action: "Show or hide the debug gizmos",
-            context: BindingContext::Always,
+            category: BindingCategory::Debug,
         }])
         .add_systems(Update, toggle_debug_gizmos);
     }

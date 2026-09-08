@@ -1,6 +1,8 @@
 use crate::common::cursor::{CursorHit, CursorRayCast};
 use crate::map::{LatticeNode, MapTile};
-use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
+use crate::ui::legend::{
+    Binding, BindingCategory, BindingCondition, BindingInput, DeclareBindings,
+};
 use bevy::ecs::system::SystemParam;
 use bevy::input::InputSystems;
 use bevy::prelude::*;
@@ -35,8 +37,11 @@ const MOVEMENT_KEYS: [(KeyCode, Vec3, &str); 4] = [
     (KeyCode::KeyD, Vec3::X, "Move the camera right"),
 ];
 
-/// Key binding for finishing what the player is placing
-const FINISH_KEY: KeyCode = KeyCode::Escape;
+/// Key binding for finishing what the player is placing.
+///
+/// Declared as a binding by whichever tool placing means something to, rather than here, since it
+/// does nothing under the others.
+pub const FINISH_KEY: KeyCode = KeyCode::Escape;
 
 /// Key binding for turning what the player is about to place.
 ///
@@ -126,8 +131,8 @@ pub struct PlayerCommand<C> {
     pub asks: C,
     /// What asking for it does, as the legend says it.
     pub action: &'static str,
-    /// When asking for it does that.
-    pub context: BindingContext,
+    /// Where the legend lists it.
+    pub category: BindingCategory,
 }
 
 /// What the player asked for on this frame, among the commands of `C`.
@@ -177,16 +182,30 @@ impl<C> Default for CommandBindings<C> {
 /// Call it from `build`. The plugin declaring them owns the command type and this owns nothing but
 /// the reading, so there is nowhere a list of every command in the game could live.
 pub trait DeclareCommands {
-    /// Add these commands to what a press can ask for, and to what the legend draws.
+    /// Add these commands, as ones that answer wherever the player is standing.
     fn declare_commands<C: Copy + PartialEq + Send + Sync + 'static>(
         &mut self,
+        commands: impl IntoIterator<Item = PlayerCommand<C>>,
+    ) -> &mut Self {
+        self.declare_commands_when(BindingCondition::Always, commands)
+    }
+
+    /// Add these commands, as ones the legend draws only while `condition` holds.
+    ///
+    /// A press still reaches the command whatever the legend is showing. What the condition says
+    /// is when naming it tells the player something, which is a question the plugin owning the
+    /// command is the only one that can answer.
+    fn declare_commands_when<C: Copy + PartialEq + Send + Sync + 'static>(
+        &mut self,
+        condition: BindingCondition,
         commands: impl IntoIterator<Item = PlayerCommand<C>>,
     ) -> &mut Self;
 }
 
 impl DeclareCommands for App {
-    fn declare_commands<C: Copy + PartialEq + Send + Sync + 'static>(
+    fn declare_commands_when<C: Copy + PartialEq + Send + Sync + 'static>(
         &mut self,
+        condition: BindingCondition,
         commands: impl IntoIterator<Item = PlayerCommand<C>>,
     ) -> &mut Self {
         if !self.world().contains_resource::<CommandBindings<C>>() {
@@ -201,11 +220,14 @@ impl DeclareCommands for App {
                 .add_systems(Last, forget_the_commands::<C>);
         }
         for command in commands {
-            self.declare_bindings([Binding {
-                input: command.input,
-                action: command.action,
-                context: command.context,
-            }]);
+            self.declare_bindings_when(
+                condition,
+                [Binding {
+                    input: command.input,
+                    action: command.action,
+                    category: command.category,
+                }],
+            );
             self.world_mut()
                 .resource_mut::<CommandBindings<C>>()
                 .0
@@ -255,23 +277,18 @@ impl Plugin for PlayerInputPlugin {
             .declare_bindings(TOOL_KEYS.map(|(key, tool)| Binding {
                 input: BindingInput::Key(key),
                 action: tool.label(),
-                context: BindingContext::Always,
+                category: BindingCategory::Tools,
             }))
             .declare_bindings(CAMERA_MODIFIERS.map(|(input, movement)| Binding {
                 input,
                 action: movement.label(),
-                context: BindingContext::Always,
+                category: BindingCategory::Camera,
             }))
             .declare_bindings(MOVEMENT_KEYS.map(|(key, _, action)| Binding {
                 input: BindingInput::Key(key),
                 action,
-                context: BindingContext::Always,
+                category: BindingCategory::Camera,
             }))
-            .declare_bindings([Binding {
-                input: BindingInput::Key(FINISH_KEY),
-                action: "Finish what you are placing",
-                context: BindingContext::Always,
-            }])
             .add_systems(Startup, (spawn_indicator, hide_the_cursor))
             .add_systems(
                 PreUpdate,
@@ -1114,13 +1131,13 @@ mod tests {
                     input: BindingInput::Key(REFUEL_KEY),
                     asks: Refuel::OneCan,
                     action: "Refuel the rover",
-                    context: BindingContext::Always,
+                    category: BindingCategory::Tools,
                 },
                 PlayerCommand {
                     input: BindingInput::Mouse(REFUEL_BUTTON),
                     asks: Refuel::TwoCans,
                     action: "Refuel the rover twice over",
-                    context: BindingContext::Always,
+                    category: BindingCategory::Tools,
                 },
             ])
             .add_systems(Update, note_what_the_player_asked_for);

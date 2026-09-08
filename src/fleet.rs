@@ -19,7 +19,7 @@ use crate::map::LatticeNode;
 use crate::road::{RoadEndpoint, RoadNetwork, RoadTiles};
 use crate::rover::{Cargo, Route, Rover, RoversDriven, SentTo, Stranded};
 use crate::simulation::Simulation;
-use crate::ui::legend::{BindingContext, BindingInput};
+use crate::ui::legend::{BindingCategory, BindingCondition, BindingInput, PickedOut};
 use crate::ui::selection::{Picked, Selection};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -200,12 +200,15 @@ impl Plugin for FleetPlugin {
             .init_resource::<Refused>()
             .add_observer(take_the_rovers_of_a_fleet_that_is_gone_off_the_road)
             .add_observer(give_back_the_place_of_a_rover_that_left_the_world)
-            .declare_commands(FLEET_KEYS.map(|(key, asks, action)| PlayerCommand {
-                input: BindingInput::Key(key),
-                asks,
-                action,
-                context: BindingContext::Tool(PlayerAction::Select),
-            }))
+            .declare_commands_when(
+                BindingCondition::PickedOut(PickedOut::Port(Flow::Intake)),
+                FLEET_KEYS.map(|(key, asks, action)| PlayerCommand {
+                    input: BindingInput::Key(key),
+                    asks,
+                    action,
+                    category: BindingCategory::Tool(PlayerAction::Select),
+                }),
+            )
             .add_systems(
                 FixedUpdate,
                 (

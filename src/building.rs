@@ -21,7 +21,7 @@ use crate::map::{
     MAP_TILE_SIZE,
 };
 use crate::road::{RoadEndpoint, RoadTiles};
-use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
+use crate::ui::legend::{Binding, BindingCategory, BindingInput, DeclareBindings};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use std::collections::HashMap;
@@ -606,28 +606,21 @@ impl Plugin for BuildingPlugin {
         app.init_resource::<BuildingTiles>()
             .init_resource::<ChosenBuildingType>()
             .init_resource::<PlacementFacing>()
-            .declare_bindings([
-                Binding {
-                    input: BindingInput::Mouse(MouseButton::Left),
-                    action: "Put a building on the tile",
-                    context: BindingContext::Tool(PlayerAction::EditBuildings),
-                },
-                Binding {
-                    input: BindingInput::Mouse(MouseButton::Right),
-                    action: "Take the building off the tile",
-                    context: BindingContext::Tool(PlayerAction::EditBuildings),
-                },
-            ])
+            .declare_bindings([Binding {
+                input: BindingInput::Mouse(MouseButton::Right),
+                action: "Take the building off the tile",
+                category: BindingCategory::Tool(PlayerAction::EditBuildings),
+            }])
             .declare_commands(CHOOSE_KEYS.map(|(key, asks, action)| PlayerCommand {
                 input: BindingInput::Key(key),
                 asks,
                 action,
-                context: BindingContext::Tool(PlayerAction::EditBuildings),
+                category: BindingCategory::Tool(PlayerAction::EditBuildings),
             }))
             .declare_bindings([Binding {
                 input: BindingInput::Key(TURN_KEY),
                 action: "Turn the building you are about to place",
-                context: BindingContext::Tool(PlayerAction::EditBuildings),
+                category: BindingCategory::Tool(PlayerAction::EditBuildings),
             }])
             .add_observer(release_the_tile_of_a_removed_building)
             .add_systems(
