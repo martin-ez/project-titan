@@ -966,6 +966,25 @@ mod tests {
     /// How many ticks a rover is given to cross one segment before the test gives up on it.
     const TICKS_ALLOWED: u32 = 4096;
 
+    /// How many ticks a rover setting off from rest takes to reach the limit of the road under it.
+    ///
+    /// The open road's limit over the rate a rover changes speed at. Written out rather than
+    /// divided out of the two, so what the tests measure is the run a player watches rather than
+    /// the arithmetic the driver was written with.
+    const TICKS_UP_TO_SPEED: u32 = 48;
+
+    /// How many ticks of slowing a rover coming to rest has to have spent to have braked.
+    ///
+    /// Half the run it takes to reach the open road's limit, so the claim holds wherever the road
+    /// left it short of that and does not rest on the rover having got all the way up to speed.
+    const TICKS_EASING: usize = TICKS_UP_TO_SPEED as usize / 2;
+
+    /// How little ground a rover has to cover in a tick to be standing still.
+    const AT_REST: f32 = 1e-4;
+
+    /// How many ticks a rover is watched over to see it pull away from a standing start.
+    const TICKS_OFF_THE_MARK: u32 = 4;
+
     /// How many ticks the two roads are driven for before what each delivered is compared.
     ///
     /// Well short of what either rover needs to reach the end of its road, so both were offered
@@ -1915,6 +1934,210 @@ mod tests {
             "{taken} ticks round the bend against the {} the same {ground} of straight takes",
             ground / open_road
         );
+    }
+
+    /// How much ground `rover` covers on each tick it spends on `segment`, once it reaches it.
+    ///
+    /// The reading starts on the tick after it arrives, so no entry is a tick split between two
+    /// segments and every one of them is ground the segment's own limit had the whole say over.
+    fn ground_covered_on(app: &mut App, rover: Entity, segment: Entity) -> Vec<f32> {
+        for _ in 0..TICKS_ALLOWED {
+            if place_of(app, rover).0 == segment {
+                break;
+            }
+            tick(app);
+        }
+        let mut covered = Vec::new();
+        let mut standing = place_of(app, rover).1;
+        for _ in 0..TICKS_ALLOWED {
+            tick(app);
+            let (on, along) = place_of(app, rover);
+            if on != segment {
+                break;
+            }
+            covered.push(along - standing);
+            standing = along;
+        }
+        covered
+    }
+
+    /// How much ground `rover` covers on each tick until the first one it covers none, walked
+    /// along the lane it set off down from `from`.
+    fn ground_covered_up_to_its_first_stop(app: &mut App, rover: Entity, from: Entity) -> Vec<f32> {
+        let mut covered = Vec::new();
+        let mut driven = driven_from(app, rover, from);
+        for _ in 0..TICKS_ALLOWED {
+            tick(app);
+            let reached = driven_from(app, rover, from);
+            covered.push(reached - driven);
+            driven = reached;
+            if covered.last().is_some_and(|&step| step < AT_REST) {
+                break;
+            }
+        }
+        covered
+    }
+
+    /// How many ticks `covered` ends with where the rover was moving, but slower than `limit`.
+    ///
+    /// Counted back from the stop it ends on, so what it says is how long the rover spent shedding
+    /// speed rather than how much of the journey happened to be slow.
+    fn ticks_slowing_before_the_stop(covered: &[f32], limit: f32) -> usize {
+        covered
+            .iter()
+            .rev()
+            .skip_while(|&&step| step < AT_REST)
+            .take_while(|&&step| step < limit - AT_REST)
+            .count()
+    }
+
+    #[test]
+    fn a_rover_setting_off_from_rest_covers_less_ground_on_its_first_tick_than_its_next() {
+        let (mut app, rover, segment) = road_with_a_driver(&STRAIGHT);
+
+        let covered = ground_covered_on(&mut app, rover, segment);
+
+        assert!(
+            covered[0] < covered[1],
+            "{} then {} of road",
+            covered[0],
+            covered[1]
+        );
+    }
+
+    #[test]
+    fn a_rover_setting_off_from_rest_reaches_the_open_road_limit_over_many_ticks() {
+        let (mut app, rover, segment) = road_with_a_driver(&STRAIGHT);
+        let limit = speed_limit_of(&app, segment);
+
+        let covered = ground_covered_on(&mut app, rover, segment);
+
+        assert!(
+            covered[..TICKS_OFF_THE_MARK as usize]
+                .iter()
+                .all(|&step| step < limit),
+            "off the mark at {:?} against a limit of {limit}",
+            &covered[..TICKS_OFF_THE_MARK as usize]
+        );
+        assert!(
+            (covered[TICKS_UP_TO_SPEED as usize - 1] - limit).abs() < TOLERANCE,
+            "{} of road on the {TICKS_UP_TO_SPEED}th tick against a limit of {limit}",
+            covered[TICKS_UP_TO_SPEED as usize - 1]
+        );
+    }
+
+    /// A stretch of the winding road and the slower one the lane runs on from it onto.
+    fn onto_a_slower_stretch(app: &mut App) -> (Entity, Entity) {
+        a_change_of_limit(app, |before, after| after < before)
+    }
+
+    /// A stretch of the winding road and the faster one the lane runs on from it onto.
+    fn onto_a_faster_stretch(app: &mut App) -> (Entity, Entity) {
+        a_change_of_limit(app, |before, after| after > before)
+    }
+
+    /// Two stretches the lane runs between whose limits differ the way `changes` asks.
+    fn a_change_of_limit(app: &mut App, changes: fn(f32, f32) -> bool) -> (Entity, Entity) {
+        let mut found: Vec<(Entity, Entity)> = segments_in(app)
+            .into_iter()
+            .filter_map(|segment| next_of(app, segment).map(|beyond| (segment, beyond)))
+            .filter(|&(segment, beyond)| {
+                let (before, after) = (speed_limit_of(app, segment), speed_limit_of(app, beyond));
+                (after - before).abs() > TOLERANCE && changes(before, after)
+            })
+            .collect();
+        found.sort();
+        found
+            .first()
+            .copied()
+            .expect("the road changes what it allows somewhere along it")
+    }
+
+    /// The winding road, laid and cut into stretches of differing speed.
+    fn a_winding_road() -> App {
+        let mut app = rover_app();
+        lay_road(&mut app, &WINDING);
+        tick(&mut app);
+        app
+    }
+
+    #[test]
+    fn a_rover_never_covers_more_ground_in_a_tick_than_the_bend_it_runs_onto_allows() {
+        let mut app = a_winding_road();
+        let (before, bend) = onto_a_slower_stretch(&mut app);
+        let rover = spawn_rover(&mut app, before, 0.);
+        let limit = speed_limit_of(&app, bend);
+
+        let covered = ground_covered_on(&mut app, rover, bend);
+
+        assert!(
+            covered.iter().all(|&step| step <= limit + AT_REST),
+            "{} of road on a bend allowing {limit}",
+            covered.iter().fold(0f32, |most, &step| most.max(step))
+        );
+    }
+
+    #[test]
+    fn a_rover_leaving_a_bend_reaches_the_faster_road_beyond_it_over_several_ticks() {
+        let mut app = a_winding_road();
+        let (bend, beyond) = onto_a_faster_stretch(&mut app);
+        let faster = speed_limit_of(&app, beyond);
+        let rover = spawn_rover(&mut app, bend, 0.);
+
+        let covered = ground_covered_on(&mut app, rover, beyond);
+
+        assert!(
+            covered[0] < faster - AT_REST,
+            "{} of road on the first tick beyond the bend, against a limit of {faster}",
+            covered[0]
+        );
+        assert!(
+            covered
+                .iter()
+                .any(|&step| (step - faster).abs() < TOLERANCE),
+            "the rover never reached the {faster} the road beyond the bend allows"
+        );
+    }
+
+    #[test]
+    fn a_rover_arriving_at_the_port_it_was_sent_to_slows_before_it_gets_there() {
+        let (mut app, collection, delivery) = a_road_between_endpoints();
+        let rover = set_off_from(&mut app, collection, delivery, Vec::new());
+        let setting_off = place_of(&app, rover).0;
+        let limit = speed_limit_of(&app, setting_off);
+
+        let covered = ground_covered_up_to_its_first_stop(&mut app, rover, setting_off);
+
+        let easing = ticks_slowing_before_the_stop(&covered, limit);
+        assert!(easing >= TICKS_EASING, "{easing} ticks of slowing");
+    }
+
+    #[test]
+    fn a_rover_reaching_a_junction_slows_before_it_rather_than_stopping_dead() {
+        let mut app = a_crossed_road();
+        let approach = segment_from(&mut app, tiles(&STRAIGHT)[0]);
+        let rover = spawn_rover(&mut app, approach, 0.);
+        let limit = speed_limit_of(&app, approach);
+
+        let covered = ground_covered_up_to_its_first_stop(&mut app, rover, approach);
+
+        let easing = ticks_slowing_before_the_stop(&covered, limit);
+        assert!(easing >= TICKS_EASING, "{easing} ticks of slowing");
+    }
+
+    #[test]
+    fn a_rover_catching_the_queue_ahead_slows_rather_than_stopping_dead() {
+        let mut app = one_way_road_app();
+        let lane = segment_from(&mut app, tiles(&STRAIGHT)[0]);
+        let last = the_end_of_the_lane(&app, lane);
+        fill_to_capacity(&mut app, last);
+        let catching_up = spawn_rover(&mut app, lane, 0.);
+        let limit = speed_limit_of(&app, lane);
+
+        let covered = ground_covered_up_to_its_first_stop(&mut app, catching_up, lane);
+
+        let easing = ticks_slowing_before_the_stop(&covered, limit);
+        assert!(easing >= TICKS_EASING, "{easing} ticks of slowing");
     }
 
     #[test]
