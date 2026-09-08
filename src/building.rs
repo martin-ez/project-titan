@@ -1449,6 +1449,7 @@ mod tests {
                 Rover {
                     segment: stops.segment,
                     along: stops.along,
+                    speed: 0.,
                 },
                 Cargo { item, quantity },
                 Route {

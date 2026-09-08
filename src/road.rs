@@ -118,7 +118,7 @@ const STRAIGHT_REACH: f32 = 1e-3;
 /// In world units, so a rover on the straight crosses a tile every sixty-four ticks. Nothing in
 /// gameplay measures in seconds (invariant 2): running the world faster runs more ticks rather
 /// than longer ones, and this is untouched by that.
-const STRAIGHT_SPEED_LIMIT: f32 = MAP_TILE_SIZE / 64.;
+pub const STRAIGHT_SPEED_LIMIT: f32 = MAP_TILE_SIZE / 64.;
 
 /// The tightest curve still driven at the straight-road limit, as a radius in world units.
 ///

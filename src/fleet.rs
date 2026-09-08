@@ -475,6 +475,7 @@ fn put_the_rovers_a_fleet_is_owed_on_the_road(
                 Rover {
                     segment: place.segment,
                     along: place.along,
+                    speed: 0.,
                 },
                 Serving { port },
             ));
@@ -1589,6 +1590,29 @@ mod tests {
         });
 
         assert!(gone, "a rover outlived the port it served");
+    }
+
+    /// How much a fleet of `A_FLEET` delivers down `HAULAGE` over `TICKS_MEASURED`.
+    ///
+    /// Measured, not reasoned about (2.3). The same fixture delivered 72 before a rover carried a
+    /// speed from one tick to the next: braking into the port it was sent to and pulling away from
+    /// it again costs a rover the run those two take at full speed, twice a round trip, and this
+    /// road is two tiles long so it pays that over forty world units rather than four hundred.
+    /// What a longer haul loses to the same rate is a smaller share of it.
+    ///
+    /// It is written down so that the next thing to move it has to say so.
+    const A_MEASURED_DELIVERY: u32 = 48;
+
+    #[test]
+    fn a_shuttle_delivers_what_a_measured_run_says_it_does() {
+        let (mut app, source, home) = haulage_app();
+        produce_at(&mut app, source);
+        consume_at(&mut app, home);
+        assign(&mut app, home, A_FLEET);
+
+        run(&mut app, TICKS_MEASURED);
+
+        assert_eq!(taken_in(&app, home), A_MEASURED_DELIVERY);
     }
 
     #[test]

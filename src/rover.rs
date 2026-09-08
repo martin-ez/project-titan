@@ -5,7 +5,8 @@ use crate::diagnostics::DebugGizmos;
 use crate::map::MAP_TILE_SIZE;
 use crate::road::{
     EndsAtJunction, JunctionLegs, JunctionPolicy, NextSegment, PlaceOnTheRoad, RoadEndpoint,
-    RoadNetwork, RoadSegment, RoadsLaid, SegmentCut, Signal, ROVER_ROOM,
+    RoadNetwork, RoadSegment, RoadsLaid, SegmentCut, ServedBy, Signal, ROVER_ROOM,
+    STRAIGHT_SPEED_LIMIT,
 };
 use crate::simulation::{Simulation, Ticks};
 use bevy::ecs::system::SystemParam;
@@ -27,6 +28,26 @@ const ROVER_HEIGHT: f32 = MAP_TILE_SIZE / 10.;
 /// other way round. It is here so that a lane of segments too short to spend a whole tick on
 /// cannot spin the driver, rather than to cap how fast anything goes.
 const HANDOVERS_PER_TICK: usize = 8;
+
+/// How much a rover's speed may change from one tick to the next, in world units a tick a tick.
+///
+/// A forty-eighth of the open road's limit, settled by play testing: a rover pulls away from a
+/// port over forty-eight ticks and three quarters of a tile, which reads as a machine getting
+/// under way rather than as one starting late. Per tick and not per second, because running the
+/// world faster runs more ticks rather than longer ones (invariant 2).
+const ROVER_ACCELERATION: f32 = STRAIGHT_SPEED_LIMIT / 48.;
+
+/// How much road a rover travelling at the open road's limit needs to brake to a stop.
+///
+/// What the lookahead stops walking at: past it there is more road than any rover could need,
+/// so what lies beyond cannot be what a rover is slowing for.
+const BRAKING_REACH: f32 = STRAIGHT_SPEED_LIMIT * STRAIGHT_SPEED_LIMIT / (2. * ROVER_ACCELERATION);
+
+/// How many segments the road ahead of a rover is walked over before the walk is given up on.
+///
+/// A lane of stretches too short to hold a braking distance between them cannot spin the walk,
+/// the same guard `HANDOVERS_PER_TICK` puts on driving one.
+const LOOKAHEAD_SEGMENTS: usize = 8;
 
 /// How far the debug view lifts a rover's marks off the road, so they do not fight the lane.
 const GIZMO_LIFT: Vec3 = Vec3::new(0., 0.2, 0.);
@@ -79,14 +100,15 @@ pub struct RoverPlugin;
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RoversDriven;
 
-/// A rover, standing somewhere along the segment it is driving.
+/// A rover, standing somewhere along the segment it is driving, going at some speed.
 ///
 /// Where it is is the distance, measured along the segment's own arc rather than as a fraction of
 /// the stretch it covers, so a road cut under a rover leaves the rover reading the same point off
 /// the same arc and moves it by nothing at all (invariant 6). The `Vec3` it stands at is derived
 /// from that geometry every frame (invariant 3), and nothing reads the transform back to work out
 /// where the rover got to, so the arc's `sin` and `cos` never reach the simulation and a chain
-/// jams the same way on every machine (invariant 2).
+/// jams the same way on every machine (invariant 2). The speed sits beside the place because a
+/// rover is never without one, which makes it a field rather than a component.
 #[derive(Component)]
 #[require(Transform, Visibility = Visibility::Hidden, NeedsInitialization)]
 pub struct Rover {
@@ -94,6 +116,8 @@ pub struct Rover {
     pub segment: Entity,
     /// How far along that segment's arc it has got, between the ends of the stretch it covers.
     pub along: f32,
+    /// How much road went under it on the tick just gone, in world units a tick.
+    pub speed: f32,
 }
 
 /// A rover a junction is holding at the end of its segment until its policy lets it through.
@@ -176,14 +200,20 @@ struct RoversWaiting {
     legs_waiting: Vec<usize>,
 }
 
-/// The rovers one stretch of road is carrying, and how near its start the last of them stands.
+/// The rovers one stretch of road is carrying, how near its start the last of them stands, and
+/// how fast that last one is going.
 ///
 /// `rear` only ever moves back down the stretch within a tick: a rover leaving the front of a
 /// queue does not free the road behind it until the next one, so a queue discharges from its
 /// front a rover at a time rather than all at once.
+///
+/// `rear_speed` is what lets a rover on the stretch behind brake for a queue that is itself
+/// moving. Without it every segment boundary is a wall, and a lane of traffic spreads out to a
+/// braking distance a rover rather than to the `ROVER_ROOM` its length was measured in.
 struct OnASegment {
     carrying: u32,
     rear: f32,
+    rear_speed: f32,
 }
 
 /// A rover whose stretch of road was removed, holding the place it was standing at.
@@ -280,25 +310,29 @@ impl Traffic {
     /// How much of `road`'s stretch is clear at its start, which is what a rover joining needs.
     fn room_at_the_start_of(&self, segment: Entity, road: &RoadSegment) -> f32 {
         self.reaches_back_to(segment)
-            .map_or(f32::INFINITY, |rear| rear - road.starts_at())
+            .map_or(f32::INFINITY, |(rear, _)| rear - road.starts_at())
     }
 
-    /// How far back down `segment` the traffic reaches, where it is carrying any.
-    fn reaches_back_to(&self, segment: Entity) -> Option<f32> {
+    /// How far back down `segment` the traffic reaches, and how fast, where it is carrying any.
+    fn reaches_back_to(&self, segment: Entity) -> Option<(f32, f32)> {
         self.0
             .get(&segment)
             .filter(|on_it| on_it.carrying > 0)
-            .map(|on_it| on_it.rear)
+            .map(|on_it| (on_it.rear, on_it.rear_speed))
     }
 
-    /// Record a rover standing `at` a distance along `segment`.
-    fn joined(&mut self, segment: Entity, at: f32) {
+    /// Record a rover standing `at` a distance along `segment`, going at `speed`.
+    fn joined(&mut self, segment: Entity, at: f32, speed: f32) {
         let on_it = self.0.entry(segment).or_insert(OnASegment {
             carrying: 0,
             rear: at,
+            rear_speed: speed,
         });
         on_it.carrying += 1;
-        on_it.rear = on_it.rear.min(at);
+        if at <= on_it.rear {
+            on_it.rear = at;
+            on_it.rear_speed = speed;
+        }
     }
 
     /// Record a rover leaving `segment`.
@@ -336,7 +370,7 @@ impl Initialize<RoverInitializeParams<'_, '_>> for Rover {
 fn count_what_each_segment_is_carrying(mut traffic: ResMut<Traffic>, rovers: Query<&Rover>) {
     traffic.0.clear();
     for rover in &rovers {
-        traffic.joined(rover.segment, rover.along);
+        traffic.joined(rover.segment, rover.along, rover.speed);
     }
 }
 
@@ -451,7 +485,7 @@ fn let_the_rovers_through(
         traffic.left(let_through.segment);
         let_through.segment = out;
         let_through.along = exit.starts_at();
-        traffic.joined(out, let_through.along);
+        traffic.joined(out, let_through.along, let_through.speed);
         commands.entity(rover).remove::<WaitingAtJunction>();
     }
 }
@@ -548,16 +582,75 @@ fn put_the_rovers_back_on_the_road_that_survived(
     }
 }
 
-/// Drive every rover along its lane, at whatever each segment it crosses allows.
+/// How much road stands ahead of a rover before something it must be at rest for, and how fast
+/// that something is going.
 ///
-/// A tick buys time rather than ground, spent segment by segment: what is left at the end of one
-/// is carried onto the next at that one's speed limit, so a rover slows on a curve, not before it.
+/// Walked along the lane rather than read off the stretch under the rover, because what it has to
+/// brake for is usually further off than that stretch is long. What ends the walk is the rover
+/// ahead, the door it was sent to, a junction, the lane running out, or traffic further down; one
+/// clear of all of them by a braking distance says so.
 ///
-/// What stops it short is the lane running out, a junction, its destination, a route it cannot
-/// drive, the rover ahead, or a stretch with no room on it. Only a rover about to join that
-/// stretch is held off it: a junction is waited at rather than short of, and a rover parking is
-/// not held back by the road past it. A lane is driven from its front backwards, so the rover
-/// ahead has moved before the one behind is asked how far it may go.
+/// The speed comes back with the room because an obstacle that is itself moving is not a wall: a
+/// rover may run nose to tail behind one going as fast as it is.
+fn road_ahead_of(
+    standing: (Entity, f32),
+    ahead: (f32, f32),
+    stops_at: Option<ServedBy>,
+    segments: &Query<(&RoadSegment, Option<&NextSegment>, Option<&EndsAtJunction>)>,
+    traffic: &Traffic,
+) -> (f32, f32) {
+    let (mut on, mut at) = standing;
+    let mut leader = Some(ahead).filter(|&(along, _)| along.is_finite());
+    let mut room = 0.;
+    for _ in 0..LOOKAHEAD_SEGMENTS {
+        let Ok((segment, next, junction)) = segments.get(on) else {
+            return (room, 0.);
+        };
+        let arriving = stops_at
+            .filter(|served| served.segment == on && served.along >= at)
+            .map(|served| (served.along, 0.));
+        let stopping = [
+            leader
+                .take()
+                .map(|(along, going)| (along - ROVER_ROOM, going)),
+            arriving,
+        ]
+        .into_iter()
+        .flatten()
+        .min_by(|one, other| one.0.total_cmp(&other.0));
+        if let Some((stop, going)) = stopping {
+            return (room + (stop - at).max(0.), going);
+        }
+
+        let onward = next
+            .filter(|_| junction.is_none())
+            .and_then(|next| segments.get(next.0).ok().map(|(road, ..)| (next.0, road)));
+        let Some((onward, road)) = onward else {
+            return (room + segment.ends_at() - at, 0.);
+        };
+        room += segment.ends_at() - at;
+        if let Some((rear, going)) = traffic.reaches_back_to(onward) {
+            return ((room + rear - ROVER_ROOM - road.starts_at()).max(0.), going);
+        }
+        if room >= BRAKING_REACH {
+            return (f32::INFINITY, 0.);
+        }
+        on = onward;
+        at = road.starts_at();
+    }
+    (room, 0.)
+}
+
+/// Drive every rover along its lane, at a speed it carries from one tick to the next.
+///
+/// It gains `ROVER_ACCELERATION` a tick and no more, held under the limit of the stretch under it
+/// and under whatever leaves it able to stop in the road `road_ahead_of` found, which turns every
+/// place a rover comes to rest into one it brakes to. What it does not do is slow for a bend it
+/// has not reached, so running onto a slower stretch still sheds speed in one tick.
+///
+/// A tick still buys time rather than ground, spent segment by segment, so a stretch crossed part
+/// way through one is driven at its own pace for that part, and the ground that went under the
+/// rover is the speed it carries on.
 fn drive_the_rovers(
     mut commands: Commands,
     ticks: Res<Ticks>,
@@ -581,17 +674,18 @@ fn drive_the_rovers(
     });
 
     let mut lane = Entity::PLACEHOLDER;
-    let mut ahead = f32::INFINITY;
+    let mut ahead = (f32::INFINITY, 0.);
     for &(standing, _, entity) in order.iter() {
         if standing != lane {
             lane = standing;
-            ahead = f32::INFINITY;
+            ahead = (f32::INFINITY, 0.);
         }
         let Ok((_, mut rover, route, stranded)) = rovers.get_mut(entity) else {
             continue;
         };
         if stranded {
-            ahead = rover.along;
+            rover.speed = 0.;
+            ahead = (rover.along, 0.);
             continue;
         }
 
@@ -604,15 +698,27 @@ fn drive_the_rovers(
                     .and_then(RoadEndpoint::served_by);
                 let Some(served) = bound_for else {
                     commands.entity(entity).insert_if_new(Stranded);
-                    ahead = rover.along;
+                    rover.speed = 0.;
+                    ahead = (rover.along, 0.);
                     continue;
                 };
                 Some(served)
             }
         };
 
+        let (room, closing_on) = road_ahead_of(
+            (rover.segment, rover.along),
+            ahead,
+            stops_at,
+            &segments,
+            &traffic,
+        );
+        let braking = (closing_on * closing_on + 2. * ROVER_ACCELERATION * room).sqrt();
+        let target = (rover.speed + ROVER_ACCELERATION).min(braking);
+
         let mut left = 1.;
-        let mut held_back = ahead - ROVER_ROOM;
+        let mut covered = 0.;
+        let mut held_back = ahead.0 - ROVER_ROOM;
         for _ in 0..HANDOVERS_PER_TICK {
             let Ok((segment, next, junction)) = segments.get(rover.segment) else {
                 break;
@@ -631,13 +737,17 @@ fn drive_the_rovers(
                 .min(held_back)
                 .max(rover.along);
 
-            let crossing = (reach - rover.along) / segment.speed_limit();
+            let pace = target.min(segment.speed_limit());
+            let crossing = ticks_to_cover(reach - rover.along, pace);
             if crossing > left {
-                rover.along += left * segment.speed_limit();
+                let step = left * pace;
+                rover.along += step;
+                covered += step;
                 break;
             }
 
             left -= crossing;
+            covered += reach - rover.along;
             rover.along = reach;
             if arriving.is_some() || reach < segment.ends_at() {
                 break;
@@ -660,19 +770,35 @@ fn drive_the_rovers(
 
             held_back = traffic
                 .reaches_back_to(onward)
-                .map_or(f32::INFINITY, |rear| rear - ROVER_ROOM);
+                .map_or(f32::INFINITY, |(rear, _)| rear - ROVER_ROOM);
             traffic.left(rover.segment);
             rover.segment = onward;
             rover.along = road.starts_at();
-            traffic.joined(onward, rover.along);
+            traffic.joined(onward, rover.along, target);
         }
 
+        rover.speed = covered;
         ahead = if rover.segment == lane {
-            rover.along
+            (rover.along, rover.speed)
         } else {
-            f32::INFINITY
+            (f32::INFINITY, 0.)
         };
     }
+}
+
+/// How much of a tick covering `ground` at `pace` takes, where either of them may be nothing.
+///
+/// Ground already covered costs no time, and a rover going nowhere never covers any: both are
+/// what a rover standing at what stopped it does every tick it stays there, so neither may come
+/// back as the `0. / 0.` that would carry it through the tick's whole budget at once.
+fn ticks_to_cover(ground: f32, pace: f32) -> f32 {
+    if ground <= 0. {
+        return 0.;
+    }
+    if pace <= 0. {
+        return f32::INFINITY;
+    }
+    ground / pace
 }
 
 /// Hand the load of every rover standing at its destination to the port it was driven to.
@@ -935,9 +1061,6 @@ mod tests {
     /// How many legs two two-way roads crossing each other make.
     const LEGS_OF_A_CROSSROADS: usize = 4;
 
-    /// How far along a segment, as a share of it, a rover stands to reach the end in one tick.
-    const ABOUT_TO_ARRIVE: f32 = 0.99;
-
     /// How many ticks a leg is held at red for, to watch what the queue behind it does.
     const TICKS_HELD: u64 = 12;
 
@@ -984,6 +1107,14 @@ mod tests {
 
     /// How many ticks a rover is watched over to see it pull away from a standing start.
     const TICKS_OFF_THE_MARK: u32 = 4;
+
+    /// How many ticks a rover coming to a stop and setting off again loses against holding its
+    /// speed.
+    ///
+    /// Shedding a full speed and picking it back up covers two braking distances at half that
+    /// speed rather than at it, so what it loses is the run those two take at full speed, which is
+    /// what `TICKS_UP_TO_SPEED` counts. What the wait itself costs is on top.
+    const TICKS_LOST_STOPPING: u32 = TICKS_UP_TO_SPEED;
 
     /// How many ticks the two roads are driven for before what each delivered is compared.
     ///
@@ -1226,7 +1357,13 @@ mod tests {
     }
 
     fn spawn_rover(app: &mut App, segment: Entity, along: f32) -> Entity {
-        app.world_mut().spawn(Rover { segment, along }).id()
+        app.world_mut()
+            .spawn(Rover {
+                segment,
+                along,
+                speed: 0.,
+            })
+            .id()
     }
 
     /// The rover's segment and how far along it, which together are where it is.
@@ -1903,9 +2040,12 @@ mod tests {
     }
 
     #[test]
-    fn a_rover_crosses_a_segment_in_ticks_its_length_over_its_speed_limit() {
+    fn a_rover_up_to_speed_crosses_a_segment_in_ticks_its_length_over_its_speed_limit() {
         let (mut app, rover, segment) = road_and_rover(0.);
-        let expected = length_of(&app, segment) / speed_limit_of(&app, segment);
+        let onward = next_of(&app, segment).expect("the lane runs on");
+        let after = next_of(&app, onward).expect("the lane runs on");
+        drive_up_to(&mut app, rover, after);
+        let expected = length_of(&app, after) / speed_limit_of(&app, after);
 
         let taken = ticks_to_cross(&mut app, rover) as f32;
 
@@ -1936,17 +2076,22 @@ mod tests {
         );
     }
 
+    /// Drive on until `rover` is standing on `segment`.
+    fn drive_up_to(app: &mut App, rover: Entity, segment: Entity) {
+        for _ in 0..TICKS_ALLOWED {
+            if place_of(app, rover).0 == segment {
+                return;
+            }
+            tick(app);
+        }
+    }
+
     /// How much ground `rover` covers on each tick it spends on `segment`, once it reaches it.
     ///
     /// The reading starts on the tick after it arrives, so no entry is a tick split between two
     /// segments and every one of them is ground the segment's own limit had the whole say over.
     fn ground_covered_on(app: &mut App, rover: Entity, segment: Entity) -> Vec<f32> {
-        for _ in 0..TICKS_ALLOWED {
-            if place_of(app, rover).0 == segment {
-                break;
-            }
-            tick(app);
-        }
+        drive_up_to(app, rover, segment);
         let mut covered = Vec::new();
         let mut standing = place_of(app, rover).1;
         for _ in 0..TICKS_ALLOWED {
@@ -1961,9 +2106,13 @@ mod tests {
         covered
     }
 
-    /// How much ground `rover` covers on each tick until the first one it covers none, walked
+    /// How much ground `rover` covers on each tick until the road brings it to a halt, walked
     /// along the lane it set off down from `from`.
-    fn ground_covered_up_to_its_first_stop(app: &mut App, rover: Entity, from: Entity) -> Vec<f32> {
+    ///
+    /// A halt is a tick it covered nothing on, or a junction taking hold of it. Both, because a
+    /// rover waiting to be let through is let through the tick after it arrives and never stands
+    /// still for one: a reading that waited for it to would run on past the stop it braked to.
+    fn ground_covered_until_it_is_held(app: &mut App, rover: Entity, from: Entity) -> Vec<f32> {
         let mut covered = Vec::new();
         let mut driven = driven_from(app, rover, from);
         for _ in 0..TICKS_ALLOWED {
@@ -1971,23 +2120,25 @@ mod tests {
             let reached = driven_from(app, rover, from);
             covered.push(reached - driven);
             driven = reached;
-            if covered.last().is_some_and(|&step| step < AT_REST) {
+            let held = app.world().entity(rover).contains::<WaitingAtJunction>();
+            if held || covered.last().is_some_and(|&step| step < AT_REST) {
                 break;
             }
         }
         covered
     }
 
-    /// How many ticks `covered` ends with where the rover was moving, but slower than `limit`.
+    /// How many ticks `covered` ends with where the rover was covering less ground than the tick
+    /// before.
     ///
-    /// Counted back from the stop it ends on, so what it says is how long the rover spent shedding
-    /// speed rather than how much of the journey happened to be slow.
-    fn ticks_slowing_before_the_stop(covered: &[f32], limit: f32) -> usize {
+    /// Counted back from the end, and asking that each tick be shorter than the last rather than
+    /// merely short: a rover still pulling away covers less than the road allows too, and only a
+    /// run that shortens tick after tick is one that was braking.
+    fn ticks_slowing_at_the_end(covered: &[f32]) -> usize {
         covered
-            .iter()
+            .windows(2)
             .rev()
-            .skip_while(|&&step| step < AT_REST)
-            .take_while(|&&step| step < limit - AT_REST)
+            .take_while(|pair| pair[1] < pair[0])
             .count()
     }
 
@@ -2104,24 +2255,22 @@ mod tests {
         let (mut app, collection, delivery) = a_road_between_endpoints();
         let rover = set_off_from(&mut app, collection, delivery, Vec::new());
         let setting_off = place_of(&app, rover).0;
-        let limit = speed_limit_of(&app, setting_off);
 
-        let covered = ground_covered_up_to_its_first_stop(&mut app, rover, setting_off);
+        let covered = ground_covered_until_it_is_held(&mut app, rover, setting_off);
 
-        let easing = ticks_slowing_before_the_stop(&covered, limit);
+        let easing = ticks_slowing_at_the_end(&covered);
         assert!(easing >= TICKS_EASING, "{easing} ticks of slowing");
     }
 
     #[test]
     fn a_rover_reaching_a_junction_slows_before_it_rather_than_stopping_dead() {
         let mut app = a_crossed_road();
-        let approach = segment_from(&mut app, tiles(&STRAIGHT)[0]);
-        let rover = spawn_rover(&mut app, approach, 0.);
-        let limit = speed_limit_of(&app, approach);
+        let setting_off = segment_from(&mut app, tiles(&STRAIGHT)[0]);
+        let rover = set_down_on(&mut app, setting_off, 0.);
 
-        let covered = ground_covered_up_to_its_first_stop(&mut app, rover, approach);
+        let covered = ground_covered_until_it_is_held(&mut app, rover, setting_off);
 
-        let easing = ticks_slowing_before_the_stop(&covered, limit);
+        let easing = ticks_slowing_at_the_end(&covered);
         assert!(easing >= TICKS_EASING, "{easing} ticks of slowing");
     }
 
@@ -2132,11 +2281,10 @@ mod tests {
         let last = the_end_of_the_lane(&app, lane);
         fill_to_capacity(&mut app, last);
         let catching_up = spawn_rover(&mut app, lane, 0.);
-        let limit = speed_limit_of(&app, lane);
 
-        let covered = ground_covered_up_to_its_first_stop(&mut app, catching_up, lane);
+        let covered = ground_covered_until_it_is_held(&mut app, catching_up, lane);
 
-        let easing = ticks_slowing_before_the_stop(&covered, limit);
+        let easing = ticks_slowing_at_the_end(&covered);
         assert!(easing >= TICKS_EASING, "{easing} ticks of slowing");
     }
 
@@ -2222,9 +2370,13 @@ mod tests {
             .exits_from(ends.leg)
     }
 
-    /// Put a rover at the far end of `segment`, a tick short of the junction it reaches.
+    /// Put a rover at the far end of `segment`, standing at the junction it reaches.
+    ///
+    /// At the end and not short of it, because a rover set down short of one now brakes into it
+    /// over the ticks its speed takes to shed rather than arriving on the next: these are tests of
+    /// what a junction does with the rovers standing at it, not of how they got there.
     fn waiting_on(app: &mut App, segment: Entity) -> Entity {
-        let along = place_along(app, segment, ABOUT_TO_ARRIVE);
+        let along = place_along(app, segment, AT_THE_JUNCTION);
         spawn_rover(app, segment, along)
     }
 
@@ -2793,12 +2945,12 @@ mod tests {
     }
 
     #[test]
-    fn carrying_straight_on_through_a_junction_costs_the_tick_it_waits_and_nothing_more() {
+    fn carrying_straight_on_through_a_junction_costs_the_stop_it_makes_and_nothing_more() {
         let crossed = ticks_along(&[&STRAIGHT_ON, &CROSSING], &STRAIGHT_ON, PAST_THE_STRAIGHT);
         let clear = ticks_along(&[&STRAIGHT_ON], &STRAIGHT_ON, PAST_THE_STRAIGHT);
 
         assert!(
-            crossed <= clear + TICKS_LOST_AT_A_JUNCTION,
+            crossed <= clear + TICKS_LOST_STOPPING + TICKS_LOST_AT_A_JUNCTION,
             "{crossed} ticks across the junction against {clear} down the road nothing crosses"
         );
     }
@@ -2833,6 +2985,7 @@ mod tests {
             .spawn(Rover {
                 segment: served.segment,
                 along: served.along,
+                speed: 0.,
             })
             .id();
         advance(&mut app, SHORT_FRAME);
@@ -2931,6 +3084,7 @@ mod tests {
                 Rover {
                     segment: from.segment,
                     along: from.along,
+                    speed: 0.,
                 },
                 Cargo {
                     item: HAULED,
@@ -3081,6 +3235,7 @@ mod tests {
                 Rover {
                     segment: from.segment,
                     along: from.along,
+                    speed: 0.,
                 },
                 Cargo {
                     item: HAULED,
@@ -3339,6 +3494,7 @@ mod tests {
                 Rover {
                     segment: stops.segment,
                     along: stops.along,
+                    speed: 0.,
                 },
                 Cargo {
                     item: HAULED,
@@ -3486,6 +3642,7 @@ mod tests {
     struct Standing {
         segment: Entity,
         along: f32,
+        speed: f32,
         waiting: bool,
         stranded: bool,
         load: u32,
@@ -3504,6 +3661,7 @@ mod tests {
                 Some(Standing {
                     segment: rover.segment,
                     along: rover.along,
+                    speed: rover.speed,
                     waiting: entity.contains::<WaitingAtJunction>(),
                     stranded: entity.contains::<Stranded>(),
                     load: entity.get::<Cargo>().map_or(0, |cargo| cargo.quantity),
@@ -3782,7 +3940,11 @@ mod tests {
     fn stop_one_dead_at_the_start_of(app: &mut App, segment: Entity, nowhere: Entity) {
         let along = place_along(app, segment, 0.);
         app.world_mut().spawn((
-            Rover { segment, along },
+            Rover {
+                segment,
+                along,
+                speed: 0.,
+            },
             Route {
                 destination: nowhere,
                 ways_out: Vec::new(),
