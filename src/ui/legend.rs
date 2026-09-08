@@ -2,19 +2,23 @@
 //!
 //! A binding is declared by the plugin that owns it, from the same table that plugin's systems
 //! read to decide what a press does, so a key cannot start working without saying what it is for.
-//! The legend renders those declarations: adding a command adds its row, and there is no second
-//! list to forget. The one thing on the panel that is not a binding is a heading naming what the
-//! tool holding it is set to place, because a key that steps through a catalogue says what it does
-//! without saying where it has got to. It is drawn in `bevy_ui` nodes rather than Bevy's
-//! `bevy_feathers` widgets, an editor set and not a game's, for the reasons [`crate::ui`] gives.
-//! A row is then a pair of text nodes under a panel rather than a line of a formatted string,
-//! which is what lets a column line up and a heading read differently from the rows beneath it.
+//! The legend renders those declarations, and only the ones the player can reach where they are
+//! standing: each sits under a [`BindingCategory`], and a category the situation does not reach is
+//! a heading carrying the count of what is under it rather than its rows. A row naming a key that
+//! does nothing there is worse than no panel at all, so a command wanting more than its category
+//! says which more in a [`BindingCondition`]. The left button is never a row, being the main
+//! action wherever the player stands. It is drawn in `bevy_ui` nodes rather than Bevy's
+//! `bevy_feathers` widgets, an editor set and not a game's, for the reasons [`crate::ui`] gives:
+//! a row is a pair of text nodes, which is what lets a column line up under a heading.
 
-use crate::building::ChosenBuildingType;
+use crate::building::{BuildingType, ChosenBuildingType, Flow, Port};
 use crate::input::{DeclareCommands, PlayerAction, PlayerCommand, Requested};
+use crate::ui::selection::Selection;
 use crate::ui::{
-    panel, panel_font, panel_row, panel_text, PanelCorner, BODY_TEXT, HEADING_TEXT, KEYED_TEXT,
+    panel, panel_font, panel_row, panel_text, Panel, PanelCorner, BODY_TEXT, HEADING_TEXT,
+    KEYED_TEXT,
 };
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
 /// Key binding that shows and hides the legend
@@ -58,6 +62,31 @@ pub enum BindingCategory {
     Debug,
 }
 
+/// What a command needs beyond the category it sits under, before it answers at all.
+///
+/// A panel claiming to show what is available now is worth less than no panel if a row on it names
+/// a key that does nothing where the player is standing. A command that asks for more than its
+/// tool says so here, as data the declaring plugin writes down beside the table its own systems
+/// read, rather than as a system the legend would have to run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BindingCondition {
+    /// Wherever the player is standing.
+    Always,
+    /// Only while this panel is on screen.
+    PanelOpen(Panel),
+    /// Only while the player has this picked out.
+    PickedOut(PickedOut),
+}
+
+/// What the player has picked out, for a command that answers only while they have.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PickedOut {
+    /// A junction of the road.
+    Junction,
+    /// A port of a building, the one that moves goods this way.
+    Port(Flow),
+}
+
 /// One command the player can reach, and what reaches it.
 pub struct Binding {
     /// What the player presses.
@@ -66,6 +95,11 @@ pub struct Binding {
     pub action: &'static str,
     /// Where the legend lists it.
     pub category: BindingCategory,
+}
+
+struct Declared {
+    binding: Binding,
+    condition: BindingCondition,
 }
 
 /// The categories the panel lays out, in the order it lays them out
@@ -99,24 +133,38 @@ impl BindingCategory {
 /// them, so a plugin's rows stay together and the legend does not reshuffle when an unrelated
 /// plugin is added ahead of it.
 #[derive(Resource, Default)]
-pub struct PlayerBindings(Vec<Binding>);
+pub struct PlayerBindings(Vec<Declared>);
 
 /// Say what a plugin's bindings are, so the legend can name them.
 ///
 /// Call it from `build`, mapping the same table the plugin's systems read. The resource is
 /// created by whoever declares first, so this does not depend on the order plugins are added.
 pub trait DeclareBindings {
-    /// Add these bindings to what the legend draws.
-    fn declare_bindings(&mut self, bindings: impl IntoIterator<Item = Binding>) -> &mut Self;
+    /// Add these bindings, as commands that answer wherever the player is standing.
+    fn declare_bindings(&mut self, bindings: impl IntoIterator<Item = Binding>) -> &mut Self {
+        self.declare_bindings_when(BindingCondition::Always, bindings)
+    }
+
+    /// Add these bindings, as commands that answer only while `condition` holds.
+    fn declare_bindings_when(
+        &mut self,
+        condition: BindingCondition,
+        bindings: impl IntoIterator<Item = Binding>,
+    ) -> &mut Self;
 }
 
 impl DeclareBindings for App {
-    fn declare_bindings(&mut self, bindings: impl IntoIterator<Item = Binding>) -> &mut Self {
+    fn declare_bindings_when(
+        &mut self,
+        condition: BindingCondition,
+        bindings: impl IntoIterator<Item = Binding>,
+    ) -> &mut Self {
         self.init_resource::<PlayerBindings>();
-        self.world_mut()
-            .resource_mut::<PlayerBindings>()
-            .0
-            .extend(bindings);
+        self.world_mut().resource_mut::<PlayerBindings>().0.extend(
+            bindings
+                .into_iter()
+                .map(|binding| Declared { binding, condition }),
+        );
         self
     }
 }
@@ -136,17 +184,9 @@ impl Plugin for LegendPlugin {
                 action: "Show or hide this legend",
                 category: BindingCategory::Panels,
             }])
+            .init_resource::<Situation>()
             .add_systems(Startup, open_the_legend)
-            .add_systems(
-                Update,
-                (
-                    toggle_the_legend,
-                    redraw_the_legend.run_if(
-                        resource_exists_and_changed::<State<PlayerAction>>
-                            .or_else(resource_exists_and_changed::<ChosenBuildingType>),
-                    ),
-                ),
-            );
+            .add_systems(Update, (toggle_the_legend, redraw_the_legend).chain());
     }
 }
 
@@ -157,107 +197,203 @@ struct Legend;
 #[derive(Clone, Copy, PartialEq)]
 struct ShowTheLegend;
 
+/// Where the player is standing, which is what says which commands answer them there.
+#[derive(Resource, Default, Clone, Copy, PartialEq)]
+struct Situation {
+    held: Option<PlayerAction>,
+    placing: Option<BuildingType>,
+    picked: Option<PickedOut>,
+    panels: u8,
+}
+
+/// The world a situation is read out of, none of which a test app has to carry.
+#[derive(SystemParam)]
+struct Standing<'w, 's> {
+    held: Option<Res<'w, State<PlayerAction>>>,
+    chosen: Option<Res<'w, ChosenBuildingType>>,
+    selection: Option<Res<'w, Selection>>,
+    ports: Query<'w, 's, &'static Port>,
+    panels: Query<'w, 's, &'static Panel>,
+}
+
+impl Standing<'_, '_> {
+    fn read(&self) -> Situation {
+        let held = self.held.as_deref().map(|state| *state.get());
+        Situation {
+            held,
+            placing: self.placing(held),
+            picked: self.picked(),
+            panels: self
+                .panels
+                .iter()
+                .fold(0, |on_screen, panel| on_screen | panel_bit(*panel)),
+        }
+    }
+
+    fn placing(&self, held: Option<PlayerAction>) -> Option<BuildingType> {
+        if held != Some(PlayerAction::EditBuildings) {
+            return None;
+        }
+        self.chosen.as_deref().map(|chosen| chosen.chosen())
+    }
+
+    fn picked(&self) -> Option<PickedOut> {
+        let selection = self.selection.as_deref()?;
+        if selection.junction().is_some() {
+            return Some(PickedOut::Junction);
+        }
+        let port = self.ports.get(selection.port()?).ok()?;
+        Some(PickedOut::Port(port.flow))
+    }
+}
+
+fn panel_bit(panel: Panel) -> u8 {
+    match panel {
+        Panel::Legend => 1,
+        Panel::Settings => 2,
+        Panel::Building => 4,
+    }
+}
+
+impl Situation {
+    fn holds(&self, condition: BindingCondition) -> bool {
+        match condition {
+            BindingCondition::Always => true,
+            BindingCondition::PanelOpen(panel) => self.panels & panel_bit(panel) != 0,
+            BindingCondition::PickedOut(picked) => self.picked == Some(picked),
+        }
+    }
+
+    /// Whether the player's situation reaches `category`, which is what opens it on the panel.
+    ///
+    /// A tool's own is reached while that tool is held. Any other is reached while something
+    /// under it is live for a reason other than always, which a category of unconditional
+    /// commands never is: it offers the same thing wherever the player stands, so opening it
+    /// every time tells them nothing they could not have read once. `Tools` is the exception,
+    /// being how they reach all the rest.
+    fn reaches(&self, category: BindingCategory, shown: &[&Declared]) -> bool {
+        if shown.is_empty() {
+            return false;
+        }
+        match category {
+            BindingCategory::Tools => true,
+            BindingCategory::Tool(tool) => self.held == Some(tool),
+            _ => shown
+                .iter()
+                .any(|it| it.condition != BindingCondition::Always),
+        }
+    }
+}
+
 fn open_the_legend(
     mut commands: Commands,
     bindings: Res<PlayerBindings>,
-    held: Option<Res<State<PlayerAction>>>,
-    chosen: Option<Res<ChosenBuildingType>>,
+    standing: Standing,
+    mut drawn: ResMut<Situation>,
 ) {
-    let held = held_tool(held.as_deref());
-    spawn_legend(
-        &mut commands,
-        &bindings,
-        held,
-        placing(chosen.as_deref(), held),
-    );
+    *drawn = standing.read();
+    spawn_legend(&mut commands, &bindings, &drawn);
 }
 
 fn toggle_the_legend(
     mut commands: Commands,
     asked_for: Res<Requested<ShowTheLegend>>,
     bindings: Res<PlayerBindings>,
-    held: Option<Res<State<PlayerAction>>>,
-    chosen: Option<Res<ChosenBuildingType>>,
+    standing: Standing,
+    mut drawn: ResMut<Situation>,
     legend_q: Query<Entity, With<Legend>>,
 ) {
     if !asked_for.asked(ShowTheLegend) {
         return;
     }
 
-    let held = held_tool(held.as_deref());
     match legend_q.iter().next() {
         Some(legend) => {
             commands.entity(legend).despawn();
         }
-        None => spawn_legend(
-            &mut commands,
-            &bindings,
-            held,
-            placing(chosen.as_deref(), held),
-        ),
+        None => {
+            *drawn = standing.read();
+            spawn_legend(&mut commands, &bindings, &drawn);
+        }
     }
 }
 
-/// Rewrite the legend when the player picks up another tool or chooses another thing to build.
+/// Rewrite the legend when the player's situation changes under it.
 ///
 /// The panel keeps its entity, and only its rows are built again, so a legend already on screen
-/// stays the one on screen rather than blinking out and back.
+/// stays the one on screen rather than blinking out and back. The situation is read every frame
+/// and compared with the one drawn, rather than watched for a change: four separate facts make
+/// it up, and a panel coming on screen is a change to none of them.
 fn redraw_the_legend(
     mut commands: Commands,
     bindings: Res<PlayerBindings>,
-    held: Option<Res<State<PlayerAction>>>,
-    chosen: Option<Res<ChosenBuildingType>>,
+    standing: Standing,
+    mut drawn: ResMut<Situation>,
     legend_q: Query<Entity, With<Legend>>,
 ) {
-    let held = held_tool(held.as_deref());
-    let placing = placing(chosen.as_deref(), held);
+    let now = standing.read();
+    if now == *drawn {
+        return;
+    }
+
+    *drawn = now;
     for legend in &legend_q {
         commands
             .entity(legend)
             .despawn_related::<Children>()
-            .with_children(|panel| fill_the_panel(panel, &bindings, held, placing.as_deref()));
+            .with_children(|panel| fill_the_panel(panel, &bindings, &now));
     }
 }
 
-fn held_tool(held: Option<&State<PlayerAction>>) -> Option<PlayerAction> {
-    held.map(|state| *state.get())
-}
-
-fn placing(chosen: Option<&ChosenBuildingType>, held: Option<PlayerAction>) -> Option<String> {
-    if held != Some(PlayerAction::EditBuildings) {
-        return None;
-    }
-    chosen.map(|chosen| chosen.chosen().label())
-}
-
-fn spawn_legend(
-    commands: &mut Commands,
-    bindings: &PlayerBindings,
-    held: Option<PlayerAction>,
-    placing: Option<String>,
-) {
+fn spawn_legend(commands: &mut Commands, bindings: &PlayerBindings, situation: &Situation) {
     commands
-        .spawn((Legend, panel(PanelCorner::TopLeft, Val::Px(PANEL_WIDTH))))
-        .with_children(|panel| fill_the_panel(panel, bindings, held, placing.as_deref()));
+        .spawn((
+            Legend,
+            panel(Panel::Legend, PanelCorner::TopLeft, Val::Px(PANEL_WIDTH)),
+        ))
+        .with_children(|panel| fill_the_panel(panel, bindings, situation));
 }
 
-/// Lay the declared bindings out, the ones on offer whatever is held first and a tool's own after.
+/// Lay the categories out, opening the ones the situation reaches and counting what is under the
+/// rest, so a command the player cannot reach from here is named but does not take a row.
 fn fill_the_panel(
     panel: &mut ChildSpawnerCommands,
     bindings: &PlayerBindings,
-    held: Option<PlayerAction>,
-    placing: Option<&str>,
+    situation: &Situation,
 ) {
     for (place, category) in categories_declared(bindings).into_iter().enumerate() {
-        panel.spawn(heading_row(heading(category, held, placing), place));
-        for binding in bindings.0.iter().filter(|it| it.category == category) {
+        let under: Vec<&Declared> = bindings
+            .0
+            .iter()
+            .filter(|it| it.binding.category == category)
+            .collect();
+        let shown: Vec<&Declared> = under
+            .iter()
+            .copied()
+            .filter(|it| situation.holds(it.condition))
+            .collect();
+
+        if !situation.reaches(category, &shown) {
+            panel.spawn(heading_row(
+                heading(category, situation, Some(under.len())),
+                place,
+            ));
+            continue;
+        }
+
+        panel.spawn(heading_row(heading(category, situation, None), place));
+        for declared in shown {
             panel.spawn(panel_row()).with_children(|row| {
                 row.spawn(panel_text(
-                    input_label(binding.input),
+                    input_label(declared.binding.input),
                     KEYED_TEXT,
                     Val::Px(KEY_COLUMN_WIDTH),
                 ));
-                row.spawn(panel_text(binding.action.to_string(), BODY_TEXT, Val::Auto));
+                row.spawn(panel_text(
+                    declared.binding.action.to_string(),
+                    BODY_TEXT,
+                    Val::Auto,
+                ));
             });
         }
     }
@@ -278,23 +414,25 @@ fn heading_row(heading: String, place: usize) -> impl Bundle {
 fn categories_declared(bindings: &PlayerBindings) -> Vec<BindingCategory> {
     CATEGORIES
         .into_iter()
-        .filter(|category| bindings.0.iter().any(|it| it.category == *category))
+        .filter(|category| bindings.0.iter().any(|it| it.binding.category == *category))
         .collect()
 }
 
-/// What the rows beneath it are for, and what the held tool is set to place.
+/// What the rows beneath it are for, and, while it is `closed`, how many it is holding back.
 ///
-/// A tool that places whatever it last placed, with no way to see which that is, is one the
-/// player builds by trial and error, so the heading of the held tool names the choice it carries.
-fn heading(category: BindingCategory, held: Option<PlayerAction>, placing: Option<&str>) -> String {
-    match (category, placing) {
-        (BindingCategory::Tool(tool), Some(placing)) if held == Some(tool) => {
-            format!("{} (held) — {placing}", tool.label())
-        }
-        (BindingCategory::Tool(tool), _) if held == Some(tool) => {
-            format!("{} (held)", tool.label())
-        }
-        _ => category.label(),
+/// A tool that places whatever it last placed, with no way to see which that is, is one the player
+/// builds by trial and error, so the heading of the held tool names the choice it carries. It says
+/// it is the one in hand whether it is open or closed, this being the only place the panel says
+/// which tool the player is holding.
+fn heading(category: BindingCategory, situation: &Situation, closed: Option<usize>) -> String {
+    let label = category.label();
+    let held = matches!(category, BindingCategory::Tool(tool) if situation.held == Some(tool));
+    match (held, closed, situation.placing) {
+        (false, None, _) => label,
+        (false, Some(under), _) => format!("{label} ({under})"),
+        (true, Some(under), _) => format!("{label} (held, {under})"),
+        (true, None, Some(placing)) => format!("{label} (held) — {}", placing.label()),
+        (true, None, None) => format!("{label} (held)"),
     }
 }
 
@@ -355,8 +493,14 @@ fn mouse_label(button: MouseButton) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::building::{Item, Port};
     use crate::input::TURN_KEY;
     use crate::testing::{ask_for, headless_app, press_key, release_key, tick};
+    use crate::ui::selection::Selection;
+
+    /// How many lines the legend drew before it was grouped, which the issue asks it to beat by
+    /// a factor of three: 36 commands under four headings.
+    const LINES_BEFORE_GROUPING: usize = 40;
 
     fn legend_app() -> App {
         let mut app = headless_app();
@@ -399,6 +543,14 @@ mod tests {
 
     fn shown_legend(app: &mut App) -> String {
         legend_lines(app).join("\n")
+    }
+
+    /// How many lines the panel draws, each of its children being a heading or a row.
+    fn legend_line_count(app: &mut App) -> usize {
+        let panel = legend_panel(app);
+        app.world()
+            .get::<Children>(panel)
+            .map_or(0, |children| children.len())
     }
 
     fn declare(app: &mut App, bindings: impl IntoIterator<Item = Binding>) {
@@ -464,7 +616,7 @@ mod tests {
             input: BindingInput::Key(KeyCode::KeyQ),
             asks: ShowTheLegend,
             action: "Refuel the rover",
-            context: BindingContext::Always,
+            category: BindingCategory::Tools,
         }]);
         tick(&mut app);
         show_a_legend(&mut app);
@@ -529,11 +681,11 @@ mod tests {
 
     #[test]
     fn a_binding_is_listed_under_the_tool_that_holds_it() {
-        let mut app = legend_app();
+        let mut app = legend_app_holding(PlayerAction::EditRoads);
         declare(
             &mut app,
             [Binding {
-                input: BindingInput::Mouse(MouseButton::Left),
+                input: BindingInput::Mouse(MouseButton::Right),
                 action: "Place a road node",
                 category: BindingCategory::Tool(PlayerAction::EditRoads),
             }],
@@ -626,8 +778,8 @@ mod tests {
         assert!(!legend.contains(&before), "{legend}");
     }
 
-    #[test]
-    fn no_two_bindings_claim_the_same_input_in_the_same_context() {
+    /// Every plugin that declares a command, which is the whole legend as a player meets it.
+    fn every_plugin_that_declares_a_binding() -> App {
         let mut app = headless_app();
         app.add_plugins(bevy::diagnostic::DiagnosticsPlugin)
             .add_plugins(LegendPlugin)
@@ -642,10 +794,17 @@ mod tests {
             .add_plugins(crate::fleet::FleetPlugin)
             .add_plugins(crate::building::BuildingPlugin)
             .add_plugins(crate::ui::settings_panel::SettingsPanelPlugin);
+        app
+    }
+
+    #[test]
+    fn no_two_bindings_claim_the_same_input_in_the_same_category() {
+        let app = every_plugin_that_declares_a_binding();
 
         let bindings = app.world().resource::<PlayerBindings>();
         let mut claimed: Vec<(BindingInput, BindingCategory)> = Vec::new();
-        for binding in &bindings.0 {
+        for declared in &bindings.0 {
+            let binding = &declared.binding;
             let claim = (binding.input, binding.category);
             assert!(
                 !claimed.contains(&claim),
@@ -750,5 +909,288 @@ mod tests {
         assert_eq!(legend_panel(&mut app), panel);
         let legend = shown_legend(&mut app);
         assert!(legend.contains("(held)"), "{legend}");
+    }
+
+    /// A legend over a game holding `tool`, which is what opens a tool's own category.
+    fn legend_app_holding(tool: PlayerAction) -> App {
+        let mut app = headless_app();
+        app.insert_state(tool).add_plugins(LegendPlugin);
+        app
+    }
+
+    fn declare_when(
+        app: &mut App,
+        condition: BindingCondition,
+        bindings: impl IntoIterator<Item = Binding>,
+    ) {
+        app.declare_bindings_when(condition, bindings);
+    }
+
+    #[test]
+    fn holding_a_tool_opens_its_category() {
+        let mut app = legend_app_holding(PlayerAction::EditRoads);
+        declare(
+            &mut app,
+            [Binding {
+                input: BindingInput::Mouse(MouseButton::Right),
+                action: "Finish the road",
+                category: BindingCategory::Tool(PlayerAction::EditRoads),
+            }],
+        );
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        let lines = legend_lines(&mut app);
+
+        assert!(
+            lines.iter().any(|line| line == "Road tool (held)"),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line == "Finish the road"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_category_of_a_tool_that_is_not_held_is_a_heading_with_its_count() {
+        let mut app = legend_app_holding(PlayerAction::Select);
+        declare(
+            &mut app,
+            [
+                Binding {
+                    input: BindingInput::Key(KeyCode::KeyQ),
+                    action: "Choose the type before this one",
+                    category: BindingCategory::Tool(PlayerAction::EditBuildings),
+                },
+                Binding {
+                    input: BindingInput::Key(KeyCode::KeyE),
+                    action: "Choose the type after this one",
+                    category: BindingCategory::Tool(PlayerAction::EditBuildings),
+                },
+            ],
+        );
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        let lines = legend_lines(&mut app);
+
+        assert!(
+            lines.iter().any(|line| line == "Building tool (2)"),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with("Choose the type")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_tools_category_is_open_whatever_the_player_holds() {
+        let mut app = legend_app_holding(PlayerAction::EditRoads);
+        declare(
+            &mut app,
+            [Binding {
+                input: BindingInput::Key(KeyCode::Digit3),
+                action: "Building tool",
+                category: BindingCategory::Tools,
+            }],
+        );
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        let lines = legend_lines(&mut app);
+
+        assert!(lines.iter().any(|line| line == "Tools"), "{lines:?}");
+        assert!(
+            lines.iter().any(|line| line == "Building tool"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_category_with_nothing_to_show_is_a_heading_even_while_its_tool_is_held() {
+        let mut app = picking_legend_app();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        let lines = legend_lines(&mut app);
+
+        assert!(
+            lines.iter().any(|line| line == "Select tool (held, 2)"),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with("Take a rover")),
+            "{lines:?}"
+        );
+    }
+
+    /// A legend over a game holding the select tool, carrying the two commands a pick unlocks.
+    fn picking_legend_app() -> App {
+        let mut app = legend_app_holding(PlayerAction::Select);
+        app.init_resource::<Selection>();
+        declare_when(
+            &mut app,
+            BindingCondition::PickedOut(PickedOut::Port(Flow::Intake)),
+            [Binding {
+                input: BindingInput::Key(KeyCode::BracketLeft),
+                action: "Take a rover off the port you picked out",
+                category: BindingCategory::Tool(PlayerAction::Select),
+            }],
+        );
+        declare_when(
+            &mut app,
+            BindingCondition::PickedOut(PickedOut::Junction),
+            [Binding {
+                input: BindingInput::Key(KeyCode::KeyG),
+                action: "Signal the junction you picked out",
+                category: BindingCategory::Tool(PlayerAction::Select),
+            }],
+        );
+        app
+    }
+
+    fn pick_out_a_port(app: &mut App, flow: Flow) {
+        let building = app.world_mut().spawn_empty().id();
+        let port = app
+            .world_mut()
+            .spawn(Port {
+                flow,
+                item: Item::Water,
+            })
+            .id();
+        app.world_mut()
+            .insert_resource(Selection::of_a_port(building, port));
+    }
+
+    fn pick_out_a_junction(app: &mut App) {
+        let junction = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .insert_resource(Selection::of_a_junction(junction));
+    }
+
+    #[test]
+    fn the_port_keys_are_shown_when_an_intake_is_picked_out() {
+        let mut app = picking_legend_app();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        pick_out_a_port(&mut app, Flow::Intake);
+        tick(&mut app);
+
+        let legend = shown_legend(&mut app);
+
+        assert!(legend.contains("Take a rover off the port"), "{legend}");
+    }
+
+    #[test]
+    fn the_port_keys_are_hidden_when_an_outlet_is_picked_out() {
+        let mut app = picking_legend_app();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        pick_out_a_port(&mut app, Flow::Outlet);
+        tick(&mut app);
+
+        let legend = shown_legend(&mut app);
+
+        assert!(!legend.contains("Take a rover off the port"), "{legend}");
+    }
+
+    #[test]
+    fn the_port_keys_are_hidden_when_a_junction_is_picked_out() {
+        let mut app = picking_legend_app();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        pick_out_a_junction(&mut app);
+        tick(&mut app);
+
+        let legend = shown_legend(&mut app);
+
+        assert!(legend.contains("Signal the junction"), "{legend}");
+        assert!(!legend.contains("Take a rover off the port"), "{legend}");
+    }
+
+    #[test]
+    fn the_port_keys_are_hidden_when_nothing_is_picked_out() {
+        let mut app = picking_legend_app();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        let legend = shown_legend(&mut app);
+
+        assert!(!legend.contains("Take a rover off the port"), "{legend}");
+        assert!(!legend.contains("Signal the junction"), "{legend}");
+    }
+
+    /// A legend beside the real settings panel, which four of its five keys answer to.
+    fn legend_beside_the_settings_panel() -> App {
+        let mut app = legend_app_holding(PlayerAction::Select);
+        app.add_plugins(crate::ui::settings_panel::SettingsPanelPlugin);
+        app
+    }
+
+    /// Put the settings panel on screen by pressing the key it is declared on.
+    fn open_the_settings_panel(app: &mut App) {
+        press_key(app, KeyCode::F2);
+        tick(app);
+        release_key(app, KeyCode::F2);
+        tick(app);
+    }
+
+    #[test]
+    fn the_settings_keys_are_hidden_while_that_panel_is_closed() {
+        let mut app = legend_beside_the_settings_panel();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        let legend = shown_legend(&mut app);
+
+        assert!(!legend.contains("Pick the setting below"), "{legend}");
+        assert!(legend.contains("Panels (6)"), "{legend}");
+    }
+
+    #[test]
+    fn the_settings_keys_are_shown_while_that_panel_is_open() {
+        let mut app = legend_beside_the_settings_panel();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        open_the_settings_panel(&mut app);
+
+        let legend = shown_legend(&mut app);
+
+        assert!(legend.contains("Pick the setting below"), "{legend}");
+        assert!(legend.contains("Show or hide this legend"), "{legend}");
+    }
+
+    #[test]
+    fn the_panel_is_under_a_third_of_the_lines_it_drew_before() {
+        let mut app = every_plugin_that_declares_a_binding();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        let drawn = legend_line_count(&mut app);
+
+        assert!(
+            drawn < LINES_BEFORE_GROUPING / 3,
+            "{drawn} lines: {:?}",
+            legend_lines(&mut app)
+        );
+    }
+
+    #[test]
+    fn the_main_action_is_never_a_row() {
+        let app = every_plugin_that_declares_a_binding();
+
+        for declared in &app.world().resource::<PlayerBindings>().0 {
+            assert!(
+                declared.binding.input != BindingInput::Mouse(MouseButton::Left),
+                "{} is on the left button, which is the main action wherever the player is",
+                declared.binding.action
+            );
+        }
     }
 }

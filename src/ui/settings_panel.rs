@@ -13,8 +13,10 @@
 
 use crate::camera::CameraSensitivity;
 use crate::input::{DeclareCommands, PlayerCommand, Requested};
-use crate::ui::legend::{BindingCategory, BindingInput};
-use crate::ui::{panel, panel_row, panel_text, PanelCorner, BODY_TEXT, HEADING_TEXT, KEYED_TEXT};
+use crate::ui::legend::{BindingCategory, BindingCondition, BindingInput};
+use crate::ui::{
+    panel, panel_row, panel_text, Panel, PanelCorner, BODY_TEXT, HEADING_TEXT, KEYED_TEXT,
+};
 use bevy::prelude::*;
 use std::ops::Range;
 
@@ -149,18 +151,24 @@ impl Plugin for SettingsPanelPlugin {
                 action: "Show or hide the camera settings",
                 category: BindingCategory::Panels,
             }])
-            .declare_commands(PICK_KEYS.map(|(key, asks, action)| PlayerCommand {
-                input: BindingInput::Key(key),
-                asks,
-                action,
-                category: BindingCategory::Panels,
-            }))
-            .declare_commands(ADJUST_KEYS.map(|(key, asks, action)| PlayerCommand {
-                input: BindingInput::Key(key),
-                asks,
-                action,
-                category: BindingCategory::Panels,
-            }))
+            .declare_commands_when(
+                BindingCondition::PanelOpen(Panel::Settings),
+                PICK_KEYS.map(|(key, asks, action)| PlayerCommand {
+                    input: BindingInput::Key(key),
+                    asks,
+                    action,
+                    category: BindingCategory::Panels,
+                }),
+            )
+            .declare_commands_when(
+                BindingCondition::PanelOpen(Panel::Settings),
+                ADJUST_KEYS.map(|(key, asks, action)| PlayerCommand {
+                    input: BindingInput::Key(key),
+                    asks,
+                    action,
+                    category: BindingCategory::Panels,
+                }),
+            )
             .add_systems(
                 Update,
                 (
@@ -257,7 +265,7 @@ fn spawn_the_panel(commands: &mut Commands, sensitivity: &CameraSensitivity, pic
     commands
         .spawn((
             SettingsPanel,
-            panel(PanelCorner::TopRight, Val::Px(PANEL_WIDTH)),
+            panel(Panel::Settings, PanelCorner::TopRight, Val::Px(PANEL_WIDTH)),
         ))
         .with_children(|panel| fill_the_panel(panel, sensitivity, picked));
 }

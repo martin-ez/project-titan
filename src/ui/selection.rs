@@ -18,7 +18,6 @@ use crate::building::{BuildingTiles, BuildingType, Port};
 use crate::input::{PlayerAction, PlayerInput};
 use crate::map::{HexCoordinates, LatticeNode, MapTile};
 use crate::road::{Junction, RoadEndpoint};
-use crate::ui::legend::{Binding, BindingCategory, BindingInput, DeclareBindings};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
@@ -70,6 +69,27 @@ impl Selection {
     /// The junction picked out, or nothing while the player picked something off the road.
     pub fn junction(&self) -> Option<Entity> {
         self.junction
+    }
+}
+
+#[cfg(test)]
+impl Selection {
+    /// A selection standing on `port` and the `building` it is a door of.
+    pub fn of_a_port(building: Entity, port: Entity) -> Self {
+        Self {
+            building: Some(building),
+            port: Some(port),
+            junction: None,
+        }
+    }
+
+    /// A selection standing on `junction`.
+    pub fn of_a_junction(junction: Entity) -> Self {
+        Self {
+            building: None,
+            port: None,
+            junction: Some(junction),
+        }
     }
 }
 
@@ -130,11 +150,6 @@ impl PointedAt<'_, '_> {
 impl Plugin for SelectionPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Selection>()
-            .declare_bindings([Binding {
-                input: BindingInput::Mouse(MouseButton::Left),
-                action: "Pick out the junction, building or port under the cursor",
-                category: BindingCategory::Tool(PlayerAction::Select),
-            }])
             .add_systems(
                 Update,
                 (

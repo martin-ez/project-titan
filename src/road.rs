@@ -2,10 +2,14 @@ use crate::building::BuildingTiles;
 use crate::common::cleanup::{Destroy, DestroyOnStateChange};
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use crate::diagnostics::DebugGizmos;
-use crate::input::{DeclareCommands, PlayerAction, PlayerCommand, PlayerInput, Requested};
+use crate::input::{
+    DeclareCommands, PlayerAction, PlayerCommand, PlayerInput, Requested, FINISH_KEY,
+};
 use crate::map::{HexCoordinates, LatticeNode, MapTile, MAP_TILE_INRADIUS, MAP_TILE_SIZE};
 use crate::simulation::Ticks;
-use crate::ui::legend::{Binding, BindingCategory, BindingInput, DeclareBindings};
+use crate::ui::legend::{
+    Binding, BindingCategory, BindingCondition, BindingInput, DeclareBindings, PickedOut,
+};
 use crate::ui::selection::{Picked, Selection};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -815,13 +819,13 @@ impl Plugin for RoadPlugin {
         app.init_resource::<RoadTiles>()
             .declare_bindings([
                 Binding {
-                    input: BindingInput::Mouse(MouseButton::Left),
-                    action: "Place a road node, or finish on a road already there",
+                    input: BindingInput::Mouse(MouseButton::Right),
+                    action: "Finish the road, or take off the arc under the cursor",
                     category: BindingCategory::Tool(PlayerAction::EditRoads),
                 },
                 Binding {
-                    input: BindingInput::Mouse(MouseButton::Right),
-                    action: "Finish the road, or take off the arc under the cursor",
+                    input: BindingInput::Key(FINISH_KEY),
+                    action: "Finish the road you are laying",
                     category: BindingCategory::Tool(PlayerAction::EditRoads),
                 },
             ])
@@ -1761,18 +1765,24 @@ fn cut_the_roads_where_they_cross(
 
 impl Plugin for JunctionSignalPlugin {
     fn build(&self, app: &mut App) {
-        app.declare_commands([PlayerCommand {
-            input: BindingInput::Key(SIGNAL_KEY),
-            asks: SignalTheJunction,
-            action: "Signal the junction you picked out, road by road",
-            category: BindingCategory::Tool(PlayerAction::Select),
-        }])
-        .declare_commands(GREEN_KEYS.map(|(key, asks, action)| PlayerCommand {
-            input: BindingInput::Key(key),
-            asks,
-            action,
-            category: BindingCategory::Tool(PlayerAction::Select),
-        }))
+        app.declare_commands_when(
+            BindingCondition::PickedOut(PickedOut::Junction),
+            [PlayerCommand {
+                input: BindingInput::Key(SIGNAL_KEY),
+                asks: SignalTheJunction,
+                action: "Signal the junction you picked out, road by road",
+                category: BindingCategory::Tool(PlayerAction::Select),
+            }],
+        )
+        .declare_commands_when(
+            BindingCondition::PickedOut(PickedOut::Junction),
+            GREEN_KEYS.map(|(key, asks, action)| PlayerCommand {
+                input: BindingInput::Key(key),
+                asks,
+                action,
+                category: BindingCategory::Tool(PlayerAction::Select),
+            }),
+        )
         .add_systems(
             Update,
             (

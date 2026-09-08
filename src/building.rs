@@ -606,18 +606,11 @@ impl Plugin for BuildingPlugin {
         app.init_resource::<BuildingTiles>()
             .init_resource::<ChosenBuildingType>()
             .init_resource::<PlacementFacing>()
-            .declare_bindings([
-                Binding {
-                    input: BindingInput::Mouse(MouseButton::Left),
-                    action: "Put a building on the tile",
-                    category: BindingCategory::Tool(PlayerAction::EditBuildings),
-                },
-                Binding {
-                    input: BindingInput::Mouse(MouseButton::Right),
-                    action: "Take the building off the tile",
-                    category: BindingCategory::Tool(PlayerAction::EditBuildings),
-                },
-            ])
+            .declare_bindings([Binding {
+                input: BindingInput::Mouse(MouseButton::Right),
+                action: "Take the building off the tile",
+                category: BindingCategory::Tool(PlayerAction::EditBuildings),
+            }])
             .declare_commands(CHOOSE_KEYS.map(|(key, asks, action)| PlayerCommand {
                 input: BindingInput::Key(key),
                 asks,

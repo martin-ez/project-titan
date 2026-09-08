@@ -16,7 +16,9 @@ use crate::building::{BuildingType, Flow, Port};
 use crate::fleet::{Fleet, Refused, RoverPool};
 use crate::production::{Running, Stopped, WaitingOn};
 use crate::ui::selection::{Picked, Selection};
-use crate::ui::{panel, panel_row, panel_text, PanelCorner, BODY_TEXT, HEADING_TEXT, KEYED_TEXT};
+use crate::ui::{
+    panel, panel_row, panel_text, Panel, PanelCorner, BODY_TEXT, HEADING_TEXT, KEYED_TEXT,
+};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
@@ -132,7 +134,11 @@ fn redraw_the_panel(
             commands
                 .spawn((
                     BuildingPanel,
-                    panel(PanelCorner::BottomRight, Val::Px(PANEL_WIDTH)),
+                    panel(
+                        Panel::Building,
+                        PanelCorner::BottomRight,
+                        Val::Px(PANEL_WIDTH),
+                    ),
                 ))
                 .with_children(|panel| fill_the_panel(panel, &reading));
         }

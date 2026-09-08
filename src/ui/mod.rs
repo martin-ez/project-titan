@@ -40,6 +40,21 @@ pub const KEYED_TEXT: Color = Color::srgb(0.98, 0.90, 0.66);
 /// The colour the body of a row is written in
 pub const BODY_TEXT: Color = Color::srgb(0.86, 0.87, 0.90);
 
+/// Which panel this is, carried by the panel while it is on screen.
+///
+/// A binding that only answers while its panel is up says which one it belongs to, and the legend
+/// answers that by looking for the panel rather than by being told a panel opened. One list of
+/// what is on screen, kept by the panels themselves, cannot fall out of step with a second.
+#[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Panel {
+    /// The legend of commands.
+    Legend,
+    /// The camera settings the player edits.
+    Settings,
+    /// The reading of whatever the player picked out.
+    Building,
+}
+
 /// The corner of the screen a panel is pinned to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PanelCorner {
@@ -51,8 +66,8 @@ pub enum PanelCorner {
     BottomRight,
 }
 
-/// The frame a panel is drawn in: pinned to `corner`, `width` wide, stacking its rows downward.
-pub fn panel(corner: PanelCorner, width: Val) -> impl Bundle {
+/// The frame `which` panel is drawn in: pinned to `corner`, `width` wide, stacking rows downward.
+pub fn panel(which: Panel, corner: PanelCorner, width: Val) -> impl Bundle {
     let inset = Val::Px(PANEL_INSET);
     let (top, bottom, left, right) = match corner {
         PanelCorner::TopLeft => (inset, Val::Auto, inset, Val::Auto),
@@ -60,6 +75,7 @@ pub fn panel(corner: PanelCorner, width: Val) -> impl Bundle {
         PanelCorner::BottomRight => (Val::Auto, inset, Val::Auto, inset),
     };
     (
+        which,
         Node {
             position_type: PositionType::Absolute,
             top,
