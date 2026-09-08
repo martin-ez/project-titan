@@ -13,7 +13,9 @@ use crate::common::cleanup::Destroy;
 use crate::common::cursor::CursorSurface;
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use crate::diagnostics::DebugGizmos;
-use crate::input::{PlayerAction, PlayerInput, TURN_KEY};
+use crate::input::{
+    DeclareCommands, PlayerAction, PlayerCommand, PlayerInput, Requested, TURN_KEY,
+};
 use crate::map::{
     Deposit, HexCoordinates, LatticeNode, MapTile, RawMaterial, TileCorner, MAP_TILE_INRADIUS,
     MAP_TILE_SIZE,
@@ -99,8 +101,23 @@ const _: () = {
     }
 };
 
-/// The keys that step through the catalogue, and how far each steps through it.
-const CHOOSE_KEYS: [(KeyCode, isize); 2] = [(KeyCode::KeyQ, -1), (KeyCode::KeyE, 1)];
+/// The keys that step through the catalogue, how far each steps, and what to call that
+const CHOOSE_KEYS: [(KeyCode, CatalogueStep, &str); 2] = [
+    (
+        KeyCode::KeyQ,
+        CatalogueStep(-1),
+        "Choose the type before this one",
+    ),
+    (
+        KeyCode::KeyE,
+        CatalogueStep(1),
+        "Choose the type after this one",
+    ),
+];
+
+/// How far through the catalogue the player asked the building tool to move, and which way.
+#[derive(Clone, Copy, PartialEq)]
+struct CatalogueStep(isize);
 
 pub struct BuildingPlugin;
 
@@ -600,22 +617,18 @@ impl Plugin for BuildingPlugin {
                     action: "Take the building off the tile",
                     context: BindingContext::Tool(PlayerAction::EditBuildings),
                 },
-                Binding {
-                    input: BindingInput::Key(CHOOSE_KEYS[0].0),
-                    action: "Choose the type before this one",
-                    context: BindingContext::Tool(PlayerAction::EditBuildings),
-                },
-                Binding {
-                    input: BindingInput::Key(CHOOSE_KEYS[1].0),
-                    action: "Choose the type after this one",
-                    context: BindingContext::Tool(PlayerAction::EditBuildings),
-                },
-                Binding {
-                    input: BindingInput::Key(TURN_KEY),
-                    action: "Turn the building you are about to place",
-                    context: BindingContext::Tool(PlayerAction::EditBuildings),
-                },
             ])
+            .declare_commands(CHOOSE_KEYS.map(|(key, asks, action)| PlayerCommand {
+                input: BindingInput::Key(key),
+                asks,
+                action,
+                context: BindingContext::Tool(PlayerAction::EditBuildings),
+            }))
+            .declare_bindings([Binding {
+                input: BindingInput::Key(TURN_KEY),
+                action: "Turn the building you are about to place",
+                context: BindingContext::Tool(PlayerAction::EditBuildings),
+            }])
             .add_observer(release_the_tile_of_a_removed_building)
             .add_systems(
                 PreUpdate,
@@ -752,17 +765,15 @@ fn place_building_system(
 /// The choice is the tool's own record and nothing on the tick reads it, so it is settled on the
 /// frame the key was pressed, like every other thing the player holds (invariant 2).
 fn choose_building_type_system(
-    input: Res<ButtonInput<KeyCode>>,
+    asked_for: Res<Requested<CatalogueStep>>,
     action: Res<State<PlayerAction>>,
     mut chosen: ResMut<ChosenBuildingType>,
 ) {
     if *action.get() != PlayerAction::EditBuildings {
         return;
     }
-    for (key, by) in CHOOSE_KEYS {
-        if input.just_pressed(key) {
-            chosen.step(by);
-        }
+    for CatalogueStep(by) in asked_for.iter() {
+        chosen.step(by);
     }
 }
 
@@ -957,7 +968,7 @@ mod tests {
     use crate::road::{Road, RoadPlugin};
     use crate::rover::{Cargo, Route, Rover, RoverPlugin};
     use crate::simulation::SimulationPlugin;
-    use crate::testing::{headless_app, press_key, release_key, tick};
+    use crate::testing::{ask_for, headless_app, press_key, release_key, tick};
 
     /// A run of tiles whose nodes are neighbours, so the road takes those tiles and no others.
     const NEIGHBOURING: [(i32, i32); 3] = [(0, 0), (1, 0), (2, 0)];
@@ -2031,6 +2042,20 @@ mod tests {
         assert_eq!(
             app.world().resource::<ChosenBuildingType>().chosen(),
             BuildingType::ALL[BuildingType::ALL.len() - 1]
+        );
+    }
+
+    #[test]
+    fn the_catalogue_steps_for_a_command_nobody_pressed_a_key_for() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        choose(&mut app, BuildingType::ALL[0]);
+
+        ask_for(&mut app, CHOOSE_KEYS[1].1);
+        tick(&mut app);
+
+        assert_eq!(
+            app.world().resource::<ChosenBuildingType>().chosen(),
+            BuildingType::ALL[1]
         );
     }
 

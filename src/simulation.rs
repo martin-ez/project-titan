@@ -1,4 +1,5 @@
-use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
+use crate::input::{CommandsRead, DeclareCommands, PlayerCommand, Requested};
+use crate::ui::legend::{BindingContext, BindingInput};
 use bevy::diagnostic::{Diagnostic, DiagnosticPath, Diagnostics, RegisterDiagnostic};
 use bevy::input::InputSystems;
 use bevy::prelude::*;
@@ -68,14 +69,16 @@ impl Plugin for SimulationPlugin {
             .insert_resource(TimeWarp(NORMAL_WARP))
             .init_resource::<Ticks>()
             .init_resource::<TicksSinceMeasured>()
-            .declare_bindings([
-                Binding {
+            .declare_commands([
+                PlayerCommand {
                     input: BindingInput::Key(WARP_FASTER_KEY),
+                    asks: WarpStep::Faster,
                     action: "Run the world faster",
                     context: BindingContext::Always,
                 },
-                Binding {
+                PlayerCommand {
                     input: BindingInput::Key(WARP_SLOWER_KEY),
+                    asks: WarpStep::Slower,
                     action: "Run the world slower, down to stopped",
                     context: BindingContext::Always,
                 },
@@ -85,17 +88,27 @@ impl Plugin for SimulationPlugin {
             .add_systems(FixedUpdate, count_the_tick.before(Simulation))
             .add_systems(
                 PreUpdate,
-                (step_the_warp, apply_the_warp).chain().after(InputSystems),
+                (step_the_warp, apply_the_warp)
+                    .chain()
+                    .after(InputSystems)
+                    .after(CommandsRead),
             )
             .add_systems(Update, measure_the_tick_rate);
     }
 }
 
+/// Which way along `WARP_LADDER` the player asked the world to move.
+#[derive(Clone, Copy, PartialEq)]
+enum WarpStep {
+    Faster,
+    Slower,
+}
+
 /// Move the player up or down the ladder, which stops at both ends.
-fn step_the_warp(input: Res<ButtonInput<KeyCode>>, mut warp: ResMut<TimeWarp>) {
-    let stepped = if input.just_pressed(WARP_FASTER_KEY) {
+fn step_the_warp(asked_for: Res<Requested<WarpStep>>, mut warp: ResMut<TimeWarp>) {
+    let stepped = if asked_for.asked(WarpStep::Faster) {
         warp.0 + 1
-    } else if input.just_pressed(WARP_SLOWER_KEY) {
+    } else if asked_for.asked(WarpStep::Slower) {
         warp.0.saturating_sub(1)
     } else {
         return;
@@ -137,7 +150,7 @@ fn measure_the_tick_rate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{advance, headless_app, press_key, release_key};
+    use crate::testing::{advance, ask_for, headless_app, press_key, release_key};
     use bevy::diagnostic::DiagnosticsStore;
     use std::time::Duration;
 
@@ -272,6 +285,16 @@ mod tests {
         let mut app = simulation_app();
 
         press_warp(&mut app, WARP_FASTER_KEY, 1);
+
+        assert_eq!(ticks_over(&mut app, 64), 128);
+    }
+
+    #[test]
+    fn the_world_warps_up_for_a_command_nobody_pressed_a_key_for() {
+        let mut app = simulation_app();
+
+        ask_for(&mut app, WarpStep::Faster);
+        advance(&mut app, FRAME);
 
         assert_eq!(ticks_over(&mut app, 64), 128);
     }

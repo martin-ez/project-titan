@@ -108,6 +108,133 @@ pub struct PlayerInput {
     pub turn: bool,
 }
 
+/// The set the player's commands are read in, so a system on the frame can run after it.
+///
+/// Only a system in `PreUpdate` needs it. One reading a command in `Update` already runs after the
+/// whole of `PreUpdate`, and ordering across schedules says nothing that the schedules do not.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CommandsRead;
+
+/// One command a plugin owns, what the player presses to ask for it, and what that asks of it.
+///
+/// The legend names it from this same declaration, so a command cannot start working without
+/// saying what it is for.
+pub struct PlayerCommand<C> {
+    /// What the player presses to ask for it.
+    pub input: BindingInput,
+    /// What pressing it asks the plugin that owns it for.
+    pub asks: C,
+    /// What asking for it does, as the legend says it.
+    pub action: &'static str,
+    /// When asking for it does that.
+    pub context: BindingContext,
+}
+
+/// What the player asked for on this frame, among the commands of `C`.
+///
+/// A request is true for the frame it was made on and forgotten by the next, which is what lets a
+/// widget or a test ask for a command without pressing whichever key currently reaches it. Nothing
+/// on the tick may read one: a frame carries no tick as often as it carries two (invariant 2).
+#[derive(Resource)]
+pub struct Requested<C>(Vec<C>);
+
+impl<C> Default for Requested<C> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<C: Copy + PartialEq> Requested<C> {
+    /// Whether the player asked for `command` on this frame.
+    pub fn asked(&self, command: C) -> bool {
+        self.0.contains(&command)
+    }
+
+    /// Everything the player asked for on this frame, in the order the commands were declared.
+    pub fn iter(&self) -> impl Iterator<Item = C> + '_ {
+        self.0.iter().copied()
+    }
+
+    /// Ask for `command` on this frame, without the press that would otherwise reach it.
+    #[cfg(test)]
+    pub fn ask(&mut self, command: C) {
+        self.0.push(command);
+    }
+}
+
+/// What the player presses to reach each of one plugin's commands.
+#[derive(Resource)]
+struct CommandBindings<C>(Vec<(BindingInput, C)>);
+
+impl<C> Default for CommandBindings<C> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+/// Say what a plugin's commands are, so a press reaches one and the legend names it.
+///
+/// Call it from `build`. The plugin declaring them owns the command type and this owns nothing but
+/// the reading, so there is nowhere a list of every command in the game could live.
+pub trait DeclareCommands {
+    /// Add these commands to what a press can ask for, and to what the legend draws.
+    fn declare_commands<C: Copy + PartialEq + Send + Sync + 'static>(
+        &mut self,
+        commands: impl IntoIterator<Item = PlayerCommand<C>>,
+    ) -> &mut Self;
+}
+
+impl DeclareCommands for App {
+    fn declare_commands<C: Copy + PartialEq + Send + Sync + 'static>(
+        &mut self,
+        commands: impl IntoIterator<Item = PlayerCommand<C>>,
+    ) -> &mut Self {
+        if !self.world().contains_resource::<CommandBindings<C>>() {
+            self.init_resource::<CommandBindings<C>>()
+                .init_resource::<Requested<C>>()
+                .add_systems(
+                    PreUpdate,
+                    read_the_commands::<C>
+                        .after(InputSystems)
+                        .in_set(CommandsRead),
+                )
+                .add_systems(Last, forget_the_commands::<C>);
+        }
+        for command in commands {
+            self.declare_bindings([Binding {
+                input: command.input,
+                action: command.action,
+                context: command.context,
+            }]);
+            self.world_mut()
+                .resource_mut::<CommandBindings<C>>()
+                .0
+                .push((command.input, command.asks));
+        }
+        self
+    }
+}
+
+fn read_the_commands<C: Copy + PartialEq + Send + Sync + 'static>(
+    input: Res<ButtonInput<KeyCode>>,
+    mouse_input: Res<ButtonInput<MouseButton>>,
+    bindings: Res<CommandBindings<C>>,
+    mut requested: ResMut<Requested<C>>,
+) {
+    for (binding, command) in &bindings.0 {
+        if was_just_pressed(*binding, &input, &mouse_input) {
+            requested.0.push(*command);
+        }
+    }
+}
+
+/// Forget what the player asked for, the frame they asked on being over.
+fn forget_the_commands<C: Copy + PartialEq + Send + Sync + 'static>(
+    mut requested: ResMut<Requested<C>>,
+) {
+    requested.0.clear();
+}
+
 #[derive(Component)]
 #[require(Transform, Visibility)]
 struct EditingTargetIndicator;
@@ -203,6 +330,18 @@ fn is_held(
     match binding {
         BindingInput::Key(key) => input.pressed(key),
         BindingInput::Mouse(button) => mouse_input.pressed(button),
+        BindingInput::Scroll => false,
+    }
+}
+
+fn was_just_pressed(
+    binding: BindingInput,
+    input: &ButtonInput<KeyCode>,
+    mouse_input: &ButtonInput<MouseButton>,
+) -> bool {
+    match binding {
+        BindingInput::Key(key) => input.just_pressed(key),
+        BindingInput::Mouse(button) => mouse_input.just_pressed(button),
         BindingInput::Scroll => false,
     }
 }
@@ -347,7 +486,9 @@ mod tests {
     use super::*;
     use crate::common::cursor::{CursorSurface, TileSurface};
     use crate::map::HexCoordinates;
-    use crate::testing::{headless_app, press_key, press_mouse, release_key, release_mouse, tick};
+    use crate::testing::{
+        ask_for, headless_app, press_key, press_mouse, release_key, release_mouse, tick,
+    };
     use bevy::camera::RenderTargetInfo;
     use bevy::math::DVec2;
     use std::f32::consts::FRAC_PI_2;
@@ -949,5 +1090,111 @@ mod tests {
         tick(&mut app);
 
         assert_eq!(player_action(&app), PlayerAction::EditRoads);
+    }
+
+    /// A command standing in for one a plugin owns, so these tests turn on no real subsystem.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Refuel {
+        OneCan,
+        TwoCans,
+    }
+
+    const REFUEL_KEY: KeyCode = KeyCode::KeyF;
+    const REFUEL_BUTTON: MouseButton = MouseButton::Middle;
+
+    /// What a system on the frame saw the player ask for, kept past the frame they asked on.
+    #[derive(Resource, Default)]
+    struct Seen(Vec<Refuel>);
+
+    fn commanded_app() -> App {
+        let mut app = headless_app();
+        app.init_resource::<Seen>()
+            .declare_commands([
+                PlayerCommand {
+                    input: BindingInput::Key(REFUEL_KEY),
+                    asks: Refuel::OneCan,
+                    action: "Refuel the rover",
+                    context: BindingContext::Always,
+                },
+                PlayerCommand {
+                    input: BindingInput::Mouse(REFUEL_BUTTON),
+                    asks: Refuel::TwoCans,
+                    action: "Refuel the rover twice over",
+                    context: BindingContext::Always,
+                },
+            ])
+            .add_systems(Update, note_what_the_player_asked_for);
+        app
+    }
+
+    fn note_what_the_player_asked_for(asked_for: Res<Requested<Refuel>>, mut seen: ResMut<Seen>) {
+        seen.0.extend(asked_for.iter());
+    }
+
+    fn seen(app: &App) -> &[Refuel] {
+        &app.world().resource::<Seen>().0
+    }
+
+    #[test]
+    fn pressing_a_command_key_asks_for_its_command() {
+        let mut app = commanded_app();
+
+        press_key(&mut app, REFUEL_KEY);
+        tick(&mut app);
+
+        assert_eq!(seen(&app), [Refuel::OneCan]);
+    }
+
+    #[test]
+    fn clicking_a_command_button_asks_for_its_command() {
+        let mut app = commanded_app();
+
+        press_mouse(&mut app, REFUEL_BUTTON);
+        tick(&mut app);
+
+        assert_eq!(seen(&app), [Refuel::TwoCans]);
+    }
+
+    #[test]
+    fn holding_a_command_key_down_asks_for_it_once() {
+        let mut app = commanded_app();
+
+        press_key(&mut app, REFUEL_KEY);
+        tick(&mut app);
+        tick(&mut app);
+
+        assert_eq!(seen(&app), [Refuel::OneCan]);
+    }
+
+    #[test]
+    fn a_command_is_forgotten_by_the_frame_after_it_was_asked_for() {
+        let mut app = commanded_app();
+        press_key(&mut app, REFUEL_KEY);
+        tick(&mut app);
+        release_key(&mut app, REFUEL_KEY);
+
+        tick(&mut app);
+
+        assert_eq!(seen(&app), [Refuel::OneCan]);
+    }
+
+    #[test]
+    fn a_command_asked_for_without_a_press_reads_the_same() {
+        let mut app = commanded_app();
+
+        ask_for(&mut app, Refuel::TwoCans);
+        tick(&mut app);
+
+        assert_eq!(seen(&app), [Refuel::TwoCans]);
+    }
+
+    #[test]
+    fn asking_for_one_command_asks_for_no_other() {
+        let mut app = commanded_app();
+
+        ask_for(&mut app, Refuel::OneCan);
+        tick(&mut app);
+
+        assert_eq!(seen(&app), [Refuel::OneCan]);
     }
 }

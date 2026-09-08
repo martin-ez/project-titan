@@ -7,6 +7,7 @@
 //! fixed tick per frame, which is the only footing invariant 2 leaves a simulation test to assert
 //! from.
 
+use crate::input::Requested;
 use crate::simulation::Simulation;
 use bevy::asset::AssetPlugin;
 use bevy::gizmos::GizmoAsset;
@@ -81,6 +82,15 @@ pub fn scroll_wheel(app: &mut App, unit: MouseScrollUnit, amount: f32) {
         window: Entity::PLACEHOLDER,
         phase: TouchPhase::Moved,
     });
+}
+
+/// Ask for `command` without the press that would otherwise reach it, to be seen on this tick.
+///
+/// A press is queued as a message and read on the tick after it, but a request is a fact about the
+/// frame it is made on, so this one is seen by the very next call to `tick` rather than the one
+/// after that.
+pub fn ask_for<C: Copy + PartialEq + Send + Sync + 'static>(app: &mut App, command: C) {
+    app.world_mut().resource_mut::<Requested<C>>().ask(command);
 }
 
 /// Press `key`, to be seen on the next tick.
