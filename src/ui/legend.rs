@@ -11,7 +11,7 @@
 //! which is what lets a column line up and a heading read differently from the rows beneath it.
 
 use crate::building::ChosenBuildingType;
-use crate::input::PlayerAction;
+use crate::input::{DeclareCommands, PlayerAction, PlayerCommand, Requested};
 use crate::ui::{
     panel, panel_font, panel_row, panel_text, PanelCorner, BODY_TEXT, HEADING_TEXT, KEYED_TEXT,
 };
@@ -92,8 +92,9 @@ pub struct LegendPlugin;
 impl Plugin for LegendPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PlayerBindings>()
-            .declare_bindings([Binding {
+            .declare_commands([PlayerCommand {
                 input: BindingInput::Key(LEGEND_KEY),
+                asks: ShowTheLegend,
                 action: "Show or hide this legend",
                 context: BindingContext::Always,
             }])
@@ -114,6 +115,10 @@ impl Plugin for LegendPlugin {
 #[derive(Component)]
 struct Legend;
 
+/// What the player asks for to show or hide the legend.
+#[derive(Clone, Copy, PartialEq)]
+struct ShowTheLegend;
+
 fn open_the_legend(
     mut commands: Commands,
     bindings: Res<PlayerBindings>,
@@ -131,13 +136,13 @@ fn open_the_legend(
 
 fn toggle_the_legend(
     mut commands: Commands,
-    input: Res<ButtonInput<KeyCode>>,
+    asked_for: Res<Requested<ShowTheLegend>>,
     bindings: Res<PlayerBindings>,
     held: Option<Res<State<PlayerAction>>>,
     chosen: Option<Res<ChosenBuildingType>>,
     legend_q: Query<Entity, With<Legend>>,
 ) {
-    if !input.just_pressed(LEGEND_KEY) {
+    if !asked_for.asked(ShowTheLegend) {
         return;
     }
 
@@ -319,7 +324,7 @@ fn mouse_label(button: MouseButton) -> String {
 mod tests {
     use super::*;
     use crate::input::TURN_KEY;
-    use crate::testing::{headless_app, press_key, release_key, tick};
+    use crate::testing::{ask_for, headless_app, press_key, release_key, tick};
 
     fn legend_app() -> App {
         let mut app = headless_app();
@@ -406,6 +411,35 @@ mod tests {
         tick(&mut app);
 
         assert_eq!(legends(&mut app), 1);
+    }
+
+    #[test]
+    fn a_hidden_legend_shows_for_a_command_nobody_pressed_a_key_for() {
+        let mut app = legend_app();
+        tick(&mut app);
+        hide_every_legend(&mut app);
+
+        ask_for(&mut app, ShowTheLegend);
+        tick(&mut app);
+
+        assert_eq!(legends(&mut app), 1);
+    }
+
+    #[test]
+    fn a_declared_command_is_named_in_the_legend() {
+        let mut app = legend_app();
+        app.declare_commands([PlayerCommand {
+            input: BindingInput::Key(KeyCode::KeyQ),
+            asks: ShowTheLegend,
+            action: "Refuel the rover",
+            context: BindingContext::Always,
+        }]);
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        let legend = shown_legend(&mut app);
+
+        assert!(legend.contains("Refuel the rover"), "{legend}");
     }
 
     #[test]

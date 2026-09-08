@@ -1,5 +1,6 @@
+use crate::input::{DeclareCommands, PlayerCommand, Requested};
 use crate::simulation::TICKS_PER_SECOND;
-use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
+use crate::ui::legend::{BindingContext, BindingInput};
 use bevy::dev_tools::diagnostics_overlay::{DiagnosticsOverlay, DiagnosticsOverlayPlugin};
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
 use bevy::prelude::*;
@@ -18,27 +19,36 @@ const DEBUG_GIZMOS_AT_STARTUP: bool = cfg!(debug_assertions);
 /// that makes it readable, so it ships with the game rather than behind a build flag.
 pub struct DiagnosticsPlugin;
 
+/// What the player asks for to show or hide the frame and tick rates.
+#[derive(Clone, Copy, PartialEq)]
+struct ShowTheOverlay;
+
 impl Plugin for DiagnosticsPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins((
             FrameTimeDiagnosticsPlugin::default(),
             DiagnosticsOverlayPlugin,
-        ))
-        .declare_bindings([Binding {
-            input: BindingInput::Key(DIAGNOSTICS_OVERLAY_KEY),
-            action: "Show or hide the frame and tick rates",
-            context: BindingContext::Always,
-        }])
-        .add_systems(Update, toggle_overlay);
+        ));
+        declare_the_overlay_command(app).add_systems(Update, toggle_overlay);
     }
+}
+
+/// Declared apart from `build` so a test can drive `toggle_overlay` without the overlay plugin.
+fn declare_the_overlay_command(app: &mut App) -> &mut App {
+    app.declare_commands([PlayerCommand {
+        input: BindingInput::Key(DIAGNOSTICS_OVERLAY_KEY),
+        asks: ShowTheOverlay,
+        action: "Show or hide the frame and tick rates",
+        context: BindingContext::Always,
+    }])
 }
 
 fn toggle_overlay(
     mut commands: Commands,
-    input: Res<ButtonInput<KeyCode>>,
+    asked_for: Res<Requested<ShowTheOverlay>>,
     overlay_q: Query<Entity, With<DiagnosticsOverlay>>,
 ) {
-    if !input.just_pressed(DIAGNOSTICS_OVERLAY_KEY) {
+    if !asked_for.asked(ShowTheOverlay) {
         return;
     }
 
@@ -84,8 +94,9 @@ impl Plugin for DebugGizmosPlugin {
                 ..default()
             },
         )
-        .declare_bindings([Binding {
+        .declare_commands([PlayerCommand {
             input: BindingInput::Key(DEBUG_GIZMOS_KEY),
+            asks: ShowTheGizmos,
             action: "Show or hide the debug gizmos",
             context: BindingContext::Always,
         }])
@@ -93,8 +104,15 @@ impl Plugin for DebugGizmosPlugin {
     }
 }
 
-fn toggle_debug_gizmos(input: Res<ButtonInput<KeyCode>>, mut config: ResMut<GizmoConfigStore>) {
-    if !input.just_pressed(DEBUG_GIZMOS_KEY) {
+/// What the player asks for to show or hide the whole debug gizmo layer.
+#[derive(Clone, Copy, PartialEq)]
+struct ShowTheGizmos;
+
+fn toggle_debug_gizmos(
+    asked_for: Res<Requested<ShowTheGizmos>>,
+    mut config: ResMut<GizmoConfigStore>,
+) {
+    if !asked_for.asked(ShowTheGizmos) {
         return;
     }
 
@@ -105,11 +123,11 @@ fn toggle_debug_gizmos(input: Res<ButtonInput<KeyCode>>, mut config: ResMut<Gizm
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{headless_app, press_key, release_key, tick};
+    use crate::testing::{ask_for, headless_app, press_key, release_key, tick};
 
     fn overlay_app() -> App {
         let mut app = headless_app();
-        app.add_systems(Update, toggle_overlay);
+        declare_the_overlay_command(&mut app).add_systems(Update, toggle_overlay);
         app
     }
 
@@ -169,6 +187,16 @@ mod tests {
         tick(&mut app);
 
         assert_eq!(overlays(&mut app), 0);
+    }
+
+    #[test]
+    fn the_overlay_shows_for_a_command_nobody_pressed_a_key_for() {
+        let mut app = overlay_app();
+
+        ask_for(&mut app, ShowTheOverlay);
+        tick(&mut app);
+
+        assert_eq!(overlays(&mut app), 1);
     }
 
     #[test]
@@ -251,6 +279,18 @@ mod tests {
         tick(&mut app);
 
         assert!(!gizmos_are_on(&app));
+    }
+
+    #[test]
+    fn the_debug_gizmos_turn_on_for_a_command_nobody_pressed_a_key_for() {
+        let mut app = gizmo_app();
+        tick(&mut app);
+        set_gizmos(&mut app, false);
+
+        ask_for(&mut app, ShowTheGizmos);
+        tick(&mut app);
+
+        assert!(gizmos_are_on(&app));
     }
 
     #[test]

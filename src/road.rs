@@ -2,7 +2,7 @@ use crate::building::BuildingTiles;
 use crate::common::cleanup::{Destroy, DestroyOnStateChange};
 use crate::common::initialize::{initialize_system, Initialize, NeedsInitialization};
 use crate::diagnostics::DebugGizmos;
-use crate::input::{PlayerAction, PlayerInput};
+use crate::input::{DeclareCommands, PlayerAction, PlayerCommand, PlayerInput, Requested};
 use crate::map::{HexCoordinates, LatticeNode, MapTile, MAP_TILE_INRADIUS, MAP_TILE_SIZE};
 use crate::simulation::Ticks;
 use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
@@ -72,8 +72,28 @@ const SHORTEST_GREEN: u32 = 1;
 /// The key that puts a signal on the junction the player picked out, and takes it off again.
 const SIGNAL_KEY: KeyCode = KeyCode::KeyG;
 
-/// The keys that shorten and lengthen the green of the junction the player picked out.
-const GREEN_KEYS: [(KeyCode, i32); 2] = [(KeyCode::BracketLeft, -1), (KeyCode::BracketRight, 1)];
+/// The keys that tune the green of the junction the player picked out, by how much, and what to
+/// call that
+const GREEN_KEYS: [(KeyCode, GreenStep, &str); 2] = [
+    (
+        KeyCode::BracketLeft,
+        GreenStep(-1),
+        "Shorten the green of the junction you picked out",
+    ),
+    (
+        KeyCode::BracketRight,
+        GreenStep(1),
+        "Lengthen the green of the junction you picked out",
+    ),
+];
+
+/// What the player asks for to put a signal on the junction they picked out, or move it on.
+#[derive(Clone, Copy, PartialEq)]
+struct SignalTheJunction;
+
+/// How many rovers' turns the player asked to add to a junction's green, negative to take some.
+#[derive(Clone, Copy, PartialEq)]
+struct GreenStep(i32);
 
 /// How closely a fitted turn has to meet the leg it reaches to be laid as one arc.
 ///
@@ -1741,23 +1761,18 @@ fn cut_the_roads_where_they_cross(
 
 impl Plugin for JunctionSignalPlugin {
     fn build(&self, app: &mut App) {
-        app.declare_bindings([
-            Binding {
-                input: BindingInput::Key(SIGNAL_KEY),
-                action: "Signal the junction you picked out, road by road",
-                context: BindingContext::Tool(PlayerAction::Select),
-            },
-            Binding {
-                input: BindingInput::Key(GREEN_KEYS[0].0),
-                action: "Shorten the green of the junction you picked out",
-                context: BindingContext::Tool(PlayerAction::Select),
-            },
-            Binding {
-                input: BindingInput::Key(GREEN_KEYS[1].0),
-                action: "Lengthen the green of the junction you picked out",
-                context: BindingContext::Tool(PlayerAction::Select),
-            },
-        ])
+        app.declare_commands([PlayerCommand {
+            input: BindingInput::Key(SIGNAL_KEY),
+            asks: SignalTheJunction,
+            action: "Signal the junction you picked out, road by road",
+            context: BindingContext::Tool(PlayerAction::Select),
+        }])
+        .declare_commands(GREEN_KEYS.map(|(key, asks, action)| PlayerCommand {
+            input: BindingInput::Key(key),
+            asks,
+            action,
+            context: BindingContext::Tool(PlayerAction::Select),
+        }))
         .add_systems(
             Update,
             (
@@ -1779,12 +1794,12 @@ impl Plugin for JunctionSignalPlugin {
 /// only thing they can take off again.
 fn signal_the_junction_the_player_picked_out(
     mut commands: Commands,
-    keys: Res<ButtonInput<KeyCode>>,
+    asked_for: Res<Requested<SignalTheJunction>>,
     action: Res<State<PlayerAction>>,
     selection: Res<Selection>,
     junctions: Query<(&Junction, Option<&Signal>)>,
 ) {
-    if *action.get() != PlayerAction::Select || !keys.just_pressed(SIGNAL_KEY) {
+    if *action.get() != PlayerAction::Select || !asked_for.asked(SignalTheJunction) {
         return;
     }
     let Some(picked) = selection.junction() else {
@@ -1811,7 +1826,7 @@ fn signal_the_junction_the_player_picked_out(
 
 /// Lengthen or shorten the green of the junction the player picked out.
 fn time_the_signal_the_player_picked_out(
-    keys: Res<ButtonInput<KeyCode>>,
+    asked_for: Res<Requested<GreenStep>>,
     action: Res<State<PlayerAction>>,
     selection: Res<Selection>,
     mut signals: Query<&mut Signal>,
@@ -1825,10 +1840,8 @@ fn time_the_signal_the_player_picked_out(
     else {
         return;
     };
-    for (key, asked) in GREEN_KEYS {
-        if keys.just_pressed(key) {
-            signal.tune(asked);
-        }
+    for GreenStep(asked) in asked_for.iter() {
+        signal.tune(asked);
     }
 }
 
@@ -2983,7 +2996,7 @@ mod tests {
     use crate::common::initialize::InitializationFailed;
     use crate::diagnostics::DebugGizmosPlugin;
     use crate::map::{Deposit, MAP_TILE_SIZE};
-    use crate::testing::{headless_app, press_key, release_key, tick};
+    use crate::testing::{ask_for, headless_app, press_key, release_key, tick};
     use crate::ui::selection::SelectionPlugin;
     use std::collections::HashSet;
 
@@ -4911,6 +4924,38 @@ mod tests {
         assert_eq!(
             the_signal(&mut app).map(|signal| signal.favours()),
             Some(first)
+        );
+    }
+
+    #[test]
+    fn a_junction_takes_a_signal_for_a_command_nobody_pressed_a_key_for() {
+        let (mut app, ..) = a_crossed_road();
+        let junction = pick_out_the_junction(&mut app);
+        let first = component_of::<Junction>(&app, junction)
+            .map(|junction| junction.roads()[0])
+            .expect("the junction knows its roads");
+
+        ask_for(&mut app, SignalTheJunction);
+        tick(&mut app);
+
+        assert_eq!(
+            the_signal(&mut app).map(|signal| signal.favours()),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn the_green_lengthens_for_a_command_nobody_pressed_a_key_for() {
+        let (mut app, ..) = a_crossed_road();
+        pick_out_the_junction(&mut app);
+        tap_key(&mut app, SIGNAL_KEY);
+
+        ask_for(&mut app, GREEN_KEYS[1].1);
+        tick(&mut app);
+
+        assert_eq!(
+            the_signal(&mut app).map(|signal| signal.green),
+            Some(OPENING_GREEN + 1)
         );
     }
 

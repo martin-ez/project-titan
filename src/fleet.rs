@@ -14,12 +14,12 @@
 use crate::building::{Flow, Holding, Item, Port};
 use crate::common::cleanup::Destroy;
 use crate::diagnostics::DebugGizmos;
-use crate::input::PlayerAction;
+use crate::input::{DeclareCommands, PlayerAction, PlayerCommand, Requested};
 use crate::map::LatticeNode;
 use crate::road::{RoadEndpoint, RoadNetwork, RoadTiles};
 use crate::rover::{Cargo, Route, Rover, RoversDriven, SentTo, Stranded};
 use crate::simulation::Simulation;
-use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
+use crate::ui::legend::{BindingContext, BindingInput};
 use crate::ui::selection::{Picked, Selection};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -38,8 +38,24 @@ const GIZMO_LIFT: Vec3 = Vec3::new(0., 0.3, 0.);
 /// The colour the way a fleet collects along is drawn in
 const FLEET_COLOUR: Color = Color::srgb(0.6, 0.5, 0.9);
 
-/// The keys that change the selected port's fleet, and how many rovers each asks for.
-const FLEET_KEYS: [(KeyCode, i32); 2] = [(KeyCode::Minus, -1), (KeyCode::Equal, 1)];
+/// The keys that change the selected port's fleet, how many rovers each asks for, and what to
+/// call that
+const FLEET_KEYS: [(KeyCode, RoverRequest, &str); 2] = [
+    (
+        KeyCode::Minus,
+        RoverRequest(-1),
+        "Take a rover off the port you picked out",
+    ),
+    (
+        KeyCode::Equal,
+        RoverRequest(1),
+        "Put another rover on the port you picked out",
+    ),
+];
+
+/// How many rovers the player asked the port they picked out for, negative to ask for some back.
+#[derive(Clone, Copy, PartialEq)]
+struct RoverRequest(i32);
 
 /// How many rovers the player has to give out across the whole map.
 ///
@@ -184,18 +200,12 @@ impl Plugin for FleetPlugin {
             .init_resource::<Refused>()
             .add_observer(take_the_rovers_of_a_fleet_that_is_gone_off_the_road)
             .add_observer(give_back_the_place_of_a_rover_that_left_the_world)
-            .declare_bindings([
-                Binding {
-                    input: BindingInput::Key(FLEET_KEYS[0].0),
-                    action: "Take a rover off the port you picked out",
-                    context: BindingContext::Tool(PlayerAction::Select),
-                },
-                Binding {
-                    input: BindingInput::Key(FLEET_KEYS[1].0),
-                    action: "Put another rover on the port you picked out",
-                    context: BindingContext::Tool(PlayerAction::Select),
-                },
-            ])
+            .declare_commands(FLEET_KEYS.map(|(key, asks, action)| PlayerCommand {
+                input: BindingInput::Key(key),
+                asks,
+                action,
+                context: BindingContext::Tool(PlayerAction::Select),
+            }))
             .add_systems(
                 FixedUpdate,
                 (
@@ -237,7 +247,7 @@ impl Plugin for FleetPlugin {
 /// request the pool cannot fill leaves the count where it was and is recorded as refused.
 fn set_the_rovers_the_player_asked_for(
     mut commands: Commands,
-    keys: Res<ButtonInput<KeyCode>>,
+    asked_for: Res<Requested<RoverRequest>>,
     picked_out: PickedOutIntake,
     pool: Res<RoverPool>,
     mut refused: ResMut<Refused>,
@@ -247,10 +257,7 @@ fn set_the_rovers_the_player_asked_for(
         return;
     };
     let spare = pool.spare(fleets.iter().map(|fleet| fleet.rovers).sum());
-    for (key, asked) in FLEET_KEYS {
-        if !keys.just_pressed(key) {
-            continue;
-        }
+    for RoverRequest(asked) in asked_for.iter() {
         if asked.is_positive() && spare < asked.unsigned_abs() {
             refused.set_if_neq(Refused(Some(port)));
             continue;
@@ -582,7 +589,7 @@ mod tests {
     use crate::road::{Road, RoadPlugin, ServedBy};
     use crate::rover::RoverPlugin;
     use crate::simulation::SimulationPlugin;
-    use crate::testing::{advance, headless_app, press_key, release_key, tick};
+    use crate::testing::{advance, ask_for, headless_app, press_key, release_key, tick};
     use crate::ui::selection::SelectionPlugin;
 
     /// The corner of a tile the road runs through and a port stands on.
@@ -1779,6 +1786,18 @@ mod tests {
         pick_out(&mut app, ground, ASSIGNED, INTAKE_CORNER);
 
         tap_key(&mut app, FLEET_KEYS[1].0);
+
+        let fleet = fleet_of(&app, intake).expect("the intake was given a fleet");
+        assert_eq!(fleet.rovers, 1);
+    }
+
+    #[test]
+    fn an_intake_gains_a_fleet_for_a_command_nobody_pressed_a_key_for() {
+        let (mut app, ground, intake) = assignment_app();
+        pick_out(&mut app, ground, ASSIGNED, INTAKE_CORNER);
+
+        ask_for(&mut app, FLEET_KEYS[1].1);
+        tick(&mut app);
 
         let fleet = fleet_of(&app, intake).expect("the intake was given a fleet");
         assert_eq!(fleet.rovers, 1);

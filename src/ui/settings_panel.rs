@@ -12,7 +12,8 @@
 //! that default it now stands at. That is the one reading that means the same on every row.
 
 use crate::camera::CameraSensitivity;
-use crate::ui::legend::{Binding, BindingContext, BindingInput, DeclareBindings};
+use crate::input::{DeclareCommands, PlayerCommand, Requested};
+use crate::ui::legend::{BindingContext, BindingInput};
 use crate::ui::{panel, panel_row, panel_text, PanelCorner, BODY_TEXT, HEADING_TEXT, KEYED_TEXT};
 use bevy::prelude::*;
 use std::ops::Range;
@@ -20,11 +21,37 @@ use std::ops::Range;
 /// Key binding that shows and hides the settings panel
 const SETTINGS_KEY: KeyCode = KeyCode::F2;
 
-/// The keys that walk the picked row through the list, and the way each walks it
-const PICK_KEYS: [(KeyCode, isize); 2] = [(KeyCode::ArrowUp, -1), (KeyCode::ArrowDown, 1)];
+/// The keys that walk the picked row through the list, the way each walks it, and what to call that
+const PICK_KEYS: [(KeyCode, SettingPick, &str); 2] = [
+    (KeyCode::ArrowUp, SettingPick(-1), "Pick the setting above"),
+    (KeyCode::ArrowDown, SettingPick(1), "Pick the setting below"),
+];
 
-/// The keys that change the picked setting, and the way each changes it
-const ADJUST_KEYS: [(KeyCode, f32); 2] = [(KeyCode::ArrowLeft, -1.0), (KeyCode::ArrowRight, 1.0)];
+/// The keys that change the picked setting, the way each changes it, and what to call that
+const ADJUST_KEYS: [(KeyCode, SettingAdjust, &str); 2] = [
+    (
+        KeyCode::ArrowLeft,
+        SettingAdjust(-1.0),
+        "Lower the setting you picked",
+    ),
+    (
+        KeyCode::ArrowRight,
+        SettingAdjust(1.0),
+        "Raise the setting you picked",
+    ),
+];
+
+/// What the player asks for to show or hide the settings panel.
+#[derive(Clone, Copy, PartialEq)]
+struct ShowTheSettings;
+
+/// How far down the list the player asked the picked row to move, negative to move it up.
+#[derive(Clone, Copy, PartialEq)]
+struct SettingPick(isize);
+
+/// Which way the player asked the picked setting to move, as a multiple of one step.
+#[derive(Clone, Copy, PartialEq)]
+struct SettingAdjust(f32);
 
 /// How much of its own shipped default one press moves a setting by
 const ADJUST_STEP: f32 = 0.1;
@@ -116,33 +143,24 @@ impl Plugin for SettingsPanelPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CameraSensitivity>()
             .init_resource::<PickedSetting>()
-            .declare_bindings([
-                Binding {
-                    input: BindingInput::Key(SETTINGS_KEY),
-                    action: "Show or hide the camera settings",
-                    context: BindingContext::Always,
-                },
-                Binding {
-                    input: BindingInput::Key(PICK_KEYS[0].0),
-                    action: "Pick the setting above",
-                    context: BindingContext::Always,
-                },
-                Binding {
-                    input: BindingInput::Key(PICK_KEYS[1].0),
-                    action: "Pick the setting below",
-                    context: BindingContext::Always,
-                },
-                Binding {
-                    input: BindingInput::Key(ADJUST_KEYS[0].0),
-                    action: "Lower the setting you picked",
-                    context: BindingContext::Always,
-                },
-                Binding {
-                    input: BindingInput::Key(ADJUST_KEYS[1].0),
-                    action: "Raise the setting you picked",
-                    context: BindingContext::Always,
-                },
-            ])
+            .declare_commands([PlayerCommand {
+                input: BindingInput::Key(SETTINGS_KEY),
+                asks: ShowTheSettings,
+                action: "Show or hide the camera settings",
+                context: BindingContext::Always,
+            }])
+            .declare_commands(PICK_KEYS.map(|(key, asks, action)| PlayerCommand {
+                input: BindingInput::Key(key),
+                asks,
+                action,
+                context: BindingContext::Always,
+            }))
+            .declare_commands(ADJUST_KEYS.map(|(key, asks, action)| PlayerCommand {
+                input: BindingInput::Key(key),
+                asks,
+                action,
+                context: BindingContext::Always,
+            }))
             .add_systems(
                 Update,
                 (
@@ -158,12 +176,12 @@ impl Plugin for SettingsPanelPlugin {
 
 fn toggle_the_panel(
     mut commands: Commands,
-    input: Res<ButtonInput<KeyCode>>,
+    asked_for: Res<Requested<ShowTheSettings>>,
     sensitivity: Res<CameraSensitivity>,
     picked: Res<PickedSetting>,
     panels: Query<Entity, With<SettingsPanel>>,
 ) {
-    if !input.just_pressed(SETTINGS_KEY) {
+    if !asked_for.asked(ShowTheSettings) {
         return;
     }
 
@@ -177,7 +195,7 @@ fn toggle_the_panel(
 
 /// Walk the picked row through the list, stopping at either end rather than wrapping round it.
 fn pick_a_setting(
-    input: Res<ButtonInput<KeyCode>>,
+    asked_for: Res<Requested<SettingPick>>,
     mut picked: ResMut<PickedSetting>,
     panels: Query<Entity, With<SettingsPanel>>,
 ) {
@@ -185,15 +203,13 @@ fn pick_a_setting(
         return;
     }
 
-    for (key, step) in PICK_KEYS {
-        if input.just_pressed(key) {
-            picked.0 = picked.0.saturating_add_signed(step).min(SETTINGS.len() - 1);
-        }
+    for SettingPick(step) in asked_for.iter() {
+        picked.0 = picked.0.saturating_add_signed(step).min(SETTINGS.len() - 1);
     }
 }
 
 fn adjust_the_setting(
-    input: Res<ButtonInput<KeyCode>>,
+    asked_for: Res<Requested<SettingAdjust>>,
     picked: Res<PickedSetting>,
     mut sensitivity: ResMut<CameraSensitivity>,
     panels: Query<Entity, With<SettingsPanel>>,
@@ -205,15 +221,13 @@ fn adjust_the_setting(
         return;
     };
 
-    for (key, direction) in ADJUST_KEYS {
-        if input.just_pressed(key) {
-            let shipped = setting.shipped();
-            let moved = setting.read(&sensitivity) + direction * ADJUST_STEP * shipped;
-            setting.write(
-                &mut sensitivity,
-                moved.clamp(SETTING_RANGE.start * shipped, SETTING_RANGE.end * shipped),
-            );
-        }
+    for SettingAdjust(direction) in asked_for.iter() {
+        let shipped = setting.shipped();
+        let moved = setting.read(&sensitivity) + direction * ADJUST_STEP * shipped;
+        setting.write(
+            &mut sensitivity,
+            moved.clamp(SETTING_RANGE.start * shipped, SETTING_RANGE.end * shipped),
+        );
     }
 }
 
@@ -292,7 +306,7 @@ mod tests {
     use super::*;
     use crate::camera::CameraPlugin;
     use crate::input::{CameraMovement, PlayerInput};
-    use crate::testing::{headless_app, press_key, release_key, tick};
+    use crate::testing::{ask_for, headless_app, press_key, release_key, tick};
 
     /// Frames to let the camera's easing settle before a distance is measured off it.
     const FRAMES_TO_SETTLE: u32 = 40;
@@ -387,6 +401,41 @@ mod tests {
         press(&mut app, SETTINGS_KEY);
 
         assert_eq!(panels(&mut app), 0);
+    }
+
+    #[test]
+    fn the_panel_shows_for_a_command_nobody_pressed_a_key_for() {
+        let mut app = settings_app();
+        tick(&mut app);
+
+        ask_for(&mut app, ShowTheSettings);
+        tick(&mut app);
+
+        assert_eq!(panels(&mut app), 1);
+    }
+
+    #[test]
+    fn a_setting_is_raised_by_a_command_nobody_pressed_a_key_for() {
+        let mut app = shown_panel_app();
+        let before = sensitivity(&app).translation;
+
+        ask_for(&mut app, ADJUST_KEYS[1].1);
+        tick(&mut app);
+
+        assert!(sensitivity(&app).translation > before);
+    }
+
+    #[test]
+    fn the_picked_row_moves_for_a_command_nobody_pressed_a_key_for() {
+        let mut app = shown_panel_app();
+
+        ask_for(&mut app, PICK_KEYS[1].1);
+        tick(&mut app);
+        let before = sensitivity(&app);
+        press(&mut app, ADJUST_KEYS[1].0);
+
+        assert_eq!(sensitivity(&app).translation, before.translation);
+        assert!(sensitivity(&app).orbit > before.orbit);
     }
 
     #[test]
