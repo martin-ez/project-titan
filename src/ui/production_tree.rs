@@ -50,11 +50,11 @@ const NODE_WIDTH: f32 = 104.0;
 /// How tall a node of the tree is drawn, in logical pixels
 const NODE_HEIGHT: f32 = 30.0;
 
-/// How much space sits between one column of the tree and the next, in logical pixels
-const COLUMN_GAP: f32 = 52.0;
+/// How much space sits between one depth of the tree and the next, in logical pixels
+const DEPTH_GAP: f32 = 22.0;
 
-/// How much space sits between one node of a column and the next, in logical pixels
-const NODE_GAP: f32 = 10.0;
+/// How much space sits between one node of a depth and the next, in logical pixels
+const NODE_GAP: f32 = 14.0;
 
 /// How thick an edge is drawn, in logical pixels
 const EDGE_THICKNESS: f32 = 1.0;
@@ -244,63 +244,66 @@ impl Tree {
         reached
     }
 
-    /// Which column each node is drawn in: a step one past the deepest good it takes, and a good
-    /// one past the shallowest step that makes it.
+    /// How deep into the tree each node sits: a step one past the deepest good it takes, and a
+    /// good one past the shallowest step that makes it.
     ///
-    /// The shallowest rather than the deepest is what keeps a loop from carrying a good rightward
+    /// The shallowest rather than the deepest is what keeps a loop from carrying a good away
     /// without end, and the pass count bounds it whatever the catalogue turns out to be shaped
-    /// like: a column only ever rises, so a pass that moves nothing has settled.
-    fn columns(&self) -> PerNode<usize> {
-        let mut columns = PerNode::filled(self, 0);
+    /// like: a depth only ever rises, so a pass that moves nothing has settled.
+    fn depths(&self) -> PerNode<usize> {
+        let mut depths = PerNode::filled(self, 0);
         for _ in 0..self.nodes().count() {
             let mut moved = false;
             for place in 0..self.recipes.len() {
                 let node = TreeNode::Recipe(place);
-                let deepest = self.column_of(&columns, node, Ord::max);
-                moved |= columns.raise(node, deepest.unwrap_or(0));
+                let deepest = self.depth_of(&depths, node, Ord::max);
+                moved |= depths.raise(node, deepest.unwrap_or(0));
             }
             for place in 0..self.items.len() {
                 let node = TreeNode::Item(place);
-                let Some(shallowest) = self.column_of(&columns, node, Ord::min) else {
+                let Some(shallowest) = self.depth_of(&depths, node, Ord::min) else {
                     continue;
                 };
-                moved |= columns.raise(node, shallowest);
+                moved |= depths.raise(node, shallowest);
             }
             if !moved {
                 break;
             }
         }
-        columns
+        depths
     }
 
-    /// Which column `node` sits in given what it needs, `pick` choosing among several.
-    fn column_of(
+    /// How deep `node` sits given what it needs, `pick` choosing among several.
+    fn depth_of(
         &self,
-        columns: &PerNode<usize>,
+        depths: &PerNode<usize>,
         node: TreeNode,
         pick: fn(usize, usize) -> usize,
     ) -> Option<usize> {
         self.neighbours(node, Direction::Needs)
-            .map(|needed| columns.of(needed) + 1)
+            .map(|needed| depths.of(needed) + 1)
             .reduce(pick)
     }
 
     /// Where each node is drawn, in logical pixels from the top left of the sheet.
+    ///
+    /// Depth runs down the screen and the nodes at one depth run across it, because the tree is
+    /// far deeper than it is wide: the other way round it draws as a strip too long to read.
     fn places(&self) -> PerNode<Vec2> {
-        let columns = self.columns();
+        let depths = self.depths();
         let mut places = PerNode::filled(self, Vec2::ZERO);
         let mut taken: Vec<usize> = Vec::new();
         for node in self.nodes().collect::<Vec<TreeNode>>() {
-            let column = columns.of(node);
-            taken.resize(taken.len().max(column + 1), 0);
+            let depth = depths.of(node);
+            taken.resize(taken.len().max(depth + 1), 0);
             places.set(
                 node,
                 Vec2::new(
-                    column as f32 * (NODE_WIDTH + COLUMN_GAP),
-                    taken[column] as f32 * (NODE_HEIGHT + NODE_GAP),
+                    taken[depth] as f32 * (NODE_WIDTH + NODE_GAP),
+                    depth as f32 * (NODE_HEIGHT + DEPTH_GAP),
                 ),
             );
-            taken[column] += 1;
+            taken[depth] += 1;
         }
         places
     }
@@ -447,8 +450,8 @@ fn fill_the_sheet(sheet: &mut ChildSpawnerCommands, tree: &Tree, focus: Option<u
         .with_children(|canvas| {
             for (from, to) in &tree.edges {
                 canvas.spawn(edge(
-                    places.of(*from) + Vec2::new(NODE_WIDTH, NODE_HEIGHT / 2.0),
-                    places.of(*to) + Vec2::new(0.0, NODE_HEIGHT / 2.0),
+                    places.of(*from) + Vec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT),
+                    places.of(*to) + Vec2::new(NODE_WIDTH / 2.0, 0.0),
                     lit(*from) && lit(*to),
                 ));
             }
@@ -753,31 +756,31 @@ mod tests {
     }
 
     #[test]
-    fn an_extractor_sits_in_the_first_column_and_a_step_past_every_good_it_takes() {
+    fn an_extractor_sits_at_the_first_depth_and_a_step_below_every_good_it_takes() {
         let tree = Tree::of(&A_CATALOGUE);
-        let columns = tree.columns();
+        let depths = tree.depths();
 
-        assert_eq!(columns.of(TreeNode::Recipe(0)), 0);
+        assert_eq!(depths.of(TreeNode::Recipe(0)), 0);
         for step in 0..A_CATALOGUE.len() {
             let node = TreeNode::Recipe(step);
             for needed in tree.neighbours(node, Direction::Needs) {
-                assert!(columns.of(node) > columns.of(needed), "step {step}");
+                assert!(depths.of(node) > depths.of(needed), "step {step}");
             }
         }
     }
 
     #[test]
-    fn a_loop_still_leaves_every_step_to_the_right_of_what_it_takes() {
+    fn a_loop_still_leaves_every_step_deeper_than_what_it_takes() {
         let tree = Tree::of(&BuildingType::ALL);
 
-        let columns = tree.columns();
+        let depths = tree.depths();
 
         for place in 0..tree.recipes.len() {
             let node = TreeNode::Recipe(place);
             for needed in tree.neighbours(node, Direction::Needs) {
                 assert!(
-                    columns.of(node) > columns.of(needed),
-                    "{} sits level with or left of the {} it takes",
+                    depths.of(node) > depths.of(needed),
+                    "{} sits level with or above the {} it takes",
                     tree.recipes[place].label(),
                     tree.label_of(needed)
                 );
@@ -795,6 +798,16 @@ mod tests {
 
         open_the_tree(&mut app);
         assert_eq!(trees(&mut app), 0);
+    }
+
+    #[test]
+    fn the_sheet_draws_a_box_for_every_node_of_the_tree() {
+        let mut app = tree_app();
+
+        open_the_tree(&mut app);
+
+        let nodes = app.world().resource::<Tree>().nodes().count();
+        assert_eq!(node_fills(&mut app).len(), nodes);
     }
 
     #[test]
