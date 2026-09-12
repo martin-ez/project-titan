@@ -21,7 +21,6 @@ use crate::ui::legend::{
 use bevy::ecs::system::SystemParam;
 use bevy::input::InputSystems;
 use bevy::prelude::*;
-use bevy::window::{CursorOptions, PrimaryWindow};
 
 /// The key that picks up each tool, and the tool it picks up
 const TOOL_KEYS: [(KeyCode, PlayerAction); 3] = [
@@ -151,6 +150,21 @@ impl PlayerInput {
         self.finish_key || self.secondary_tapped()
     }
 
+    /// Give the interface this frame's click, and the pointer with it.
+    ///
+    /// The player is aiming at one side of the screen or the other, so a pointer the interface has
+    /// taken points nowhere in the world: the click reaches nothing there and neither does the
+    /// cursor, which is what puts the editing mark out while the player is over a panel. Both
+    /// halves of that are one call, because a click the world still answers while the cursor has
+    /// stopped pointing at anything is a player aiming at two places at once.
+    pub fn the_interface_took_the_pointer(&mut self) {
+        self.claimed_by_the_interface = true;
+        self.world_cursor_position = None;
+        self.ground_cursor_position = None;
+        self.cursor_tile = None;
+        self.cursor_node = None;
+    }
+
     #[cfg(test)]
     pub fn tap(&mut self, clicked: bool) {
         self.tap = clicked;
@@ -167,7 +181,10 @@ impl PlayerInput {
     }
 }
 
-/// The set the player's commands are read in, so a system on the frame can run after it.
+/// The set everything the player asked for is read in, so a system on the frame can run after it.
+///
+/// It holds the reading of the keys, of the cursor and of the widgets a press reaches, so a system
+/// after it sees one settled account of what the player did with this frame however they did it.
 ///
 /// Only a system in `PreUpdate` needs it. One reading a command in `Update` already runs after the
 /// whole of `PreUpdate`, and ordering across schedules says nothing that the schedules do not.
@@ -215,7 +232,6 @@ impl<C: Copy + PartialEq> Requested<C> {
     }
 
     /// Ask for `command` on this frame, without the press that would otherwise reach it.
-    #[cfg(test)]
     pub fn ask(&mut self, command: C) {
         self.0.push(command);
     }
@@ -236,6 +252,12 @@ impl<C> Default for CommandBindings<C> {
 /// Call it from `build`. The plugin declaring them owns the command type and this owns nothing but
 /// the reading, so there is nowhere a list of every command in the game could live.
 pub trait DeclareCommands {
+    /// Make what the player asked for among `C`'s commands readable for the frame they asked on.
+    ///
+    /// Declaring a command does this for it. Say it outright where a command is reached by
+    /// something other than the press that declared it, a widget being the one there is.
+    fn read_requests_of<C: Copy + PartialEq + Send + Sync + 'static>(&mut self) -> &mut Self;
+
     /// Add these commands, as ones that answer wherever the player is standing.
     fn declare_commands<C: Copy + PartialEq + Send + Sync + 'static>(
         &mut self,
@@ -257,21 +279,27 @@ pub trait DeclareCommands {
 }
 
 impl DeclareCommands for App {
+    fn read_requests_of<C: Copy + PartialEq + Send + Sync + 'static>(&mut self) -> &mut Self {
+        if !self.world().contains_resource::<Requested<C>>() {
+            self.init_resource::<Requested<C>>()
+                .add_systems(Last, forget_the_commands::<C>);
+        }
+        self
+    }
+
     fn declare_commands_when<C: Copy + PartialEq + Send + Sync + 'static>(
         &mut self,
         condition: BindingCondition,
         commands: impl IntoIterator<Item = PlayerCommand<C>>,
     ) -> &mut Self {
+        self.read_requests_of::<C>();
         if !self.world().contains_resource::<CommandBindings<C>>() {
-            self.init_resource::<CommandBindings<C>>()
-                .init_resource::<Requested<C>>()
-                .add_systems(
-                    PreUpdate,
-                    read_the_commands::<C>
-                        .after(InputSystems)
-                        .in_set(CommandsRead),
-                )
-                .add_systems(Last, forget_the_commands::<C>);
+            self.init_resource::<CommandBindings<C>>().add_systems(
+                PreUpdate,
+                read_the_commands::<C>
+                    .after(InputSystems)
+                    .in_set(CommandsRead),
+            );
         }
         for command in commands {
             self.declare_bindings_when(
@@ -348,7 +376,7 @@ impl Plugin for PlayerInputPlugin {
                 action,
                 category: BindingCategory::Camera,
             }))
-            .add_systems(Startup, (spawn_indicator, hide_the_cursor))
+            .add_systems(Startup, spawn_indicator)
             .add_systems(
                 PreUpdate,
                 (
@@ -356,7 +384,8 @@ impl Plugin for PlayerInputPlugin {
                     update_player_action,
                     update_player_input,
                 )
-                    .after(InputSystems),
+                    .after(InputSystems)
+                    .in_set(CommandsRead),
             )
             .add_systems(Update, update_indicator)
             .add_systems(Last, forget_the_claim);
@@ -374,12 +403,6 @@ fn spawn_indicator(
         Mesh3d(meshes.add(Sphere::new(0.1))),
         MeshMaterial3d(materials.add(Color::srgb(0.1, 0.2, 0.9))),
     ));
-}
-
-fn hide_the_cursor(mut cursor_q: Query<&mut CursorOptions, With<PrimaryWindow>>) {
-    for mut cursor_options in &mut cursor_q {
-        cursor_options.visible = false;
-    }
 }
 
 /// Update the camera movement type based on the player's input
@@ -660,11 +683,6 @@ mod tests {
             landed.distance(expected) < 1e-4,
             "{landed:?} is not where {expected:?} is"
         );
-    }
-
-    fn spawn_a_primary_window(app: &mut App) {
-        app.world_mut()
-            .spawn((Window::default(), PrimaryWindow, CursorOptions::default()));
     }
 
     #[test]
@@ -1285,22 +1303,6 @@ mod tests {
             Vec3::new(0., 2., 0.),
         );
         assert_eq!(player_input(&app).cursor_tile, None);
-    }
-
-    #[test]
-    fn a_primary_window_has_its_cursor_hidden() {
-        let mut app = headless_app();
-        spawn_a_primary_window(&mut app);
-        app.add_plugins(PlayerInputPlugin);
-
-        tick(&mut app);
-
-        let mut query = app.world_mut().query::<&CursorOptions>();
-        let cursor = query
-            .iter(app.world())
-            .next()
-            .expect("the window the test spawned is still there");
-        assert!(!cursor.visible);
     }
 
     #[test]

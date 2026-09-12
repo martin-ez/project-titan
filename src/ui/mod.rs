@@ -1,23 +1,24 @@
 //! What the game puts on screen for the player to read, and the layer it is drawn with.
 //!
-//! Panels here are `bevy_ui` nodes styled by this project, chosen over Bevy's `bevy_feathers`:
-//! Feathers is an editor and inspector widget set, aimed at a future Bevy editor's look and
-//! documented as deliberately not for a game's own interface, so adopting it would buy a theme,
-//! an embedded font and a material stack in exchange for a look this game does not want. Where a
-//! control needs behaviour rather than a look, `bevy_ui_widgets` is the styling-free upstream it
-//! comes from — `EditableText` and the rest are `bevy_ui`'s, not Feathers'.
+//! Panels here are `bevy_ui` nodes styled by this project rather than Bevy's `bevy_feathers`,
+//! which is an editor widget set documented as deliberately not for a game's own interface: it
+//! would buy a theme, an embedded font and a material stack in exchange for a look this game does
+//! not want. Where a control needs behaviour rather than a look, `bevy_ui_widgets` is the
+//! styling-free upstream Feathers comes from.
 //!
-//! A panel that reads the game out never writes it: the only way the player changes the game is
-//! the action a press already goes through (invariant 4). A settings panel is the one that does
-//! write, and only ever the settings resource it is an editor of — a sensitivity is a setting on
-//! the player's own input, not a fact a rover could observe. What every panel is drawn in is
-//! here, so two of them cannot drift into two looks.
+//! A panel that reads the game out never writes it: what the player presses asks for the command
+//! that already changes the thing, so a widget is a second way in and never a second writer
+//! (invariant 4). The settings panel is the one exception, editing the resource it is an editor
+//! of. Which side of the screen a press belongs to is settled by `pointer`, whose one rule is that
+//! the player is aiming at the interface or at the world and never at both. What every panel and
+//! widget is drawn in is here, so two of them cannot drift into two looks.
 
 use bevy::prelude::*;
 
 pub mod building_panel;
 pub mod junction_panel;
 pub mod legend;
+pub mod pointer;
 pub mod production_tree;
 pub mod selection;
 pub mod settings_panel;
