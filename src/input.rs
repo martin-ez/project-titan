@@ -386,6 +386,11 @@ fn update_player_action(
 ///
 /// The cursor points nowhere without a window to point in, and nowhere without a camera to point
 /// from, but a key and a click are still a key and a click: neither half stops the other.
+///
+/// A node is named from where the ray meets the ground plane rather than from the surface it
+/// landed on. The lattice lies in that plane, and a point taken above it stands towards the camera
+/// of the node under it by the height it was taken at, which over a building is wider than a tile
+/// (invariant 3).
 fn update_player_input(
     mut player_input: ResMut<PlayerInput>,
     input: Res<ButtonInput<KeyCode>>,
@@ -414,7 +419,8 @@ fn update_player_input(
         .window
         .as_ref()
         .and_then(|window| get_cursor_ray(window, camera, camera_transform));
-    player_input.ground_cursor_position = ray.and_then(ground_plane_position);
+    let ground = ray.and_then(ground_plane_position);
+    player_input.ground_cursor_position = ground;
 
     let hit = ray.and_then(|ray| cursor.surfaces.cast(ray));
     let node = hit
@@ -422,7 +428,7 @@ fn update_player_input(
         .filter(|_| *action.get() == PlayerAction::EditRoads)
         .and_then(|hit| {
             let tile = cursor.tiles.get(hit.tile?.entity).ok()?;
-            Some(LatticeNode::nearest_on(tile.coordinates, hit.point))
+            Some(LatticeNode::nearest_on(tile.coordinates, ground?))
         });
 
     player_input.cursor_node = node;
@@ -434,13 +440,13 @@ fn update_player_input(
 /// Where the cursor reports itself to be, given the tool the player is holding.
 ///
 /// The road tool settles it on `node`, which a road may be built through, and the building tool
-/// over the middle of the tile, which is where a building stands. The height it landed at is its
-/// own either way, so a cursor over a building stays on top of the building rather than dropping
-/// through it.
+/// over the middle of the tile, which is where a building stands. A node stands in the ground
+/// plane, so the road tool takes the whole of its place and reports the corner it names rather
+/// than a point above it; the building tool keeps the height the cursor landed at, so it stays on
+/// top of a building rather than dropping through it.
 fn settled_position(hit: &CursorHit, action: &PlayerAction, node: Option<LatticeNode>) -> Vec3 {
     if let Some(node) = node {
-        let settled = node.world_position();
-        return Vec3::new(settled.x, hit.point.y, settled.z);
+        return node.world_position();
     }
     match hit.tile {
         Some(tile) if *action == PlayerAction::EditBuildings => {
@@ -502,7 +508,7 @@ fn update_indicator(
 mod tests {
     use super::*;
     use crate::common::cursor::{CursorSurface, TileSurface};
-    use crate::map::HexCoordinates;
+    use crate::map::{HexCoordinates, TileCorner, MAP_TILE_SIZE};
     use crate::testing::{
         ask_for, headless_app, press_key, press_mouse, release_key, release_mouse, tick,
     };
@@ -553,16 +559,17 @@ mod tests {
         app
     }
 
-    fn spawn_surface_at(app: &mut App, centre: Vec3, height: f32) -> Entity {
+    fn spawn_surface_of(app: &mut App, centre: Vec3, radius: f32, height: f32) -> Entity {
         app.world_mut()
             .spawn((
-                CursorSurface {
-                    radius: SURFACE_RADIUS,
-                    height,
-                },
+                CursorSurface { radius, height },
                 Transform::from_translation(centre),
             ))
             .id()
+    }
+
+    fn spawn_surface_at(app: &mut App, centre: Vec3, height: f32) -> Entity {
+        spawn_surface_of(app, centre, SURFACE_RADIUS, height)
     }
 
     fn spawn_surface(app: &mut App, height: f32) -> Entity {
@@ -971,6 +978,133 @@ mod tests {
         hold_tool(&mut app, tool_key(PlayerAction::EditRoads));
 
         assert_eq!(cursor_node(&app), None);
+    }
+
+    /// The circumradius the grid gives a tile, and so the footprint a building on one covers.
+    const TILE_RADIUS: f32 = MAP_TILE_SIZE / 2.;
+
+    /// How far a building's surface stands above the tile it covers.
+    const A_BUILDING_TALL: f32 = 4.;
+
+    /// The pitch the camera starts on.
+    const DEFAULT_PITCH: f32 = 30.;
+
+    /// How far back along its own forward the camera aiming fixture stands.
+    const AIMED_FROM: f32 = 50.;
+
+    /// A turn of the camera in sixths, which carries each corner of a tile in turn to the far side.
+    const YAWS: [f32; 6] = [0., 60., 120., 180., 240., 300.];
+
+    /// Pitches spanning what the camera allows, the range itself being the camera's own to hold.
+    const PITCHES: [f32; 3] = [20., 45., 89.];
+
+    /// An app whose cursor is aimed down a ray through `target`, from `yaw` and `pitch` in degrees.
+    ///
+    /// The ray cast through the middle of the viewport runs down the camera's own forward axis, so
+    /// standing the camera back along that axis from `target` puts the cursor on it. The rotation
+    /// is built the way the camera builds its own, so a yaw and a pitch here mean what they mean
+    /// to the player.
+    fn app_aimed_at(target: Vec3, yaw: f32, pitch: f32) -> App {
+        let mut app = input_app();
+        let mut camera = Camera::default();
+        camera.computed.target_info = Some(RenderTargetInfo {
+            physical_size: WINDOW_SIZE,
+            scale_factor: 1.,
+        });
+        let rotation = Quat::from_euler(EulerRot::YXZ, yaw.to_radians(), -pitch.to_radians(), 0.);
+        app.world_mut().spawn((
+            camera,
+            Camera3d::default(),
+            Transform::from_translation(target - rotation * Vec3::NEG_Z * AIMED_FROM)
+                .with_rotation(rotation),
+        ));
+
+        let mut window = Window::default();
+        window.set_physical_cursor_position(Some(DVec2::new(
+            WINDOW_SIZE.x as f64 / 2.,
+            WINDOW_SIZE.y as f64 / 2.,
+        )));
+        app.world_mut().spawn(window);
+
+        tick(&mut app);
+        app
+    }
+
+    /// Stand a building over `origin_tile()`, and lay the tiles sharing `corner` with it.
+    ///
+    /// A corner stands on the rim the three tiles sharing it hold in common, so which of them a
+    /// point aimed at it belongs to is settled by rounding: all three are there for one of them
+    /// to claim it, the way the grid the player plays on has them.
+    fn spawn_a_building_on_the_tile_at(app: &mut App, corner: TileCorner) {
+        for tile in corner
+            .node_of(origin_tile())
+            .tiles_sharing()
+            .expect("a corner is shared by three tiles")
+        {
+            let ground = spawn_surface_of(app, tile.world_position(), TILE_RADIUS, 0.);
+            app.world_mut()
+                .entity_mut(ground)
+                .insert((TileSurface, MapTile { coordinates: tile }));
+        }
+        spawn_surface_of(
+            app,
+            origin_tile().world_position(),
+            TILE_RADIUS,
+            A_BUILDING_TALL,
+        );
+    }
+
+    /// The node the road tool names with the cursor aimed at `corner` of a tile a building holds.
+    fn node_aimed_at(corner: TileCorner, yaw: f32, pitch: f32) -> Option<LatticeNode> {
+        let mut app = app_aimed_at(corner.node_of(origin_tile()).world_position(), yaw, pitch);
+        spawn_a_building_on_the_tile_at(&mut app, corner);
+
+        hold_tool(&mut app, tool_key(PlayerAction::EditRoads));
+
+        cursor_node(&app)
+    }
+
+    #[test]
+    fn the_cursor_names_every_corner_of_a_tile_a_building_stands_on() {
+        for corner in TileCorner::ALL {
+            let node = corner.node_of(origin_tile());
+
+            assert_eq!(
+                node_aimed_at(corner, 0., DEFAULT_PITCH),
+                Some(node),
+                "aiming at {corner:?} named another node"
+            );
+        }
+    }
+
+    #[test]
+    fn every_corner_of_a_built_on_tile_stays_nameable_as_the_camera_orbits() {
+        for yaw in YAWS {
+            for corner in TileCorner::ALL {
+                let node = corner.node_of(origin_tile());
+
+                assert_eq!(
+                    node_aimed_at(corner, yaw, DEFAULT_PITCH),
+                    Some(node),
+                    "aiming at {corner:?} named another node at a yaw of {yaw}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_corner_of_a_built_on_tile_stays_nameable_at_any_pitch() {
+        for pitch in PITCHES {
+            for corner in TileCorner::ALL {
+                let node = corner.node_of(origin_tile());
+
+                assert_eq!(
+                    node_aimed_at(corner, 0., pitch),
+                    Some(node),
+                    "aiming at {corner:?} named another node at a pitch of {pitch}"
+                );
+            }
+        }
     }
 
     #[test]
