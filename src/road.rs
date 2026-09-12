@@ -3131,7 +3131,7 @@ mod tests {
     use crate::common::cleanup::CleanupPlugin;
     use crate::common::initialize::InitializationFailed;
     use crate::diagnostics::DebugGizmosPlugin;
-    use crate::map::{Deposit, RawMaterial, MAP_TILE_SIZE};
+    use crate::map::{Deposit, RawMaterial, TileCorner, MAP_TILE_SIZE};
     use crate::testing::{ask_for, headless_app, press_key, release_key, tick};
     use crate::ui::selection::SelectionPlugin;
     use std::collections::HashSet;
@@ -3947,6 +3947,54 @@ mod tests {
         click_at(&mut app, nodes(&ACROSS_THE_TILES)[0]);
 
         assert_eq!(placing(&mut app), 0);
+    }
+
+    /// The middle of a tile sharing `corner` of `BUILT_ON` that no building stands on.
+    fn beside_the_building(corner: TileCorner) -> LatticeNode {
+        corner
+            .node_of(tile(BUILT_ON))
+            .tiles_sharing()
+            .expect("a corner is shared by three tiles")
+            .into_iter()
+            .find(|&sharing| sharing != tile(BUILT_ON))
+            .map(LatticeNode::from_tile)
+            .expect("a corner has a tile beside the one it belongs to")
+    }
+
+    #[test]
+    fn a_road_can_be_begun_on_every_corner_of_a_tile_a_building_stands_on() {
+        let refused: Vec<TileCorner> = TileCorner::ALL
+            .into_iter()
+            .filter(|&corner| {
+                let mut app = app_holding(PlayerAction::EditRoads);
+                put_a_building_on(&mut app, BUILT_ON);
+
+                click_at(&mut app, corner.node_of(tile(BUILT_ON)));
+
+                placing(&mut app) == 0
+            })
+            .collect();
+
+        assert!(refused.is_empty(), "no road could be begun on {refused:?}");
+    }
+
+    #[test]
+    fn a_road_can_be_laid_onto_every_corner_of_a_tile_a_building_stands_on() {
+        let refused: Vec<TileCorner> = TileCorner::ALL
+            .into_iter()
+            .filter(|&corner| {
+                let mut app = app_holding(PlayerAction::EditRoads);
+                put_a_building_on(&mut app, BUILT_ON);
+
+                click_at(&mut app, beside_the_building(corner));
+                click_at(&mut app, corner.node_of(tile(BUILT_ON)));
+                finish_the_road(&mut app);
+
+                roads_in_the_world(&mut app) == 0
+            })
+            .collect();
+
+        assert!(refused.is_empty(), "no road could be laid onto {refused:?}");
     }
 
     #[test]
