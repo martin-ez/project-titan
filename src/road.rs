@@ -423,6 +423,13 @@ pub enum JunctionPolicy {
 /// the road's own component, declared beside it rather than in the panel that will read it.
 pub struct JunctionSignalPlugin;
 
+/// The point in a frame by which the junction picked out carries the signal the player asked for.
+///
+/// A press is true for the frame it is made on, so a reading of a signal taken before this is the
+/// signal as it stood before the key, and shows the player the press before last.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Signalled;
+
 /// A signal the player has put on a junction, holding every leg but one of them red.
 ///
 /// It sits beside the [`JunctionPolicy`] rather than replacing it, because the policy is derived
@@ -1148,6 +1155,19 @@ impl JunctionLegs {
         out.into_iter().map(|(_, way)| way).collect()
     }
 
+    /// Which way each arm `road` has at this junction heads away from it.
+    ///
+    /// A road crossed in its middle answers with two, a road ending here with one, and a road
+    /// that does not reach the junction with none. It is what a reading of who meets here is
+    /// named from, so a name is asked of the road network rather than measured off the screen.
+    pub fn arms_of(&self, road: Entity) -> Vec<Vec3> {
+        self.0
+            .iter()
+            .filter(|leg| leg.road == road)
+            .map(|leg| leg.heading)
+            .collect()
+    }
+
     fn road_of(&self, leg: usize) -> Option<Entity> {
         self.0.get(leg).map(|leg| leg.road)
     }
@@ -1204,6 +1224,18 @@ impl Signal {
         self.favouring
     }
 
+    /// How many ticks of green `road` holds each time the cycle comes round to it.
+    ///
+    /// The favoured road holds the run the player timed and every other holds a single tick, so
+    /// what a signal costs the rest of the junction is a number the player can read rather than
+    /// a cycle they have to watch go by.
+    pub fn green_for(&self, road: Entity) -> u32 {
+        match road == self.favouring {
+            true => self.green.max(SHORTEST_GREEN),
+            false => SHORTEST_GREEN,
+        }
+    }
+
     /// Lengthen or shorten the green by `asked`, never below a single tick.
     ///
     /// A leg green for no ticks at all is a road closed rather than a road waiting, and closing a
@@ -1249,9 +1281,9 @@ impl Signal {
     }
 
     fn held_by(&self, legs: &JunctionLegs, leg: usize) -> u64 {
-        match legs.road_of(leg) == Some(self.favouring) {
-            true => self.green.max(SHORTEST_GREEN) as u64,
-            false => SHORTEST_GREEN as u64,
+        match legs.road_of(leg) {
+            Some(road) => self.green_for(road) as u64,
+            None => SHORTEST_GREEN as u64,
         }
     }
 }
@@ -1432,7 +1464,7 @@ fn place_a_node(
     junctions: Query<&Junction>,
     mut placing: Query<&mut DrawnRoad>,
 ) {
-    if !player_input.tap || *action.get() != PlayerAction::EditRoads {
+    if !player_input.tapped() || *action.get() != PlayerAction::EditRoads {
         return;
     }
     let Some(target) = player_input.cursor_node else {
@@ -1575,7 +1607,7 @@ fn lay_the_road(
     roads: Query<&Road>,
 ) {
     for (entity, placed) in &placing {
-        if !player_input.finish && !reaches_a_road(placed, &roads) {
+        if !player_input.asked_to_finish() && !reaches_a_road(placed, &roads) {
             continue;
         }
         commands.entity(entity).despawn();
@@ -1613,7 +1645,7 @@ fn remove_the_arc_under_the_cursor(
     placing: Query<&DrawnRoad>,
     roads: Query<&Road>,
 ) {
-    if !player_input.secondary_tap
+    if !player_input.secondary_tapped()
         || *action.get() != PlayerAction::EditRoads
         || !placing.is_empty()
     {
@@ -1790,6 +1822,7 @@ impl Plugin for JunctionSignalPlugin {
                 time_the_signal_the_player_picked_out,
             )
                 .chain()
+                .in_set(Signalled)
                 .after(Picked),
         );
     }
@@ -3482,22 +3515,29 @@ mod tests {
         assert_eq!(segments_in_the_world(&mut app), 0);
     }
 
+    /// Take the next click for the interface, as whatever notices a press on a panel would.
+    fn claim_the_click(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<PlayerInput>()
+            .claimed_by_the_interface = true;
+    }
+
     /// Click on `node`, and take the frame that reads the click.
     fn click_at(app: &mut App, node: LatticeNode) {
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
             input.cursor_node = Some(node);
-            input.tap = true;
+            input.tap(true);
         }
         tick(app);
-        app.world_mut().resource_mut::<PlayerInput>().tap = false;
+        app.world_mut().resource_mut::<PlayerInput>().tap(false);
     }
 
     /// Ask for the road being placed to be laid, and take the frame that reads it.
     fn finish_the_road(app: &mut App) {
-        app.world_mut().resource_mut::<PlayerInput>().finish = true;
+        app.world_mut().resource_mut::<PlayerInput>().finish(true);
         tick(app);
-        app.world_mut().resource_mut::<PlayerInput>().finish = false;
+        app.world_mut().resource_mut::<PlayerInput>().finish(false);
     }
 
     /// Click through `path` and finish, which is how a whole road is placed.
@@ -3556,6 +3596,30 @@ mod tests {
     }
 
     #[test]
+    fn a_click_the_interface_claimed_places_no_node() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+
+        claim_the_click(&mut app);
+        click_at(&mut app, nodes(&STRAIGHT)[0]);
+
+        assert_eq!(placing(&mut app), 0);
+    }
+
+    #[test]
+    fn a_right_click_the_interface_claimed_finishes_no_road() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        let path = nodes(&STRAIGHT);
+        click_at(&mut app, path[0]);
+        click_at(&mut app, path[1]);
+
+        claim_the_click(&mut app);
+        right_click_at(&mut app, path[1].world_position());
+
+        assert_eq!(roads_in_the_world(&mut app), 0);
+        assert_eq!(placing(&mut app), 1);
+    }
+
+    #[test]
     fn nothing_is_laid_until_the_road_is_finished() {
         let mut app = app_holding(PlayerAction::EditRoads);
 
@@ -3598,10 +3662,10 @@ mod tests {
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
             input.cursor_node = None;
-            input.tap = true;
+            input.tap(true);
         }
         tick(&mut app);
-        app.world_mut().resource_mut::<PlayerInput>().tap = false;
+        app.world_mut().resource_mut::<PlayerInput>().tap(false);
         click_at(&mut app, path[1]);
         finish_the_road(&mut app);
 
@@ -3712,13 +3776,13 @@ mod tests {
         take_up(app, PlayerAction::EditBuildings);
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.secondary_tap = true;
+            input.secondary_tap(true);
             input.cursor_tile = Some(tile);
         }
         tick(app);
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.secondary_tap = false;
+            input.secondary_tap(false);
             input.cursor_tile = None;
         }
         take_up(app, PlayerAction::EditRoads);
@@ -3728,13 +3792,13 @@ mod tests {
     fn tap_on(app: &mut App, tile: Entity) {
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.tap = true;
+            input.tap(true);
             input.cursor_tile = Some(tile);
         }
         tick(app);
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.tap = false;
+            input.tap(false);
             input.cursor_tile = None;
         }
     }
@@ -4839,6 +4903,48 @@ mod tests {
     }
 
     #[test]
+    fn the_favoured_road_holds_the_green_it_was_given() {
+        let (_, crossed, _) = a_crossed_road();
+        let signal = Signal::favouring(crossed);
+
+        assert_eq!(signal.green_for(crossed), OPENING_GREEN);
+    }
+
+    #[test]
+    fn every_road_but_the_favoured_one_holds_the_shortest_green() {
+        let (_, crossed, crossing) = a_crossed_road();
+        let signal = Signal::favouring(crossed);
+
+        assert_eq!(signal.green_for(crossing), SHORTEST_GREEN);
+    }
+
+    #[test]
+    fn timing_the_signal_moves_what_the_favoured_road_holds() {
+        let (_, crossed, _) = a_crossed_road();
+        let mut signal = Signal::favouring(crossed);
+
+        signal.tune(2);
+
+        assert_eq!(signal.green_for(crossed), OPENING_GREEN + 2);
+    }
+
+    #[test]
+    fn a_road_crossed_in_its_middle_has_an_arm_either_side_of_the_junction() {
+        let (mut app, crossed, _) = a_crossed_road();
+        let arms = the_arms(&mut app).arms_of(crossed);
+
+        assert_eq!(arms.len(), 2);
+        assert!(arms[0].dot(arms[1]) < 0., "{arms:?} head the same way");
+    }
+
+    #[test]
+    fn a_road_that_is_nowhere_near_the_junction_has_no_arms_on_it() {
+        let (mut app, _, _) = a_crossed_road();
+
+        assert!(the_arms(&mut app).arms_of(Entity::PLACEHOLDER).is_empty());
+    }
+
+    #[test]
     fn every_leg_of_a_signalled_junction_comes_round_to_the_green() {
         let (mut app, crossed, _) = a_crossed_road();
         let legs = the_arms(&mut app);
@@ -4907,11 +5013,11 @@ mod tests {
             .expect("the junction stands somewhere");
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.tap = true;
+            input.tap(true);
             input.world_cursor_position = Some(at);
         }
         tick(app);
-        app.world_mut().resource_mut::<PlayerInput>().tap = false;
+        app.world_mut().resource_mut::<PlayerInput>().tap(false);
         junction
     }
 
@@ -5552,15 +5658,12 @@ mod tests {
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
             input.ground_cursor_position = Some(at);
-            input.secondary_tap = true;
-            input.finish = true;
+            input.secondary_tap(true);
         }
         tick(app);
-        {
-            let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.secondary_tap = false;
-            input.finish = false;
-        }
+        app.world_mut()
+            .resource_mut::<PlayerInput>()
+            .secondary_tap(false);
         tick(app);
     }
 
@@ -5607,6 +5710,19 @@ mod tests {
             .query_filtered::<Entity, With<Road>>()
             .iter(app.world())
             .collect()
+    }
+
+    #[test]
+    fn a_right_click_the_interface_claimed_removes_no_arc() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        spawn_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+
+        claim_the_click(&mut app);
+        right_click_at(&mut app, middle_of(&STRAIGHT, 1));
+
+        assert_eq!(roads_in_the_world(&mut app), 1);
+        assert!(a_road_runs_through(&mut app, &STRAIGHT));
     }
 
     #[test]

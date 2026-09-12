@@ -16,6 +16,7 @@
 use bevy::prelude::*;
 
 pub mod building_panel;
+pub mod junction_panel;
 pub mod legend;
 pub mod production_tree;
 pub mod selection;
@@ -57,6 +58,8 @@ pub enum Panel {
     Settings,
     /// The reading of whatever the player picked out.
     Building,
+    /// The reading of the junction the player picked out.
+    Junction,
     /// The tree of everything the game can make.
     ProductionTree,
 }

@@ -1,3 +1,18 @@
+//! How a key, a click and the cursor become something the rest of the game can act on.
+//!
+//! A click belongs to one side of the screen or the other. Either the interface took it, the
+//! player having pressed something drawn over the world, or the world did, and no press is both.
+//! The interface says which by claiming the frame's click, and a claimed click reaches nothing in
+//! the world: no selection moves, no building goes down or comes up, no road node is placed and
+//! no road is finished. Only whatever draws the interface can tell a press on a panel from a
+//! press on the ground, so claiming is its to do; what a claim then means is one fact about the
+//! frame, read the same way by everything that acts on a click.
+//!
+//! A claim is made on the frame it belongs to and forgotten at the end of it, like everything
+//! else the player pressed (invariant 2). The press itself is kept as the mouse reported it and
+//! reached only through `PlayerInput`, which subtracts the claim, so a system in the world cannot
+//! read past the rule to the button underneath. A key is not a click and no claim takes one.
+
 use crate::common::cursor::{CursorHit, CursorRayCast};
 use crate::map::{LatticeNode, MapTile};
 use crate::ui::legend::{
@@ -103,14 +118,53 @@ pub struct PlayerInput {
     pub cursor_node: Option<LatticeNode>,
     /// The normalized vector representing the player's movement (WASD)
     pub movement_vector: Vec3,
-    /// Whether the player just tap or clicked
-    pub tap: bool,
-    /// Whether the player just clicked with the secondary mouse button
-    pub secondary_tap: bool,
-    /// Whether the player just asked to finish placing what they are part way through
-    pub finish: bool,
     /// Whether the player just asked to turn what they are about to place
     pub turn: bool,
+    /// Whether the interface took this frame's click, leaving nothing in the world to act on it
+    ///
+    /// Set by whatever draws the interface, that being the only side of the screen able to tell a
+    /// press on a panel from a press on the ground, and let go of at the end of the frame it was
+    /// set on. Nothing in the world sets it: a click is read there through `Res`, and the systems
+    /// that act on one never hold the resource by the end that could.
+    pub claimed_by_the_interface: bool,
+    tap: bool,
+    secondary_tap: bool,
+    finish_key: bool,
+}
+
+impl PlayerInput {
+    /// Whether the player just clicked on the world.
+    pub fn tapped(&self) -> bool {
+        self.tap && !self.claimed_by_the_interface
+    }
+
+    /// Whether the player just clicked on the world with the secondary mouse button.
+    pub fn secondary_tapped(&self) -> bool {
+        self.secondary_tap && !self.claimed_by_the_interface
+    }
+
+    /// Whether the player just asked to finish placing what they are part way through.
+    ///
+    /// The secondary button asks for it as well as the key does, which is how a road is finished
+    /// without reaching for one — so a click the interface took stops asking and a key never does.
+    pub fn asked_to_finish(&self) -> bool {
+        self.finish_key || self.secondary_tapped()
+    }
+
+    #[cfg(test)]
+    pub fn tap(&mut self, clicked: bool) {
+        self.tap = clicked;
+    }
+
+    #[cfg(test)]
+    pub fn secondary_tap(&mut self, clicked: bool) {
+        self.secondary_tap = clicked;
+    }
+
+    #[cfg(test)]
+    pub fn finish(&mut self, asked: bool) {
+        self.finish_key = asked;
+    }
 }
 
 /// The set the player's commands are read in, so a system on the frame can run after it.
@@ -250,6 +304,11 @@ fn read_the_commands<C: Copy + PartialEq + Send + Sync + 'static>(
     }
 }
 
+/// Let go of the interface's claim on the click, the frame it was made on being over.
+fn forget_the_claim(mut player_input: ResMut<PlayerInput>) {
+    player_input.claimed_by_the_interface = false;
+}
+
 /// Forget what the player asked for, the frame they asked on being over.
 fn forget_the_commands<C: Copy + PartialEq + Send + Sync + 'static>(
     mut requested: ResMut<Requested<C>>,
@@ -299,7 +358,8 @@ impl Plugin for PlayerInputPlugin {
                 )
                     .after(InputSystems),
             )
-            .add_systems(Update, update_indicator);
+            .add_systems(Update, update_indicator)
+            .add_systems(Last, forget_the_claim);
     }
 }
 
@@ -386,6 +446,11 @@ fn update_player_action(
 ///
 /// The cursor points nowhere without a window to point in, and nowhere without a camera to point
 /// from, but a key and a click are still a key and a click: neither half stops the other.
+///
+/// A node is named from where the ray meets the ground plane, not from the surface it landed on.
+/// Both the lattice and a tile's own surface lie in that plane, while a point taken above it
+/// stands towards the camera of the node beneath by the height it was taken at — over a building,
+/// wider than a tile (invariant 3).
 fn update_player_input(
     mut player_input: ResMut<PlayerInput>,
     input: Res<ButtonInput<KeyCode>>,
@@ -395,7 +460,7 @@ fn update_player_input(
 ) {
     player_input.tap = mouse_input.just_pressed(MouseButton::Left);
     player_input.secondary_tap = mouse_input.just_pressed(MouseButton::Right);
-    player_input.finish = player_input.secondary_tap || input.just_pressed(FINISH_KEY);
+    player_input.finish_key = input.just_pressed(FINISH_KEY);
     player_input.turn = input.just_pressed(TURN_KEY);
 
     let Some(camera) = &cursor.camera else {
@@ -414,7 +479,8 @@ fn update_player_input(
         .window
         .as_ref()
         .and_then(|window| get_cursor_ray(window, camera, camera_transform));
-    player_input.ground_cursor_position = ray.and_then(ground_plane_position);
+    let ground = ray.and_then(ground_plane_position);
+    player_input.ground_cursor_position = ground;
 
     let hit = ray.and_then(|ray| cursor.surfaces.cast(ray));
     let node = hit
@@ -422,7 +488,7 @@ fn update_player_input(
         .filter(|_| *action.get() == PlayerAction::EditRoads)
         .and_then(|hit| {
             let tile = cursor.tiles.get(hit.tile?.entity).ok()?;
-            Some(LatticeNode::nearest_on(tile.coordinates, hit.point))
+            Some(LatticeNode::nearest_on(tile.coordinates, ground?))
         });
 
     player_input.cursor_node = node;
@@ -434,13 +500,13 @@ fn update_player_input(
 /// Where the cursor reports itself to be, given the tool the player is holding.
 ///
 /// The road tool settles it on `node`, which a road may be built through, and the building tool
-/// over the middle of the tile, which is where a building stands. The height it landed at is its
-/// own either way, so a cursor over a building stays on top of the building rather than dropping
-/// through it.
+/// over the middle of the tile, which is where a building stands. A node stands in the ground
+/// plane, so the road tool takes the whole of its place and reports the corner it names rather
+/// than a point above it; the building tool keeps the height the cursor landed at, so it stays on
+/// top of a building rather than dropping through it.
 fn settled_position(hit: &CursorHit, action: &PlayerAction, node: Option<LatticeNode>) -> Vec3 {
     if let Some(node) = node {
-        let settled = node.world_position();
-        return Vec3::new(settled.x, hit.point.y, settled.z);
+        return node.world_position();
     }
     match hit.tile {
         Some(tile) if *action == PlayerAction::EditBuildings => {
@@ -502,13 +568,12 @@ fn update_indicator(
 mod tests {
     use super::*;
     use crate::common::cursor::{CursorSurface, TileSurface};
-    use crate::map::HexCoordinates;
+    use crate::map::{HexCoordinates, TileCorner, MAP_TILE_SIZE};
     use crate::testing::{
         ask_for, headless_app, press_key, press_mouse, release_key, release_mouse, tick,
     };
     use bevy::camera::RenderTargetInfo;
     use bevy::math::DVec2;
-    use std::f32::consts::FRAC_PI_2;
 
     const SURFACE_RADIUS: f32 = 10.;
     const WINDOW_SIZE: UVec2 = UVec2::new(1280, 720);
@@ -527,42 +592,26 @@ mod tests {
 
     /// An app whose cursor sits at the middle of the window, under a camera looking straight down.
     ///
-    /// A headless camera has no render target to size a viewport from, so the test gives it one.
-    /// The ray it casts through the middle of that viewport falls down the world's Y axis.
+    /// The ray it casts through the middle of that viewport falls down the world's Y axis, which
+    /// is a camera aimed at the origin from directly overhead.
     fn app_looking_down_at_the_origin() -> App {
-        let mut app = input_app();
-        let mut camera = Camera::default();
-        camera.computed.target_info = Some(RenderTargetInfo {
-            physical_size: WINDOW_SIZE,
-            scale_factor: 1.,
-        });
-        app.world_mut().spawn((
-            camera,
-            Camera3d::default(),
-            Transform::from_xyz(0., 50., 0.).with_rotation(Quat::from_rotation_x(-FRAC_PI_2)),
-        ));
-
-        let mut window = Window::default();
-        window.set_physical_cursor_position(Some(DVec2::new(
-            WINDOW_SIZE.x as f64 / 2.,
-            WINDOW_SIZE.y as f64 / 2.,
-        )));
-        app.world_mut().spawn(window);
-
-        tick(&mut app);
-        app
+        app_aimed_at(Vec3::ZERO, 0., STRAIGHT_DOWN)
     }
 
-    fn spawn_surface_at(app: &mut App, centre: Vec3, height: f32) -> Entity {
+    /// The pitch of a camera looking straight down, in degrees.
+    const STRAIGHT_DOWN: f32 = 90.;
+
+    fn spawn_surface_of(app: &mut App, centre: Vec3, radius: f32, height: f32) -> Entity {
         app.world_mut()
             .spawn((
-                CursorSurface {
-                    radius: SURFACE_RADIUS,
-                    height,
-                },
+                CursorSurface { radius, height },
                 Transform::from_translation(centre),
             ))
             .id()
+    }
+
+    fn spawn_surface_at(app: &mut App, centre: Vec3, height: f32) -> Entity {
+        spawn_surface_of(app, centre, SURFACE_RADIUS, height)
     }
 
     fn spawn_surface(app: &mut App, height: f32) -> Entity {
@@ -661,6 +710,13 @@ mod tests {
         app.world().resource::<PlayerInput>()
     }
 
+    /// Take the click for the interface, as whatever notices a press on a panel would.
+    fn claim_the_click(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<PlayerInput>()
+            .claimed_by_the_interface = true;
+    }
+
     #[test]
     fn holding_the_orbit_key_switches_the_camera_to_orbiting() {
         let mut app = input_app();
@@ -715,7 +771,7 @@ mod tests {
         press_mouse(&mut app, MouseButton::Left);
         tick(&mut app);
 
-        assert!(player_input(&app).tap);
+        assert!(player_input(&app).tapped());
     }
 
     #[test]
@@ -726,7 +782,7 @@ mod tests {
         press_mouse(&mut app, MouseButton::Right);
         tick(&mut app);
 
-        assert!(player_input(&app).secondary_tap);
+        assert!(player_input(&app).secondary_tapped());
     }
 
     #[test]
@@ -737,7 +793,7 @@ mod tests {
         press_mouse(&mut app, MouseButton::Right);
         tick(&mut app);
 
-        assert!(player_input(&app).finish);
+        assert!(player_input(&app).asked_to_finish());
     }
 
     #[test]
@@ -748,7 +804,7 @@ mod tests {
         press_key(&mut app, FINISH_KEY);
         tick(&mut app);
 
-        assert!(player_input(&app).finish);
+        assert!(player_input(&app).asked_to_finish());
     }
 
     #[test]
@@ -759,7 +815,7 @@ mod tests {
 
         tick(&mut app);
 
-        assert!(!player_input(&app).finish);
+        assert!(!player_input(&app).asked_to_finish());
     }
 
     #[test]
@@ -792,7 +848,7 @@ mod tests {
         press_mouse(&mut app, MouseButton::Left);
         tick(&mut app);
 
-        assert!(!player_input(&app).finish);
+        assert!(!player_input(&app).asked_to_finish());
     }
 
     #[test]
@@ -803,7 +859,68 @@ mod tests {
         press_mouse(&mut app, MouseButton::Right);
         tick(&mut app);
 
-        assert!(!player_input(&app).tap);
+        assert!(!player_input(&app).tapped());
+    }
+
+    #[test]
+    fn a_click_the_interface_claimed_is_no_tap() {
+        let mut app = input_app();
+        tick(&mut app);
+        press_mouse(&mut app, MouseButton::Left);
+        tick(&mut app);
+
+        claim_the_click(&mut app);
+
+        assert!(!player_input(&app).tapped());
+    }
+
+    #[test]
+    fn a_right_click_the_interface_claimed_is_no_secondary_tap() {
+        let mut app = input_app();
+        tick(&mut app);
+        press_mouse(&mut app, MouseButton::Right);
+        tick(&mut app);
+
+        claim_the_click(&mut app);
+
+        assert!(!player_input(&app).secondary_tapped());
+    }
+
+    #[test]
+    fn a_right_click_the_interface_claimed_asks_for_no_finish() {
+        let mut app = input_app();
+        tick(&mut app);
+        press_mouse(&mut app, MouseButton::Right);
+        tick(&mut app);
+
+        claim_the_click(&mut app);
+
+        assert!(!player_input(&app).asked_to_finish());
+    }
+
+    #[test]
+    fn a_claim_on_the_click_leaves_the_finish_key_alone() {
+        let mut app = input_app();
+        tick(&mut app);
+        press_key(&mut app, FINISH_KEY);
+        tick(&mut app);
+
+        claim_the_click(&mut app);
+
+        assert!(player_input(&app).asked_to_finish());
+    }
+
+    #[test]
+    fn a_claim_does_not_outlive_the_frame_it_was_made_on() {
+        let mut app = input_app();
+        tick(&mut app);
+        claim_the_click(&mut app);
+        tick(&mut app);
+
+        press_mouse(&mut app, MouseButton::Left);
+        tick(&mut app);
+
+        assert!(player_input(&app).tapped());
     }
 
     #[test]
@@ -971,6 +1088,154 @@ mod tests {
         hold_tool(&mut app, tool_key(PlayerAction::EditRoads));
 
         assert_eq!(cursor_node(&app), None);
+    }
+
+    /// The circumradius the grid gives a tile, and so the footprint a building on one covers.
+    const TILE_RADIUS: f32 = MAP_TILE_SIZE / 2.;
+
+    /// How far a building's surface stands above the tile it covers.
+    ///
+    /// The same height as the building plugin's own `BUILDING_HEIGHT`, which is private to it. The
+    /// displacement these tests are about is proportional to it, so they measure what the player
+    /// meets only while the two agree.
+    const A_BUILDING_TALL: f32 = 4.;
+
+    /// The pitch the camera starts on.
+    const DEFAULT_PITCH: f32 = 30.;
+
+    /// How far back along its own forward the camera aiming fixture stands.
+    const AIMED_FROM: f32 = 50.;
+
+    /// The five facings a turn of the camera in sixths reaches besides the one it starts on.
+    const YAWS: [f32; 5] = [60., 120., 180., 240., 300.];
+
+    /// Pitches spanning what the camera allows, the range itself being the camera's own to hold.
+    const PITCHES: [f32; 3] = [20., 45., 89.];
+
+    /// An app whose cursor is aimed down a ray through `target`, from `yaw` and `pitch` in degrees.
+    ///
+    /// The ray cast through the middle of the viewport runs down the camera's own forward axis, so
+    /// standing the camera back along that axis from `target` puts the cursor on it. The rotation
+    /// is built the way the camera builds its own, so a yaw and a pitch here mean what they mean
+    /// to the player.
+    fn app_aimed_at(target: Vec3, yaw: f32, pitch: f32) -> App {
+        let mut app = input_app();
+        let mut camera = Camera::default();
+        camera.computed.target_info = Some(RenderTargetInfo {
+            physical_size: WINDOW_SIZE,
+            scale_factor: 1.,
+        });
+        let rotation = Quat::from_euler(EulerRot::YXZ, yaw.to_radians(), -pitch.to_radians(), 0.);
+        app.world_mut().spawn((
+            camera,
+            Camera3d::default(),
+            Transform::from_translation(target - rotation * Vec3::NEG_Z * AIMED_FROM)
+                .with_rotation(rotation),
+        ));
+
+        let mut window = Window::default();
+        window.set_physical_cursor_position(Some(DVec2::new(
+            WINDOW_SIZE.x as f64 / 2.,
+            WINDOW_SIZE.y as f64 / 2.,
+        )));
+        app.world_mut().spawn(window);
+
+        tick(&mut app);
+        app
+    }
+
+    /// Stand a building over `origin_tile()`, and lay the tiles sharing `corner` with it.
+    ///
+    /// A corner stands on the rim the three tiles sharing it hold in common, so which of them a
+    /// point aimed at it belongs to is settled by rounding: all three are there for one of them
+    /// to claim it, the way the grid the player plays on has them.
+    fn spawn_a_building_on_the_tile_at(app: &mut App, corner: TileCorner) {
+        for tile in corner
+            .node_of(origin_tile())
+            .tiles_sharing()
+            .expect("a corner is shared by three tiles")
+        {
+            let ground = spawn_surface_of(app, tile.world_position(), TILE_RADIUS, 0.);
+            app.world_mut()
+                .entity_mut(ground)
+                .insert((TileSurface, MapTile { coordinates: tile }));
+        }
+        spawn_surface_of(
+            app,
+            origin_tile().world_position(),
+            TILE_RADIUS,
+            A_BUILDING_TALL,
+        );
+    }
+
+    /// The node the road tool names with the cursor aimed at `corner` of a tile a building holds.
+    fn node_aimed_at(corner: TileCorner, yaw: f32, pitch: f32) -> Option<LatticeNode> {
+        let mut app = app_aimed_at(corner.node_of(origin_tile()).world_position(), yaw, pitch);
+        spawn_a_building_on_the_tile_at(&mut app, corner);
+
+        hold_tool(&mut app, tool_key(PlayerAction::EditRoads));
+
+        cursor_node(&app)
+    }
+
+    #[test]
+    fn the_cursor_names_every_corner_of_a_tile_a_building_stands_on() {
+        for corner in TileCorner::ALL {
+            let node = corner.node_of(origin_tile());
+
+            assert_eq!(
+                node_aimed_at(corner, 0., DEFAULT_PITCH),
+                Some(node),
+                "aiming at {corner:?} named another node"
+            );
+        }
+    }
+
+    /// The corner of `origin_tile()` that faces away from a camera at a yaw of zero.
+    const CORNER_FACING_AWAY: TileCorner = TileCorner::South;
+
+    #[test]
+    fn the_road_tool_settles_the_cursor_on_its_node_rather_than_over_it() {
+        let node = CORNER_FACING_AWAY.node_of(origin_tile());
+        let mut app = app_aimed_at(node.world_position(), 0., DEFAULT_PITCH);
+        spawn_a_building_on_the_tile_at(&mut app, CORNER_FACING_AWAY);
+
+        hold_tool(&mut app, tool_key(PlayerAction::EditRoads));
+
+        assert_lands_on(
+            player_input(&app).world_cursor_position,
+            node.world_position(),
+        );
+    }
+
+    #[test]
+    fn every_corner_of_a_built_on_tile_stays_nameable_as_the_camera_orbits() {
+        for yaw in YAWS {
+            for corner in TileCorner::ALL {
+                let node = corner.node_of(origin_tile());
+
+                assert_eq!(
+                    node_aimed_at(corner, yaw, DEFAULT_PITCH),
+                    Some(node),
+                    "aiming at {corner:?} named another node at a yaw of {yaw}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_corner_of_a_built_on_tile_stays_nameable_at_any_pitch() {
+        for pitch in PITCHES {
+            for corner in TileCorner::ALL {
+                let node = corner.node_of(origin_tile());
+
+                assert_eq!(
+                    node_aimed_at(corner, 0., pitch),
+                    Some(node),
+                    "aiming at {corner:?} named another node at a pitch of {pitch}"
+                );
+            }
+        }
     }
 
     #[test]

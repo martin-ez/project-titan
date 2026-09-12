@@ -721,7 +721,7 @@ fn place_building_system(
     mut buildings: ResMut<BuildingTiles>,
     tiles: Query<(&MapTile, Option<&Deposit>)>,
 ) {
-    if !player_input.tap || *action.get() != PlayerAction::EditBuildings {
+    if !player_input.tapped() || *action.get() != PlayerAction::EditBuildings {
         return;
     }
     let Some(entity) = player_input.cursor_tile else {
@@ -782,7 +782,7 @@ fn remove_building_system(
     buildings: Res<BuildingTiles>,
     tiles: Query<&MapTile>,
 ) {
-    if !player_input.secondary_tap || *action.get() != PlayerAction::EditBuildings {
+    if !player_input.secondary_tapped() || *action.get() != PlayerAction::EditBuildings {
         return;
     }
     let Some(entity) = player_input.cursor_tile else {
@@ -1020,26 +1020,35 @@ mod tests {
         tile
     }
 
+    /// Take the next click for the interface, as whatever notices a press on a panel would.
+    fn claim_the_click(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<PlayerInput>()
+            .claimed_by_the_interface = true;
+    }
+
     /// Click on `tile`, then let the tap go, so a second frame is not a second click.
     fn tap_on(app: &mut App, tile: Option<Entity>) {
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.tap = true;
+            input.tap(true);
             input.cursor_tile = tile;
         }
         tick(app);
-        app.world_mut().resource_mut::<PlayerInput>().tap = false;
+        app.world_mut().resource_mut::<PlayerInput>().tap(false);
     }
 
     /// Right-click on `tile`, then let the button go, so a second frame is not a second click.
     fn secondary_tap_on(app: &mut App, tile: Option<Entity>) {
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.secondary_tap = true;
+            input.secondary_tap(true);
             input.cursor_tile = tile;
         }
         tick(app);
-        app.world_mut().resource_mut::<PlayerInput>().secondary_tap = false;
+        app.world_mut()
+            .resource_mut::<PlayerInput>()
+            .secondary_tap(false);
     }
 
     fn still_there(app: &App, entity: Entity) -> bool {
@@ -1344,19 +1353,27 @@ mod tests {
 
     #[test]
     fn a_road_on_the_corner_one_port_names_leaves_the_other_port_unserved() {
-        let mut app = building_app(PlayerAction::EditBuildings);
-        let building = place_building_at(&mut app, MELTER, PORTED);
+        for (reached, missed) in [(Flow::Intake, Flow::Outlet), (Flow::Outlet, Flow::Intake)] {
+            let mut app = building_app(PlayerAction::EditBuildings);
+            let building = place_building_at(&mut app, MELTER, PORTED);
 
-        lay_road_to(
-            &mut app,
-            corner_for(MELTER, Flow::Intake).node_of(tile_at(PORTED)),
-            &[PORTED],
-        );
+            lay_road_to(
+                &mut app,
+                corner_for(MELTER, reached).node_of(tile_at(PORTED)),
+                &[PORTED],
+            );
 
-        let intake = port_of(&mut app, building, Flow::Intake);
-        let outlet = port_of(&mut app, building, Flow::Outlet);
-        assert!(is_served(&app, intake), "the road did not serve the intake");
-        assert!(!is_served(&app, outlet), "the outlet was served too");
+            let served = port_of(&mut app, building, reached);
+            let left_off = port_of(&mut app, building, missed);
+            assert!(
+                is_served(&app, served),
+                "the road did not serve the {reached:?}"
+            );
+            assert!(
+                !is_served(&app, left_off),
+                "the {missed:?} was served as well"
+            );
+        }
     }
 
     #[test]
@@ -1611,6 +1628,29 @@ mod tests {
             .entity(building)
             .get::<Children>()
             .is_some_and(|children| !children.is_empty()));
+    }
+
+    #[test]
+    fn a_click_the_interface_claimed_places_no_building() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        let tile = spawn_tile(&mut app, 0, 0);
+
+        claim_the_click(&mut app);
+        tap_on(&mut app, Some(tile));
+
+        assert!(buildings(&mut app).is_empty());
+    }
+
+    #[test]
+    fn a_click_the_interface_claimed_takes_no_building_down() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        let tile = spawn_tile(&mut app, 0, 0);
+        tap_on(&mut app, Some(tile));
+
+        claim_the_click(&mut app);
+        secondary_tap_on(&mut app, Some(tile));
+
+        assert_eq!(buildings(&mut app).len(), 1);
     }
 
     #[test]
