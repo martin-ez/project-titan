@@ -1353,19 +1353,27 @@ mod tests {
 
     #[test]
     fn a_road_on_the_corner_one_port_names_leaves_the_other_port_unserved() {
-        let mut app = building_app(PlayerAction::EditBuildings);
-        let building = place_building_at(&mut app, MELTER, PORTED);
+        for (reached, missed) in [(Flow::Intake, Flow::Outlet), (Flow::Outlet, Flow::Intake)] {
+            let mut app = building_app(PlayerAction::EditBuildings);
+            let building = place_building_at(&mut app, MELTER, PORTED);
 
-        lay_road_to(
-            &mut app,
-            corner_for(MELTER, Flow::Intake).node_of(tile_at(PORTED)),
-            &[PORTED],
-        );
+            lay_road_to(
+                &mut app,
+                corner_for(MELTER, reached).node_of(tile_at(PORTED)),
+                &[PORTED],
+            );
 
-        let intake = port_of(&mut app, building, Flow::Intake);
-        let outlet = port_of(&mut app, building, Flow::Outlet);
-        assert!(is_served(&app, intake), "the road did not serve the intake");
-        assert!(!is_served(&app, outlet), "the outlet was served too");
+            let served = port_of(&mut app, building, reached);
+            let left_off = port_of(&mut app, building, missed);
+            assert!(
+                is_served(&app, served),
+                "the road did not serve the {reached:?}"
+            );
+            assert!(
+                !is_served(&app, left_off),
+                "the {missed:?} was served as well"
+            );
+        }
     }
 
     #[test]
