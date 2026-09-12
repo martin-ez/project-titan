@@ -234,7 +234,7 @@ mod tests {
 
     /// How far through the catalogue a type taking one item in and putting one out sits.
     ///
-    /// The first assembler of `BuildingType::ALL`: an extractor takes nothing in, so it stands no
+    /// The first assembler of `CatalogueEntry::ALL`: an extractor takes nothing in, so it stands no
     /// intake, and an intake is what a fleet is given to.
     const MELTER: isize = 1;
 

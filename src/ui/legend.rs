@@ -17,13 +17,26 @@ use crate::map::{Deposit, RawMaterial};
 use crate::ui::selection::Selection;
 use crate::ui::{
     panel, panel_font, panel_row, panel_text, Panel, PanelCorner, BODY_TEXT, HEADING_TEXT,
-    KEYED_TEXT,
+    KEYED_TEXT, PICKED_OUT,
 };
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
 /// Key binding that shows and hides the legend
 const LEGEND_KEY: KeyCode = KeyCode::F1;
+/// Key binding that walks the picked category up the panel
+const PICK_UP_KEY: KeyCode = KeyCode::PageUp;
+/// Key binding that walks the picked category down the panel
+const PICK_DOWN_KEY: KeyCode = KeyCode::PageDown;
+/// Key binding that opens the picked category, or closes one already open
+const SHOW_CATEGORY_KEY: KeyCode = KeyCode::Enter;
+
+/// What the panel says about the keys that walk it, for a player who has not opened a category
+///
+/// The three sit under `Panels` like every other binding, and `Panels` is itself a category that
+/// has to be opened, so without this line there is nothing to open it with.
+const HOW_TO_OPEN: &str = "Page Up/Down picks a category, Enter opens it";
+
 /// How much space sits above a heading, holding it off the rows before it, in logical pixels
 const HEADING_GAP: f32 = 10.0;
 /// How wide the column naming what the player presses is, in logical pixels
@@ -174,6 +187,10 @@ impl DeclareBindings for App {
 ///
 /// A tester who has not read the source has no other way to learn what the game answers to, and
 /// a briefing goes stale the next time a binding lands. This reads the declarations instead.
+///
+/// A category the situation leaves closed opens on keys of its own, not on the arrows: a press
+/// reaches a command whatever the legend is showing, so the settings panel would answer the same
+/// one. What the player opens or closes by hand then outlives the situation for the session.
 pub struct LegendPlugin;
 
 impl Plugin for LegendPlugin {
@@ -185,9 +202,39 @@ impl Plugin for LegendPlugin {
                 action: "Show or hide this legend",
                 category: BindingCategory::Panels,
             }])
+            .declare_commands([
+                PlayerCommand {
+                    input: BindingInput::Key(PICK_UP_KEY),
+                    asks: CategoryPick(-1),
+                    action: "Pick the category above",
+                    category: BindingCategory::Panels,
+                },
+                PlayerCommand {
+                    input: BindingInput::Key(PICK_DOWN_KEY),
+                    asks: CategoryPick(1),
+                    action: "Pick the category below",
+                    category: BindingCategory::Panels,
+                },
+            ])
+            .declare_commands([PlayerCommand {
+                input: BindingInput::Key(SHOW_CATEGORY_KEY),
+                asks: ShowTheCategory,
+                action: "Open or close the category",
+                category: BindingCategory::Panels,
+            }])
             .init_resource::<Situation>()
+            .init_resource::<Arrangement>()
             .add_systems(Startup, open_the_legend)
-            .add_systems(Update, (toggle_the_legend, redraw_the_legend).chain());
+            .add_systems(
+                Update,
+                (
+                    toggle_the_legend,
+                    pick_a_category,
+                    show_the_category,
+                    redraw_the_legend,
+                )
+                    .chain(),
+            );
     }
 }
 
@@ -197,6 +244,47 @@ struct Legend;
 /// What the player asks for to show or hide the legend.
 #[derive(Clone, Copy, PartialEq)]
 struct ShowTheLegend;
+
+/// How far down the panel the player asked the picked category to move, negative to move it up.
+#[derive(Clone, Copy, PartialEq)]
+struct CategoryPick(isize);
+
+/// What the player asks for to open the picked category, or to close one already open.
+#[derive(Clone, Copy, PartialEq)]
+struct ShowTheCategory;
+
+/// How the player has arranged the panel: the category the keys hold, and what they settled.
+///
+/// A category settled here outlives the situation that would otherwise decide it, for as long as
+/// the session lasts: picking up another tool no longer reopens one the player closed by hand, nor
+/// closes one they opened. Eight categories at most, so a scan costs nothing and
+/// [`BindingCategory`] does not have to be hashable to be looked up. It is the panel's own record
+/// rather than anything read out of the world, which is what [`Situation`] is.
+#[derive(Resource, Default)]
+struct Arrangement {
+    picked: usize,
+    settled: Vec<(BindingCategory, bool)>,
+}
+
+impl Arrangement {
+    fn choice(&self, category: BindingCategory) -> Option<bool> {
+        self.settled
+            .iter()
+            .find(|(settled, _)| *settled == category)
+            .map(|(_, open)| *open)
+    }
+
+    fn settle(&mut self, category: BindingCategory, open: bool) {
+        match self
+            .settled
+            .iter_mut()
+            .find(|(settled, _)| *settled == category)
+        {
+            Some((_, was)) => *was = open,
+            None => self.settled.push((category, open)),
+        }
+    }
+}
 
 /// Where the player is standing, which is what says which commands answer them there.
 #[derive(Resource, Default, Clone, Copy, PartialEq)]
@@ -283,11 +371,9 @@ impl Situation {
     /// under it is live for a reason other than always, which a category of unconditional
     /// commands never is: it offers the same thing wherever the player stands, so opening it
     /// every time tells them nothing they could not have read once. `Tools` is the exception,
-    /// being how they reach all the rest.
+    /// being how they reach all the rest. What the player asked for beats all of it, which is
+    /// [`opens`]'s to say rather than this.
     fn reaches(&self, category: BindingCategory, shown: &[&Declared]) -> bool {
-        if shown.is_empty() {
-            return false;
-        }
         match category {
             BindingCategory::Tools => true,
             BindingCategory::Tool(tool) => self.held == Some(tool),
@@ -303,9 +389,10 @@ fn open_the_legend(
     bindings: Res<PlayerBindings>,
     standing: Standing,
     mut drawn: ResMut<Situation>,
+    arrangement: Res<Arrangement>,
 ) {
     *drawn = standing.read();
-    spawn_legend(&mut commands, &bindings, &drawn);
+    spawn_legend(&mut commands, &bindings, &drawn, &arrangement);
 }
 
 fn toggle_the_legend(
@@ -314,6 +401,7 @@ fn toggle_the_legend(
     bindings: Res<PlayerBindings>,
     standing: Standing,
     mut drawn: ResMut<Situation>,
+    arrangement: Res<Arrangement>,
     legend_q: Query<Entity, With<Legend>>,
 ) {
     if !asked_for.asked(ShowTheLegend) {
@@ -326,9 +414,48 @@ fn toggle_the_legend(
         }
         None => {
             *drawn = standing.read();
-            spawn_legend(&mut commands, &bindings, &drawn);
+            spawn_legend(&mut commands, &bindings, &drawn, &arrangement);
         }
     }
+}
+
+/// Walk the picked category through the panel, stopping at either end rather than wrapping round.
+fn pick_a_category(
+    asked_for: Res<Requested<CategoryPick>>,
+    bindings: Res<PlayerBindings>,
+    mut arrangement: ResMut<Arrangement>,
+    legend_q: Query<Entity, With<Legend>>,
+) {
+    if legend_q.is_empty() {
+        return;
+    }
+    let last = categories_declared(&bindings).len().saturating_sub(1);
+
+    for CategoryPick(step) in asked_for.iter() {
+        arrangement.picked = arrangement.picked.saturating_add_signed(step).min(last);
+    }
+}
+
+/// Open the picked category, or close it if it is open, and remember which the player asked for.
+fn show_the_category(
+    asked_for: Res<Requested<ShowTheCategory>>,
+    bindings: Res<PlayerBindings>,
+    situation: Res<Situation>,
+    mut arrangement: ResMut<Arrangement>,
+    legend_q: Query<Entity, With<Legend>>,
+) {
+    if legend_q.is_empty() || !asked_for.asked(ShowTheCategory) {
+        return;
+    }
+    let declared = categories_declared(&bindings);
+    let Some(category) = declared.get(arrangement.picked).copied() else {
+        return;
+    };
+
+    let under = under_category(&bindings, category);
+    let shown = shown_under(&under, &situation);
+    let open = opens(category, &situation, &shown, &arrangement);
+    arrangement.settle(category, !open);
 }
 
 /// Rewrite the legend when the player's situation changes under it.
@@ -336,16 +463,18 @@ fn toggle_the_legend(
 /// The panel keeps its entity, and only its rows are built again, so a legend already on screen
 /// stays the one on screen rather than blinking out and back. The situation is read every frame
 /// and compared with the one drawn, rather than watched for a change: five separate facts make
-/// it up, and a panel coming on screen is a change to none of them.
+/// it up, and a panel coming on screen is a change to none of them. How the player has arranged
+/// the panel is the panel's own record rather than one of those facts, so it is watched.
 fn redraw_the_legend(
     mut commands: Commands,
     bindings: Res<PlayerBindings>,
     standing: Standing,
     mut drawn: ResMut<Situation>,
+    arrangement: Res<Arrangement>,
     legend_q: Query<Entity, With<Legend>>,
 ) {
     let now = standing.read();
-    if now == *drawn {
+    if now == *drawn && !arrangement.is_changed() {
         return;
     }
 
@@ -354,47 +483,50 @@ fn redraw_the_legend(
         commands
             .entity(legend)
             .despawn_related::<Children>()
-            .with_children(|panel| fill_the_panel(panel, &bindings, &now));
+            .with_children(|panel| fill_the_panel(panel, &bindings, &now, &arrangement));
     }
 }
 
-fn spawn_legend(commands: &mut Commands, bindings: &PlayerBindings, situation: &Situation) {
+fn spawn_legend(
+    commands: &mut Commands,
+    bindings: &PlayerBindings,
+    situation: &Situation,
+    arrangement: &Arrangement,
+) {
     commands
         .spawn((
             Legend,
             panel(Panel::Legend, PanelCorner::TopLeft, Val::Px(PANEL_WIDTH)),
         ))
-        .with_children(|panel| fill_the_panel(panel, bindings, situation));
+        .with_children(|panel| fill_the_panel(panel, bindings, situation, arrangement));
 }
 
-/// Lay the categories out, opening the ones the situation reaches and counting what is under the
-/// rest, so a command the player cannot reach from here is named but does not take a row.
+/// Lay the categories out, opening the ones [`opens`] says are open and counting what is under
+/// the rest, so a command the player cannot reach from here is named but does not take a row.
+///
+/// A line above them all says what walks the panel, and the category the keys are holding is
+/// marked, so the count on a closed heading names something the player can act on.
 fn fill_the_panel(
     panel: &mut ChildSpawnerCommands,
     bindings: &PlayerBindings,
     situation: &Situation,
+    arrangement: &Arrangement,
 ) {
+    panel.spawn(panel_text(HOW_TO_OPEN.to_string(), BODY_TEXT, Val::Auto));
     for (place, category) in categories_declared(bindings).into_iter().enumerate() {
-        let under: Vec<&Declared> = bindings
-            .0
-            .iter()
-            .filter(|it| it.binding.category == category)
-            .collect();
-        let shown: Vec<&Declared> = under
-            .iter()
-            .copied()
-            .filter(|it| situation.holds(it.condition))
-            .collect();
+        let under = under_category(bindings, category);
+        let shown = shown_under(&under, situation);
+        let holding = place == arrangement.picked;
 
-        if !situation.reaches(category, &shown) {
+        if !opens(category, situation, &shown, arrangement) {
             panel.spawn(heading_row(
                 heading(category, situation, Some(under.len())),
-                place,
+                holding,
             ));
             continue;
         }
 
-        panel.spawn(heading_row(heading(category, situation, None), place));
+        panel.spawn(heading_row(heading(category, situation, None), holding));
         for declared in shown {
             panel.spawn(panel_row()).with_children(|row| {
                 row.spawn(panel_text(
@@ -412,16 +544,52 @@ fn fill_the_panel(
     }
 }
 
-fn heading_row(heading: String, place: usize) -> impl Bundle {
+fn heading_row(heading: String, holding: bool) -> impl Bundle {
     (
         Node {
-            margin: UiRect::top(Val::Px(if place == 0 { 0.0 } else { HEADING_GAP })),
+            margin: UiRect::top(Val::Px(HEADING_GAP)),
             ..default()
         },
-        Text(heading),
+        Text(format!("{}{heading}", PICKED_OUT[usize::from(holding)])),
         panel_font(),
-        TextColor(HEADING_TEXT),
+        TextColor(if holding { KEYED_TEXT } else { HEADING_TEXT }),
     )
+}
+
+/// Every command declared under `category`, whether or not the player can reach it from here.
+fn under_category(bindings: &PlayerBindings, category: BindingCategory) -> Vec<&Declared> {
+    bindings
+        .0
+        .iter()
+        .filter(|it| it.binding.category == category)
+        .collect()
+}
+
+/// The ones of those the player's situation reaches, which are the only ones worth a row.
+fn shown_under<'a>(under: &[&'a Declared], situation: &Situation) -> Vec<&'a Declared> {
+    under
+        .iter()
+        .copied()
+        .filter(|it| situation.holds(it.condition))
+        .collect()
+}
+
+/// Whether `category` is laid out open, the player's own choice beating the situation's.
+///
+/// One with nothing to show stays shut whatever they asked for: there is nothing under it to
+/// press, and the count is the honest reading of that.
+fn opens(
+    category: BindingCategory,
+    situation: &Situation,
+    shown: &[&Declared],
+    arrangement: &Arrangement,
+) -> bool {
+    if shown.is_empty() {
+        return false;
+    }
+    arrangement
+        .choice(category)
+        .unwrap_or_else(|| situation.reaches(category, shown))
 }
 
 fn categories_declared(bindings: &PlayerBindings) -> Vec<BindingCategory> {
@@ -486,6 +654,9 @@ fn key_label(key: KeyCode) -> String {
         KeyCode::Equal => "+",
         KeyCode::BracketLeft => "[",
         KeyCode::BracketRight => "]",
+        KeyCode::PageUp => "Page Up",
+        KeyCode::PageDown => "Page Down",
+        KeyCode::Enter => "Enter",
         KeyCode::F1 => "F1",
         KeyCode::F2 => "F2",
         KeyCode::F3 => "F3",
@@ -1008,7 +1179,7 @@ mod tests {
         let lines = legend_lines(&mut app);
 
         assert!(
-            lines.iter().any(|line| line == "Road tool (held)"),
+            lines.iter().any(|line| line == "▸ Road tool (held)"),
             "{lines:?}"
         );
         assert!(
@@ -1041,7 +1212,7 @@ mod tests {
         let lines = legend_lines(&mut app);
 
         assert!(
-            lines.iter().any(|line| line == "Building tool (2)"),
+            lines.iter().any(|line| line == "▸ Building tool (2)"),
             "{lines:?}"
         );
         assert!(
@@ -1066,7 +1237,7 @@ mod tests {
 
         let lines = legend_lines(&mut app);
 
-        assert!(lines.iter().any(|line| line == "Tools"), "{lines:?}");
+        assert!(lines.iter().any(|line| line == "▸ Tools"), "{lines:?}");
         assert!(
             lines.iter().any(|line| line == "Building tool"),
             "{lines:?}"
@@ -1082,7 +1253,7 @@ mod tests {
         let lines = legend_lines(&mut app);
 
         assert!(
-            lines.iter().any(|line| line == "Select tool (held, 2)"),
+            lines.iter().any(|line| line == "▸ Select tool (held, 2)"),
             "{lines:?}"
         );
         assert!(
@@ -1214,7 +1385,7 @@ mod tests {
         let legend = shown_legend(&mut app);
 
         assert!(!legend.contains("Pick the setting below"), "{legend}");
-        assert!(legend.contains("Panels (6)"), "{legend}");
+        assert!(legend.contains("Panels (9)"), "{legend}");
     }
 
     #[test]
@@ -1244,6 +1415,271 @@ mod tests {
             "{drawn} lines: {:?}",
             legend_lines(&mut app)
         );
+    }
+
+    /// Press `key` and let go again, which is one command asked for.
+    fn press_once(app: &mut App, key: KeyCode) {
+        press_key(app, key);
+        tick(app);
+        release_key(app, key);
+        tick(app);
+    }
+
+    /// A legend over a game holding the select tool, with three categories to walk between.
+    ///
+    /// `Tools` and the building tool's own come off the bindings declared here, and `Panels` off
+    /// the legend's own keys, so the list the picked category walks is `Tools`, `Building tool`,
+    /// `Panels`.
+    fn legend_over_several_categories() -> App {
+        let mut app = legend_app_holding(PlayerAction::Select);
+        declare(
+            &mut app,
+            [
+                Binding {
+                    input: BindingInput::Key(KeyCode::Digit3),
+                    action: "Building tool",
+                    category: BindingCategory::Tools,
+                },
+                Binding {
+                    input: BindingInput::Key(KeyCode::KeyQ),
+                    action: "Choose the type before this one",
+                    category: BindingCategory::Tool(PlayerAction::EditBuildings),
+                },
+            ],
+        );
+        app
+    }
+
+    /// What `which` panel has written on it, for a test reading one the legend is beside.
+    fn panel_lines(app: &mut App, which: Panel) -> Vec<String> {
+        let on_screen: Vec<(Entity, Panel)> = app
+            .world_mut()
+            .query::<(Entity, &Panel)>()
+            .iter(app.world())
+            .map(|(entity, panel)| (entity, *panel))
+            .collect();
+        let panel = on_screen
+            .into_iter()
+            .find(|(_, panel)| *panel == which)
+            .map(|(entity, _)| entity)
+            .expect("that panel is on screen");
+        let mut lines = Vec::new();
+        collect_text(app.world(), panel, &mut lines);
+        lines
+    }
+
+    #[test]
+    fn the_legend_marks_the_category_its_keys_are_holding() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        let lines = legend_lines(&mut app);
+
+        assert!(lines.iter().any(|line| line == "▸ Tools"), "{lines:?}");
+    }
+
+    #[test]
+    fn picking_walks_the_mark_down_the_categories() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        press_once(&mut app, PICK_DOWN_KEY);
+
+        let lines = legend_lines(&mut app);
+        assert!(
+            lines.iter().any(|line| line == "▸ Building tool (1)"),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|line| line == "  Tools"), "{lines:?}");
+    }
+
+    #[test]
+    fn picking_stops_at_the_last_category_rather_than_wrapping() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        for _ in 0..5 {
+            press_once(&mut app, PICK_DOWN_KEY);
+        }
+
+        let lines = legend_lines(&mut app);
+        assert!(
+            lines.iter().any(|line| line.starts_with("▸ Panels")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn picking_stops_at_the_first_category_rather_than_wrapping() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        press_once(&mut app, PICK_UP_KEY);
+
+        let lines = legend_lines(&mut app);
+        assert!(lines.iter().any(|line| line == "▸ Tools"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_category_the_situation_leaves_closed_opens_on_the_key() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        press_once(&mut app, PICK_DOWN_KEY);
+        press_once(&mut app, SHOW_CATEGORY_KEY);
+
+        let lines = legend_lines(&mut app);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Choose the type before this one"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_category_opened_by_hand_closes_again_on_the_same_key() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+        press_once(&mut app, PICK_DOWN_KEY);
+        press_once(&mut app, SHOW_CATEGORY_KEY);
+
+        press_once(&mut app, SHOW_CATEGORY_KEY);
+
+        let lines = legend_lines(&mut app);
+        assert!(
+            lines.iter().any(|line| line == "▸ Building tool (1)"),
+            "{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line == "Choose the type before this one"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_category_opened_by_hand_stays_open_when_another_tool_is_picked_up() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+        press_once(&mut app, PICK_DOWN_KEY);
+        press_once(&mut app, SHOW_CATEGORY_KEY);
+
+        hold_the_tool(&mut app, PlayerAction::EditRoads);
+
+        let lines = legend_lines(&mut app);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Choose the type before this one"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_category_closed_by_hand_stays_closed_when_its_tool_is_picked_up() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+        press_once(&mut app, PICK_DOWN_KEY);
+        press_once(&mut app, SHOW_CATEGORY_KEY);
+        press_once(&mut app, SHOW_CATEGORY_KEY);
+
+        hold_the_tool(&mut app, PlayerAction::EditBuildings);
+
+        let lines = legend_lines(&mut app);
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line == "Choose the type before this one"),
+            "{lines:?}"
+        );
+    }
+
+    /// Put `tool` in the player's hand, which is one of the situations a category reads.
+    fn hold_the_tool(app: &mut App, tool: PlayerAction) {
+        app.world_mut()
+            .resource_mut::<NextState<PlayerAction>>()
+            .set(tool);
+        tick(app);
+        tick(app);
+    }
+
+    #[test]
+    fn a_category_with_nothing_to_show_does_not_open_by_hand() {
+        let mut app = picking_legend_app();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        press_once(&mut app, SHOW_CATEGORY_KEY);
+
+        let lines = legend_lines(&mut app);
+        assert!(
+            lines.iter().any(|line| line == "▸ Select tool (held, 2)"),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with("Take a rover")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn only_the_settings_panel_answers_an_arrow_while_both_are_open() {
+        let mut app = every_plugin_that_declares_a_binding();
+        tick(&mut app);
+        show_a_legend(&mut app);
+        open_the_settings_panel(&mut app);
+
+        press_once(&mut app, KeyCode::ArrowDown);
+
+        let settings = panel_lines(&mut app, Panel::Settings);
+        assert!(
+            settings.iter().any(|line| line == "▸ Orbit the camera"),
+            "{settings:?}"
+        );
+        let legend = legend_lines(&mut app);
+        assert!(legend.iter().any(|line| line == "▸ Tools"), "{legend:?}");
+    }
+
+    #[test]
+    fn the_legend_says_what_opens_a_category() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        let lines = legend_lines(&mut app);
+
+        assert!(lines.iter().any(|line| line == HOW_TO_OPEN), "{lines:?}");
+    }
+
+    #[test]
+    fn the_keys_that_open_a_category_are_rows_like_any_other_binding() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        for _ in 0..2 {
+            press_once(&mut app, PICK_DOWN_KEY);
+        }
+        press_once(&mut app, SHOW_CATEGORY_KEY);
+
+        let lines = legend_lines(&mut app);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Open or close the category"),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|line| line == "Page Down"), "{lines:?}");
     }
 
     #[test]
