@@ -16,6 +16,7 @@
 use bevy::prelude::*;
 
 pub mod building_panel;
+pub mod junction_panel;
 pub mod legend;
 pub mod selection;
 pub mod settings_panel;
@@ -53,6 +54,8 @@ pub enum Panel {
     Settings,
     /// The reading of whatever the player picked out.
     Building,
+    /// The reading of the junction the player picked out.
+    Junction,
 }
 
 /// The corner of the screen a panel is pinned to.

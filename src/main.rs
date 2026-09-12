@@ -31,6 +31,7 @@ fn main() {
         .add_plugins(rover::RoverPlugin)
         .add_plugins(simulation::SimulationPlugin)
         .add_plugins(ui::building_panel::BuildingPanelPlugin)
+        .add_plugins(ui::junction_panel::JunctionPanelPlugin)
         .add_plugins(ui::legend::LegendPlugin)
         .add_plugins(ui::selection::SelectionPlugin)
         .add_plugins(ui::settings_panel::SettingsPanelPlugin)

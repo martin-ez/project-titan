@@ -252,6 +252,7 @@ fn panel_bit(panel: Panel) -> u8 {
         Panel::Legend => 1,
         Panel::Settings => 2,
         Panel::Building => 4,
+        Panel::Junction => 8,
     }
 }
 
