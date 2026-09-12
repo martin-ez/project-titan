@@ -1276,9 +1276,10 @@ mod tests {
 
     /// The roads built across the fork's quicker arm, as the tiles each runs between.
     ///
-    /// Two, because one junction does not cost the arm the time that separates it from the other,
-    /// and they cross it a long way apart so that neither crossing stands too near the other or
-    /// near the junctions the arms already meet at.
+    /// Four, because one stop does not cost that arm the time that separates it from the other, and
+    /// two of them cross where it is held to half the open limit, where shedding a speed it never
+    /// reached costs half as much. They stand a long way apart, neither within a junction's extent
+    /// of another or of the junctions the arms already meet at.
     const CROSSINGS_OF_THE_QUICKER_ARM: [((i32, i32), (i32, i32)); 4] = [
         ((-1, 1), (1, 1)),
         ((1, 0), (1, 4)),
@@ -1304,19 +1305,21 @@ mod tests {
     /// How many segments a network has to hold to be worth looking for a route across.
     const A_LARGE_NETWORK: usize = 2000;
 
-    /// How far from the ticks a rover spends driving a route the search may cost it, as a
-    /// fraction of the drive.
+    /// How far from the ticks a rover spends driving a route the search may cost it, as a fraction
+    /// of the drive.
     ///
-    /// A twentieth. The cost is the trapezoid a rover drives and a rover drives it a tick at a
-    /// time, so a part-spent tick rounds at every change of pace along the way; what is left over
-    /// is the hand-over at a junction, which is a rover waiting rather than driving.
+    /// A twentieth. A rover drives a tick at a time the run the cost measures as a curve, and a
+    /// tick spent changing pace covers a little more ground than the curve through it does, so the
+    /// cost reads high by a few ticks at every stop: three over a straight road with a stop at
+    /// either end, fourteen over one stopping at a junction in the middle as well.
     const COSTED_WITHIN: f32 = 0.05;
 
     /// How long the search may spend costing one route across a network of thousands of segments.
     ///
-    /// Measured at 1.4 to 2.4 ms over this fixture's 4358 segments from a cold start, so this is
-    /// twenty times the figure it is guarding: it catches a cost that walks the network again for
-    /// every stretch it prices, and not a machine that was busy elsewhere.
+    /// Measured at 1.0 to 1.1 ms over this fixture's 4358 segments from a cold start, against 1.4
+    /// to 2.4 ms for the length-over-limit cost of #174, so this is better than twenty times what
+    /// it guards: it catches a cost that walks the network again for every stretch it prices, and
+    /// not a machine that was busy elsewhere.
     const COSTING_A_LARGE_NETWORK: Duration = Duration::from_millis(40);
 
     /// How much a rover carries on a delivery under test.
