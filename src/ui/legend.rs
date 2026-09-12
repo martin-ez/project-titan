@@ -11,8 +11,9 @@
 //! `bevy_feathers` widgets, an editor set and not a game's, for the reasons [`crate::ui`] gives:
 //! a row is a pair of text nodes, which is what lets a column line up under a heading.
 
-use crate::building::{BuildingType, ChosenBuildingType, Flow, Port};
-use crate::input::{DeclareCommands, PlayerAction, PlayerCommand, Requested};
+use crate::building::{CatalogueEntry, ChosenBuilding, Flow, Port};
+use crate::map::{Deposit, RawMaterial};
+use crate::input::{DeclareCommands, PlayerAction, PlayerCommand, PlayerInput, Requested};
 use crate::ui::selection::Selection;
 use crate::ui::{
     panel, panel_font, panel_row, panel_text, Panel, PanelCorner, BODY_TEXT, HEADING_TEXT,
@@ -201,7 +202,8 @@ struct ShowTheLegend;
 #[derive(Resource, Default, Clone, Copy, PartialEq)]
 struct Situation {
     held: Option<PlayerAction>,
-    placing: Option<BuildingType>,
+    placing: Option<CatalogueEntry>,
+    over: Option<RawMaterial>,
     picked: Option<PickedOut>,
     panels: u8,
 }
@@ -210,8 +212,10 @@ struct Situation {
 #[derive(SystemParam)]
 struct Standing<'w, 's> {
     held: Option<Res<'w, State<PlayerAction>>>,
-    chosen: Option<Res<'w, ChosenBuildingType>>,
+    chosen: Option<Res<'w, ChosenBuilding>>,
     selection: Option<Res<'w, Selection>>,
+    pointing: Option<Res<'w, PlayerInput>>,
+    deposits: Query<'w, 's, &'static Deposit>,
     ports: Query<'w, 's, &'static Port>,
     panels: Query<'w, 's, &'static Panel>,
 }
@@ -222,6 +226,7 @@ impl Standing<'_, '_> {
         Situation {
             held,
             placing: self.placing(held),
+            over: self.over(),
             picked: self.picked(),
             panels: self
                 .panels
@@ -230,11 +235,17 @@ impl Standing<'_, '_> {
         }
     }
 
-    fn placing(&self, held: Option<PlayerAction>) -> Option<BuildingType> {
+    fn placing(&self, held: Option<PlayerAction>) -> Option<CatalogueEntry> {
         if held != Some(PlayerAction::EditBuildings) {
             return None;
         }
         self.chosen.as_deref().map(|chosen| chosen.chosen())
+    }
+
+    /// The material lying under the cursor, which is what an extractor placed there would draw.
+    fn over(&self) -> Option<RawMaterial> {
+        let tile = self.pointing.as_deref()?.cursor_tile?;
+        Some(self.deposits.get(tile).ok()?.material)
     }
 
     fn picked(&self) -> Option<PickedOut> {
@@ -324,7 +335,7 @@ fn toggle_the_legend(
 ///
 /// The panel keeps its entity, and only its rows are built again, so a legend already on screen
 /// stays the one on screen rather than blinking out and back. The situation is read every frame
-/// and compared with the one drawn, rather than watched for a change: four separate facts make
+/// and compared with the one drawn, rather than watched for a change: five separate facts make
 /// it up, and a panel coming on screen is a change to none of them.
 fn redraw_the_legend(
     mut commands: Commands,
@@ -433,7 +444,7 @@ fn heading(category: BindingCategory, situation: &Situation, closed: Option<usiz
         (false, None, _) => label,
         (false, Some(under), _) => format!("{label} ({under})"),
         (true, Some(under), _) => format!("{label} (held, {under})"),
-        (true, None, Some(placing)) => format!("{label} (held) — {}", placing.label()),
+        (true, None, Some(placing)) => format!("{label} (held) — {}", placing.label_over(situation.over)),
         (true, None, None) => format!("{label} (held)"),
     }
 }
@@ -728,7 +739,7 @@ mod tests {
     fn building_legend_app() -> App {
         let mut app = headless_app();
         app.insert_state(PlayerAction::EditBuildings)
-            .init_resource::<ChosenBuildingType>()
+            .init_resource::<ChosenBuilding>()
             .insert_resource(PlayerInput::default())
             .add_plugins(LegendPlugin);
         declare(
@@ -793,9 +804,9 @@ mod tests {
 
         let placing = app
             .world()
-            .resource::<ChosenBuildingType>()
+            .resource::<ChosenBuilding>()
             .chosen()
-            .label();
+            .label_over(None);
         assert!(legend.contains(&placing), "{legend}");
     }
 
@@ -806,18 +817,18 @@ mod tests {
         show_a_legend(&mut app);
         let before = app
             .world()
-            .resource::<ChosenBuildingType>()
+            .resource::<ChosenBuilding>()
             .chosen()
-            .label();
+            .label_over(None);
 
-        app.world_mut().resource_mut::<ChosenBuildingType>().step(1);
+        app.world_mut().resource_mut::<ChosenBuilding>().step(1);
         tick(&mut app);
 
         let after = app
             .world()
-            .resource::<ChosenBuildingType>()
+            .resource::<ChosenBuilding>()
             .chosen()
-            .label();
+            .label_over(None);
         let legend = shown_legend(&mut app);
         assert!(legend.contains(&after), "{legend}");
         assert!(!legend.contains(&before), "{legend}");

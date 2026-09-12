@@ -87,17 +87,27 @@ const OUTLET_CORNERS: [TileCorner; 3] = [
 
 const _: () = {
     let mut index = 0;
-    while index < BuildingType::ALL.len() {
-        let recipe = BuildingType::ALL[index].recipe();
-        assert!(
-            recipe.inputs.len() <= INTAKE_CORNERS.len(),
-            "a type takes in more items than there are corners to take them in on"
-        );
-        assert!(
-            recipe.outputs.len() <= OUTLET_CORNERS.len(),
-            "a type puts out more items than there are corners to hand them out on"
-        );
+    while index < CatalogueEntry::ALL.len() {
+        if let CatalogueEntry::Assembler(recipe) = CatalogueEntry::ALL[index] {
+            assert!(
+                recipe.inputs.len() <= INTAKE_CORNERS.len(),
+                "a type takes in more items than there are corners to take them in on"
+            );
+            assert!(
+                recipe.outputs.len() <= OUTLET_CORNERS.len(),
+                "a type puts out more items than there are corners to hand them out on"
+            );
+        }
         index += 1;
+    }
+
+    let mut material = 0;
+    while material < RawMaterial::ALL.len() {
+        assert!(
+            extracted(RawMaterial::ALL[material]).len() <= OUTLET_CORNERS.len(),
+            "an extractor puts out more items than there are corners to hand them out on"
+        );
+        material += 1;
     }
 };
 
@@ -227,9 +237,24 @@ pub enum BuildingType {
     Assembler(Recipe),
 }
 
-/// The type the building tool will place next, which the player steps through with `CHOOSE_KEYS`.
+/// One row of the catalogue the building tool steps through.
+///
+/// Not a [`BuildingType`], because an entry names no material and a placed extractor must: a
+/// deposit holds one material and an extractor standing on it can draw no other, so which one it
+/// is is a fact of the tile rather than a choice the player is asked for. What a tap puts down is
+/// the entry resolved against the ground it lands on, by [`CatalogueEntry::placed_on`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogueEntry {
+    /// An extractor, drawing whatever lies under the tile it is placed on.
+    Extractor,
+    /// One recipe of the production tree.
+    Assembler(Recipe),
+}
+
+/// The entry of the catalogue the building tool will place next, which the player steps through
+/// with `CHOOSE_KEYS`.
 #[derive(Resource, Default)]
-pub struct ChosenBuildingType(usize);
+pub struct ChosenBuilding(usize);
 
 /// Which building stands on each tile of the map.
 ///
@@ -276,17 +301,21 @@ fn ports_standing(
 /// the tap would not put down.
 #[derive(SystemParam)]
 struct BuildingToPlace<'w> {
-    chosen: Res<'w, ChosenBuildingType>,
+    chosen: Res<'w, ChosenBuilding>,
     facing: Res<'w, PlacementFacing>,
 }
 
 impl BuildingToPlace<'_> {
-    fn kind(&self) -> BuildingType {
+    fn entry(&self) -> CatalogueEntry {
         self.chosen.chosen()
     }
 
-    fn ports_standing(&self, tile: HexCoordinates) -> impl Iterator<Item = (Port, LatticeNode)> {
-        ports_standing(self.kind(), self.facing.0, tile)
+    fn ports_standing(
+        &self,
+        kind: BuildingType,
+        tile: HexCoordinates,
+    ) -> impl Iterator<Item = (Port, LatticeNode)> {
+        ports_standing(kind, self.facing.0, tile)
     }
 }
 
@@ -329,8 +358,8 @@ const fn assembler(
     inputs: &'static [Stack],
     outputs: &'static [Stack],
     ticks: u32,
-) -> BuildingType {
-    BuildingType::Assembler(Recipe {
+) -> CatalogueEntry {
+    CatalogueEntry::Assembler(Recipe {
         inputs,
         outputs,
         ticks,
@@ -415,18 +444,15 @@ impl Item {
     }
 }
 
-impl BuildingType {
-    /// Every type the player can place, transcribed from `docs/production_tree.md`.
+impl CatalogueEntry {
+    /// Every entry the player can place, transcribed from `docs/production_tree.md`.
     ///
-    /// An extractor for each raw material, then an assembler for each recipe, in the tier order
-    /// the tables come in. Adding a building to the game is a row here rather than a kind of
-    /// building, which is what the two archetypes buy.
-    pub const ALL: [Self; 22] = [
-        Self::Extractor(RawMaterial::Ice),
-        Self::Extractor(RawMaterial::CarbonMonoxide),
-        Self::Extractor(RawMaterial::Nitrogen),
-        Self::Extractor(RawMaterial::Silicon),
-        Self::Extractor(RawMaterial::CobaltOre),
+    /// One extractor, then an assembler for each recipe, in the tier order the tables come in.
+    /// Adding a building to the game is a row here rather than a kind of building, which is what
+    /// the two archetypes buy. The extractor is one row and not five because the five differ only
+    /// in a material the ground already names.
+    pub const ALL: [Self; 18] = [
+        Self::Extractor,
         assembler(
             &[stack(1, Item::Raw(RawMaterial::Ice))],
             &[stack(1, Item::Water)],
@@ -546,6 +572,56 @@ impl BuildingType {
         ),
     ];
 
+    /// The building this entry puts on ground holding `deposit`, or `None` where that ground will
+    /// take none of it.
+    ///
+    /// The whole of the rule about which tile takes which building, and the only place an
+    /// extractor learns what it draws. An extractor stands on a deposit and takes its material
+    /// from it; an assembler brings its materials in on rovers and stands anywhere the ground is
+    /// bare, a deposit being reserved for the machine that can reach it. Whether the ground suits
+    /// an entry and what would stand there are then one question with one answer, so nothing can
+    /// place a building the ground refuses or refuse one it would have taken.
+    pub fn placed_on(self, deposit: Option<&Deposit>) -> Option<BuildingType> {
+        match (self, deposit) {
+            (Self::Extractor, Some(deposit)) => Some(BuildingType::Extractor(deposit.material)),
+            (Self::Extractor, None) => None,
+            (Self::Assembler(recipe), None) => Some(BuildingType::Assembler(recipe)),
+            (Self::Assembler(_), Some(_)) => None,
+        }
+    }
+
+    /// Every building the catalogue can put down, an extractor for each material the ground holds.
+    ///
+    /// The catalogue offers one extractor because a deposit names the material, so a reader
+    /// wanting every step the game can run — the production tree — wants that one entry once per
+    /// material rather than once.
+    pub fn every_building() -> Vec<BuildingType> {
+        Self::ALL
+            .iter()
+            .flat_map(|entry| match entry {
+                Self::Extractor => RawMaterial::ALL
+                    .iter()
+                    .map(|material| BuildingType::Extractor(*material))
+                    .collect(),
+                Self::Assembler(recipe) => vec![BuildingType::Assembler(*recipe)],
+            })
+            .collect()
+    }
+
+    /// What the legend calls this entry, over ground holding `material`.
+    ///
+    /// An extractor is named for what it will draw, which the tile settles rather than the
+    /// catalogue, so over ground naming no material there is nothing to call it but what it is.
+    pub fn label_over(self, material: Option<RawMaterial>) -> String {
+        match (self, material) {
+            (Self::Extractor, Some(material)) => BuildingType::Extractor(material).label(),
+            (Self::Extractor, None) => "Extractor".to_string(),
+            (Self::Assembler(recipe), _) => BuildingType::Assembler(recipe).label(),
+        }
+    }
+}
+
+impl BuildingType {
     /// What one run of a building of this type takes in and puts out.
     ///
     /// An extractor draws what it stands on rather than taking anything in, so it is the same
@@ -588,15 +664,15 @@ impl BuildingType {
     }
 }
 
-impl ChosenBuildingType {
-    /// The type the building tool will place on the next tap.
-    pub fn chosen(&self) -> BuildingType {
-        BuildingType::ALL[self.0]
+impl ChosenBuilding {
+    /// The entry the building tool will place on the next tap.
+    pub fn chosen(&self) -> CatalogueEntry {
+        CatalogueEntry::ALL[self.0]
     }
 
     /// Move `by` places through the catalogue, going round rather than stopping at either end.
     pub fn step(&mut self, by: isize) {
-        let catalogue = BuildingType::ALL.len() as isize;
+        let catalogue = CatalogueEntry::ALL.len() as isize;
         self.0 = (self.0 as isize + by).rem_euclid(catalogue) as usize;
     }
 }
@@ -604,7 +680,7 @@ impl ChosenBuildingType {
 impl Plugin for BuildingPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<BuildingTiles>()
-            .init_resource::<ChosenBuildingType>()
+            .init_resource::<ChosenBuilding>()
             .init_resource::<PlacementFacing>()
             .declare_bindings([Binding {
                 input: BindingInput::Mouse(MouseButton::Right),
@@ -645,34 +721,23 @@ impl Plugin for BuildingPlugin {
     }
 }
 
-/// Whether `tile` will take a building of `kind`, which is the whole of the rule and is asked in
-/// one place.
+/// The building `tile` would take of `entry`, or `None` where it will take none, which is the
+/// whole of the rule and is asked in one place.
 ///
 /// A road is read off the tile it runs over rather than measured out of its arcs, so the answer
 /// costs a lookup however many roads are on the map.
 fn takes_a_building(
-    kind: BuildingType,
+    entry: CatalogueEntry,
     tile: HexCoordinates,
     deposit: Option<&Deposit>,
     buildings: &BuildingTiles,
     roads: &RoadTiles,
-) -> bool {
-    buildings.building_on(tile).is_none()
-        && roads.roads_over(tile).is_empty()
-        && stands_on_the_ground_it_needs(kind, deposit)
-}
-
-/// Whether the ground a tile holds is the ground a building of `kind` is built to stand on.
-///
-/// An extractor draws one material and must stand over that one; an assembler brings its
-/// materials in on rovers and stands anywhere the ground is bare, a deposit being reserved for
-/// the machine that can reach it.
-fn stands_on_the_ground_it_needs(kind: BuildingType, deposit: Option<&Deposit>) -> bool {
-    match (kind, deposit) {
-        (BuildingType::Extractor(drawn), Some(deposit)) => deposit.material == drawn,
-        (BuildingType::Extractor(_), None) => false,
-        (BuildingType::Assembler(_), deposit) => deposit.is_none(),
+) -> Option<BuildingType> {
+    if buildings.building_on(tile).is_some() || !roads.roads_over(tile).is_empty() {
+        return None;
     }
+
+    entry.placed_on(deposit)
 }
 
 /// Give up the tile a building held, whichever way it left the world.
@@ -730,10 +795,15 @@ fn place_building_system(
     let Ok((tile, deposit)) = tiles.get(entity) else {
         return;
     };
-    let kind = to_place.kind();
-    if !takes_a_building(kind, tile.coordinates, deposit, &buildings, &roads) {
+    let Some(kind) = takes_a_building(
+        to_place.entry(),
+        tile.coordinates,
+        deposit,
+        &buildings,
+        &roads,
+    ) else {
         return;
-    }
+    };
 
     let building = commands
         .spawn((
@@ -744,7 +814,7 @@ fn place_building_system(
             Visibility::Hidden,
         ))
         .with_children(|ports| {
-            for (port, node) in to_place.ports_standing(tile.coordinates) {
+            for (port, node) in to_place.ports_standing(kind, tile.coordinates) {
                 ports.spawn((port, Holding::default(), RoadEndpoint::at(node)));
             }
         })
@@ -760,7 +830,7 @@ fn place_building_system(
 fn choose_building_type_system(
     asked_for: Res<Requested<CatalogueStep>>,
     action: Res<State<PlayerAction>>,
-    mut chosen: ResMut<ChosenBuildingType>,
+    mut chosen: ResMut<ChosenBuilding>,
 ) {
     if *action.get() != PlayerAction::EditBuildings {
         return;
@@ -823,12 +893,14 @@ fn draw_the_refused_tile(
         return;
     };
     if takes_a_building(
-        to_place.kind(),
+        to_place.entry(),
         tile.coordinates,
         deposit,
         &buildings,
         &roads,
-    ) {
+    )
+    .is_some()
+    {
         return;
     }
 
@@ -899,17 +971,17 @@ fn draw_the_ports_to_place(
     else {
         return;
     };
-    if !takes_a_building(
-        to_place.kind(),
+    let Some(kind) = takes_a_building(
+        to_place.entry(),
         tile.coordinates,
         deposit,
         &buildings,
         &roads,
-    ) {
+    ) else {
         return;
-    }
+    };
 
-    for (port, node) in to_place.ports_standing(tile.coordinates) {
+    for (port, node) in to_place.ports_standing(kind, tile.coordinates) {
         draw_a_port(&mut gizmos, tile.coordinates, node, port.flow);
     }
 }
@@ -980,7 +1052,7 @@ mod tests {
         app.insert_state(action)
             .insert_resource(PlayerInput::default())
             .add_plugins((BuildingPlugin, CleanupPlugin, DebugGizmosPlugin, RoadPlugin));
-        choose(&mut app, MELTER);
+        choose(&mut app, entry_of(MELTER));
         app
     }
 
@@ -1105,20 +1177,25 @@ mod tests {
     /// A type drawing out of the ground, which takes nothing in at all.
     const ICE_EXTRACTOR: BuildingType = BuildingType::Extractor(RawMaterial::Ice);
 
-    /// What `BuildingType::ALL[1]` draws, which is the ground one step through the catalogue needs.
-    const SECOND_MATERIAL: RawMaterial = RawMaterial::CarbonMonoxide;
-
     fn tile_at(offset: (i32, i32)) -> HexCoordinates {
         HexCoordinates::from_offset_row(offset.0, offset.1)
     }
 
-    /// Hold the tool over `kind`, which the player does by stepping through the catalogue.
-    fn choose(app: &mut App, kind: BuildingType) {
-        let place = BuildingType::ALL
+    /// The entry of the catalogue that puts a building of `kind` down.
+    fn entry_of(kind: BuildingType) -> CatalogueEntry {
+        match kind {
+            BuildingType::Extractor(_) => CatalogueEntry::Extractor,
+            BuildingType::Assembler(recipe) => CatalogueEntry::Assembler(recipe),
+        }
+    }
+
+    /// Hold the tool over `entry`, which the player does by stepping through the catalogue.
+    fn choose(app: &mut App, entry: CatalogueEntry) {
+        let place = CatalogueEntry::ALL
             .iter()
-            .position(|held| *held == kind)
-            .expect("the type is one the catalogue offers");
-        app.world_mut().insert_resource(ChosenBuildingType(place));
+            .position(|held| *held == entry)
+            .expect("the entry is one the catalogue offers");
+        app.world_mut().insert_resource(ChosenBuilding(place));
     }
 
     /// The corner a building of `kind` stands its `flow` port on.
@@ -1131,7 +1208,7 @@ mod tests {
 
     /// Put a building of `kind` on the tile at `offset`, which the tool takes a tap to do.
     fn place_building_at(app: &mut App, kind: BuildingType, offset: (i32, i32)) -> Entity {
-        choose(app, kind);
+        choose(app, entry_of(kind));
         let tile = spawn_tile(app, offset.0, offset.1);
         tap_on(app, Some(tile));
         buildings_in_the_world(app)
@@ -1574,7 +1651,7 @@ mod tests {
     #[test]
     fn taking_a_building_off_the_map_takes_its_ports_with_it() {
         let mut app = building_app(PlayerAction::EditBuildings);
-        choose(&mut app, MELTER);
+        choose(&mut app, entry_of(MELTER));
         let tile = spawn_tile(&mut app, PORTED.0, PORTED.1);
         tap_on(&mut app, Some(tile));
         let building = building_entity(&mut app).expect("the tap placed a building");
@@ -1867,31 +1944,30 @@ mod tests {
     }
 
     #[test]
-    fn an_extractor_stands_on_a_deposit_of_the_material_it_draws() {
+    fn an_extractor_stands_on_a_deposit_whatever_it_holds() {
         let mut app = building_app(PlayerAction::EditBuildings);
-        choose(&mut app, ICE_EXTRACTOR);
-        let tile = spawn_deposit_tile(&mut app, 0, 0, RawMaterial::Ice);
+        choose(&mut app, CatalogueEntry::Extractor);
+        let ice = spawn_deposit_tile(&mut app, 0, 0, RawMaterial::Ice);
+        let silicon = spawn_deposit_tile(&mut app, 3, 0, RawMaterial::Silicon);
 
-        tap_on(&mut app, Some(tile));
+        tap_on(&mut app, Some(ice));
+        tap_on(&mut app, Some(silicon));
 
-        assert_eq!(buildings(&mut app), [HexCoordinates::from_offset_row(0, 0)]);
-    }
-
-    #[test]
-    fn an_extractor_is_refused_on_a_deposit_of_another_material() {
-        let mut app = building_app(PlayerAction::EditBuildings);
-        choose(&mut app, ICE_EXTRACTOR);
-        let tile = spawn_deposit_tile(&mut app, 0, 0, RawMaterial::Silicon);
-
-        tap_on(&mut app, Some(tile));
-
-        assert!(buildings(&mut app).is_empty());
+        let standing = buildings(&mut app);
+        assert!(
+            standing.contains(&HexCoordinates::from_offset_row(0, 0)),
+            "{standing:?}"
+        );
+        assert!(
+            standing.contains(&HexCoordinates::from_offset_row(3, 0)),
+            "{standing:?}"
+        );
     }
 
     #[test]
     fn an_extractor_is_refused_on_bare_ground() {
         let mut app = building_app(PlayerAction::EditBuildings);
-        choose(&mut app, ICE_EXTRACTOR);
+        choose(&mut app, CatalogueEntry::Extractor);
         let tile = spawn_tile(&mut app, 0, 0);
 
         tap_on(&mut app, Some(tile));
@@ -1902,7 +1978,7 @@ mod tests {
     #[test]
     fn an_assembler_is_refused_on_a_deposit_tile() {
         let mut app = building_app(PlayerAction::EditBuildings);
-        choose(&mut app, MELTER);
+        choose(&mut app, entry_of(MELTER));
         let tile = spawn_deposit_tile(&mut app, 0, 0, RawMaterial::Ice);
 
         tap_on(&mut app, Some(tile));
@@ -1913,7 +1989,7 @@ mod tests {
     #[test]
     fn an_assembler_stands_on_bare_ground() {
         let mut app = building_app(PlayerAction::EditBuildings);
-        choose(&mut app, MELTER);
+        choose(&mut app, entry_of(MELTER));
         let tile = spawn_tile(&mut app, 0, 0);
 
         tap_on(&mut app, Some(tile));
@@ -1924,7 +2000,7 @@ mod tests {
     #[test]
     fn a_deposit_tile_an_extractor_left_takes_another_one() {
         let mut app = building_app(PlayerAction::EditBuildings);
-        choose(&mut app, ICE_EXTRACTOR);
+        choose(&mut app, CatalogueEntry::Extractor);
         let tile = spawn_deposit_tile(&mut app, 0, 0, RawMaterial::Ice);
 
         tap_on(&mut app, Some(tile));
@@ -1937,7 +2013,7 @@ mod tests {
 
     /// Put the extractor the catalogue offers on a deposit of `material` at `offset`.
     fn extract_from(app: &mut App, material: RawMaterial, offset: (i32, i32)) -> Entity {
-        choose(app, ICE_EXTRACTOR);
+        choose(app, CatalogueEntry::Extractor);
         let tile = spawn_deposit_tile(app, offset.0, offset.1, material);
         tap_on(app, Some(tile));
         app.world()
@@ -1993,12 +2069,25 @@ mod tests {
 
     #[test]
     fn the_catalogue_offers_one_extractor() {
-        let extractors = BuildingType::ALL
+        let extractors = CatalogueEntry::ALL
             .iter()
-            .filter(|entry| matches!(entry, BuildingType::Extractor(_)))
+            .filter(|entry| **entry == CatalogueEntry::Extractor)
             .count();
 
         assert_eq!(extractors, 1);
+    }
+
+    #[test]
+    fn the_one_extractor_stands_for_every_material_the_ground_holds() {
+        let drawn: Vec<Item> = CatalogueEntry::every_building()
+            .into_iter()
+            .flat_map(|kind| items_through(kind, Flow::Outlet))
+            .filter(|item| matches!(item, Item::Raw(_)))
+            .collect();
+
+        for material in RawMaterial::ALL {
+            assert!(drawn.contains(&Item::Raw(material)), "{drawn:?}");
+        }
     }
 
     /// What `kind` moves through its ports one way, taken off the ports it stands.
@@ -2011,7 +2100,7 @@ mod tests {
 
     #[test]
     fn every_type_takes_in_each_item_its_recipe_consumes() {
-        for kind in BuildingType::ALL {
+        for kind in CatalogueEntry::every_building() {
             let taken = items_through(kind, Flow::Intake);
             for stack in kind.recipe().inputs {
                 assert!(
@@ -2027,7 +2116,7 @@ mod tests {
 
     #[test]
     fn every_type_puts_out_each_item_its_recipe_makes() {
-        for kind in BuildingType::ALL {
+        for kind in CatalogueEntry::every_building() {
             let made = items_through(kind, Flow::Outlet);
             for stack in kind.recipe().outputs {
                 assert!(
@@ -2060,7 +2149,7 @@ mod tests {
 
     #[test]
     fn no_two_ports_of_a_type_stand_on_one_corner() {
-        for kind in BuildingType::ALL {
+        for kind in CatalogueEntry::every_building() {
             let mut standing: Vec<TileCorner> = Vec::new();
             for (corner, _) in kind.ports() {
                 assert!(
@@ -2075,7 +2164,7 @@ mod tests {
 
     #[test]
     fn the_catalogue_offers_more_than_one_type_to_place() {
-        assert!(BuildingType::ALL.len() > 1);
+        assert!(CatalogueEntry::ALL.len() > 1);
     }
 
     #[test]
@@ -2116,8 +2205,8 @@ mod tests {
     #[test]
     fn the_tool_places_the_type_the_player_stepped_to() {
         let mut app = building_app(PlayerAction::EditBuildings);
-        choose(&mut app, BuildingType::ALL[0]);
-        let tile = spawn_deposit_tile(&mut app, 0, 0, SECOND_MATERIAL);
+        choose(&mut app, CatalogueEntry::ALL[0]);
+        let tile = spawn_tile(&mut app, 0, 0);
 
         press_key(&mut app, CHOOSE_KEYS[1].0);
         tick(&mut app);
@@ -2126,50 +2215,53 @@ mod tests {
 
         let building = building_entity(&mut app).expect("the tap placed a building");
         assert_eq!(
-            app.world().entity(building).get::<BuildingType>(),
-            Some(&BuildingType::ALL[1])
+            app.world()
+                .entity(building)
+                .get::<BuildingType>()
+                .map(|kind| entry_of(*kind)),
+            Some(CatalogueEntry::ALL[1])
         );
     }
 
     #[test]
     fn stepping_back_from_the_first_type_goes_round_to_the_last() {
         let mut app = building_app(PlayerAction::EditBuildings);
-        choose(&mut app, BuildingType::ALL[0]);
+        choose(&mut app, CatalogueEntry::ALL[0]);
 
         press_key(&mut app, CHOOSE_KEYS[0].0);
         tick(&mut app);
 
         assert_eq!(
-            app.world().resource::<ChosenBuildingType>().chosen(),
-            BuildingType::ALL[BuildingType::ALL.len() - 1]
+            app.world().resource::<ChosenBuilding>().chosen(),
+            CatalogueEntry::ALL[CatalogueEntry::ALL.len() - 1]
         );
     }
 
     #[test]
     fn the_catalogue_steps_for_a_command_nobody_pressed_a_key_for() {
         let mut app = building_app(PlayerAction::EditBuildings);
-        choose(&mut app, BuildingType::ALL[0]);
+        choose(&mut app, CatalogueEntry::ALL[0]);
 
         ask_for(&mut app, CHOOSE_KEYS[1].1);
         tick(&mut app);
 
         assert_eq!(
-            app.world().resource::<ChosenBuildingType>().chosen(),
-            BuildingType::ALL[1]
+            app.world().resource::<ChosenBuilding>().chosen(),
+            CatalogueEntry::ALL[1]
         );
     }
 
     #[test]
     fn stepping_while_another_tool_is_held_changes_nothing() {
         let mut app = building_app(PlayerAction::EditRoads);
-        choose(&mut app, BuildingType::ALL[0]);
+        choose(&mut app, CatalogueEntry::ALL[0]);
 
         press_key(&mut app, CHOOSE_KEYS[1].0);
         tick(&mut app);
 
         assert_eq!(
-            app.world().resource::<ChosenBuildingType>().chosen(),
-            BuildingType::ALL[0]
+            app.world().resource::<ChosenBuilding>().chosen(),
+            CatalogueEntry::ALL[0]
         );
     }
 
