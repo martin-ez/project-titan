@@ -1,3 +1,18 @@
+//! How a key, a click and the cursor become something the rest of the game can act on.
+//!
+//! A click belongs to one side of the screen or the other. Either the interface took it, the
+//! player having pressed something drawn over the world, or the world did, and no press is both.
+//! The interface says which by claiming the frame's click, and a claimed click reaches nothing in
+//! the world: no selection moves, no building goes down or comes up, no road node is placed and
+//! no road is finished. Only whatever draws the interface can tell a press on a panel from a
+//! press on the ground, so claiming is its to do; what a claim then means is one fact about the
+//! frame, read the same way by everything that acts on a click.
+//!
+//! A claim is made on the frame it belongs to and forgotten at the end of it, like everything
+//! else the player pressed (invariant 2). The press itself is kept as the mouse reported it and
+//! reached only through `PlayerInput`, which subtracts the claim, so a system in the world cannot
+//! read past the rule to the button underneath. A key is not a click and no claim takes one.
+
 use crate::common::cursor::{CursorHit, CursorRayCast};
 use crate::map::{LatticeNode, MapTile};
 use crate::ui::legend::{
@@ -103,14 +118,56 @@ pub struct PlayerInput {
     pub cursor_node: Option<LatticeNode>,
     /// The normalized vector representing the player's movement (WASD)
     pub movement_vector: Vec3,
-    /// Whether the player just tap or clicked
-    pub tap: bool,
-    /// Whether the player just clicked with the secondary mouse button
-    pub secondary_tap: bool,
-    /// Whether the player just asked to finish placing what they are part way through
-    pub finish: bool,
     /// Whether the player just asked to turn what they are about to place
     pub turn: bool,
+    tap: bool,
+    secondary_tap: bool,
+    finish_key: bool,
+    claimed: bool,
+}
+
+impl PlayerInput {
+    /// Whether the player just clicked on the world.
+    pub fn tapped(&self) -> bool {
+        self.tap && !self.claimed
+    }
+
+    /// Whether the player just clicked on the world with the secondary mouse button.
+    pub fn secondary_tapped(&self) -> bool {
+        self.secondary_tap && !self.claimed
+    }
+
+    /// Whether the player just asked to finish placing what they are part way through.
+    ///
+    /// The secondary button asks for it as well as the key does, which is how a road is finished
+    /// without reaching for one — so a click the interface took stops asking and a key never does.
+    pub fn asked_to_finish(&self) -> bool {
+        self.finish_key || self.secondary_tapped()
+    }
+
+    /// Take this frame's click for the interface, so nothing in the world acts on it.
+    ///
+    /// The interface's alone: it is the only side of the screen that can tell a press on what it
+    /// drew from a press on the ground. Everything in the world reads a click through `Res`, so
+    /// claiming one from there means widening a signature where a reader can see it happen.
+    pub fn claim_the_click(&mut self) {
+        self.claimed = true;
+    }
+
+    #[cfg(test)]
+    pub fn tap(&mut self, clicked: bool) {
+        self.tap = clicked;
+    }
+
+    #[cfg(test)]
+    pub fn secondary_tap(&mut self, clicked: bool) {
+        self.secondary_tap = clicked;
+    }
+
+    #[cfg(test)]
+    pub fn finish(&mut self, asked: bool) {
+        self.finish_key = asked;
+    }
 }
 
 /// The set the player's commands are read in, so a system on the frame can run after it.
@@ -250,6 +307,11 @@ fn read_the_commands<C: Copy + PartialEq + Send + Sync + 'static>(
     }
 }
 
+/// Let go of the interface's claim on the click, the frame it was made on being over.
+fn forget_the_claim(mut player_input: ResMut<PlayerInput>) {
+    player_input.claimed = false;
+}
+
 /// Forget what the player asked for, the frame they asked on being over.
 fn forget_the_commands<C: Copy + PartialEq + Send + Sync + 'static>(
     mut requested: ResMut<Requested<C>>,
@@ -299,7 +361,8 @@ impl Plugin for PlayerInputPlugin {
                 )
                     .after(InputSystems),
             )
-            .add_systems(Update, update_indicator);
+            .add_systems(Update, update_indicator)
+            .add_systems(Last, forget_the_claim);
     }
 }
 
@@ -395,7 +458,7 @@ fn update_player_input(
 ) {
     player_input.tap = mouse_input.just_pressed(MouseButton::Left);
     player_input.secondary_tap = mouse_input.just_pressed(MouseButton::Right);
-    player_input.finish = player_input.secondary_tap || input.just_pressed(FINISH_KEY);
+    player_input.finish_key = input.just_pressed(FINISH_KEY);
     player_input.turn = input.just_pressed(TURN_KEY);
 
     let Some(camera) = &cursor.camera else {
@@ -661,6 +724,13 @@ mod tests {
         app.world().resource::<PlayerInput>()
     }
 
+    /// Take the click for the interface, as whatever notices a press on a panel would.
+    fn claim_the_click(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<PlayerInput>()
+            .claim_the_click();
+    }
+
     #[test]
     fn holding_the_orbit_key_switches_the_camera_to_orbiting() {
         let mut app = input_app();
@@ -715,7 +785,7 @@ mod tests {
         press_mouse(&mut app, MouseButton::Left);
         tick(&mut app);
 
-        assert!(player_input(&app).tap);
+        assert!(player_input(&app).tapped());
     }
 
     #[test]
@@ -726,7 +796,7 @@ mod tests {
         press_mouse(&mut app, MouseButton::Right);
         tick(&mut app);
 
-        assert!(player_input(&app).secondary_tap);
+        assert!(player_input(&app).secondary_tapped());
     }
 
     #[test]
@@ -737,7 +807,7 @@ mod tests {
         press_mouse(&mut app, MouseButton::Right);
         tick(&mut app);
 
-        assert!(player_input(&app).finish);
+        assert!(player_input(&app).asked_to_finish());
     }
 
     #[test]
@@ -748,7 +818,7 @@ mod tests {
         press_key(&mut app, FINISH_KEY);
         tick(&mut app);
 
-        assert!(player_input(&app).finish);
+        assert!(player_input(&app).asked_to_finish());
     }
 
     #[test]
@@ -759,7 +829,7 @@ mod tests {
 
         tick(&mut app);
 
-        assert!(!player_input(&app).finish);
+        assert!(!player_input(&app).asked_to_finish());
     }
 
     #[test]
@@ -792,7 +862,7 @@ mod tests {
         press_mouse(&mut app, MouseButton::Left);
         tick(&mut app);
 
-        assert!(!player_input(&app).finish);
+        assert!(!player_input(&app).asked_to_finish());
     }
 
     #[test]
@@ -803,7 +873,68 @@ mod tests {
         press_mouse(&mut app, MouseButton::Right);
         tick(&mut app);
 
-        assert!(!player_input(&app).tap);
+        assert!(!player_input(&app).tapped());
+    }
+
+    #[test]
+    fn a_click_the_interface_claimed_is_no_tap() {
+        let mut app = input_app();
+        tick(&mut app);
+        press_mouse(&mut app, MouseButton::Left);
+        tick(&mut app);
+
+        claim_the_click(&mut app);
+
+        assert!(!player_input(&app).tapped());
+    }
+
+    #[test]
+    fn a_right_click_the_interface_claimed_is_no_secondary_tap() {
+        let mut app = input_app();
+        tick(&mut app);
+        press_mouse(&mut app, MouseButton::Right);
+        tick(&mut app);
+
+        claim_the_click(&mut app);
+
+        assert!(!player_input(&app).secondary_tapped());
+    }
+
+    #[test]
+    fn a_right_click_the_interface_claimed_asks_for_no_finish() {
+        let mut app = input_app();
+        tick(&mut app);
+        press_mouse(&mut app, MouseButton::Right);
+        tick(&mut app);
+
+        claim_the_click(&mut app);
+
+        assert!(!player_input(&app).asked_to_finish());
+    }
+
+    #[test]
+    fn a_claim_on_the_click_leaves_the_finish_key_alone() {
+        let mut app = input_app();
+        tick(&mut app);
+        press_key(&mut app, FINISH_KEY);
+        tick(&mut app);
+
+        claim_the_click(&mut app);
+
+        assert!(player_input(&app).asked_to_finish());
+    }
+
+    #[test]
+    fn a_claim_does_not_outlive_the_frame_it_was_made_on() {
+        let mut app = input_app();
+        tick(&mut app);
+        claim_the_click(&mut app);
+        tick(&mut app);
+
+        press_mouse(&mut app, MouseButton::Left);
+        tick(&mut app);
+
+        assert!(player_input(&app).tapped());
     }
 
     #[test]

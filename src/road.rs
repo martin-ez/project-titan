@@ -1432,7 +1432,7 @@ fn place_a_node(
     junctions: Query<&Junction>,
     mut placing: Query<&mut DrawnRoad>,
 ) {
-    if !player_input.tap || *action.get() != PlayerAction::EditRoads {
+    if !player_input.tapped() || *action.get() != PlayerAction::EditRoads {
         return;
     }
     let Some(target) = player_input.cursor_node else {
@@ -1575,7 +1575,7 @@ fn lay_the_road(
     roads: Query<&Road>,
 ) {
     for (entity, placed) in &placing {
-        if !player_input.finish && !reaches_a_road(placed, &roads) {
+        if !player_input.asked_to_finish() && !reaches_a_road(placed, &roads) {
             continue;
         }
         commands.entity(entity).despawn();
@@ -1613,7 +1613,7 @@ fn remove_the_arc_under_the_cursor(
     placing: Query<&DrawnRoad>,
     roads: Query<&Road>,
 ) {
-    if !player_input.secondary_tap
+    if !player_input.secondary_tapped()
         || *action.get() != PlayerAction::EditRoads
         || !placing.is_empty()
     {
@@ -3487,17 +3487,17 @@ mod tests {
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
             input.cursor_node = Some(node);
-            input.tap = true;
+            input.tap(true);
         }
         tick(app);
-        app.world_mut().resource_mut::<PlayerInput>().tap = false;
+        app.world_mut().resource_mut::<PlayerInput>().tap(false);
     }
 
     /// Ask for the road being placed to be laid, and take the frame that reads it.
     fn finish_the_road(app: &mut App) {
-        app.world_mut().resource_mut::<PlayerInput>().finish = true;
+        app.world_mut().resource_mut::<PlayerInput>().finish(true);
         tick(app);
-        app.world_mut().resource_mut::<PlayerInput>().finish = false;
+        app.world_mut().resource_mut::<PlayerInput>().finish(false);
     }
 
     /// Click through `path` and finish, which is how a whole road is placed.
@@ -3598,10 +3598,10 @@ mod tests {
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
             input.cursor_node = None;
-            input.tap = true;
+            input.tap(true);
         }
         tick(&mut app);
-        app.world_mut().resource_mut::<PlayerInput>().tap = false;
+        app.world_mut().resource_mut::<PlayerInput>().tap(false);
         click_at(&mut app, path[1]);
         finish_the_road(&mut app);
 
@@ -3712,13 +3712,13 @@ mod tests {
         take_up(app, PlayerAction::EditBuildings);
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.secondary_tap = true;
+            input.secondary_tap(true);
             input.cursor_tile = Some(tile);
         }
         tick(app);
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.secondary_tap = false;
+            input.secondary_tap(false);
             input.cursor_tile = None;
         }
         take_up(app, PlayerAction::EditRoads);
@@ -3728,13 +3728,13 @@ mod tests {
     fn tap_on(app: &mut App, tile: Entity) {
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.tap = true;
+            input.tap(true);
             input.cursor_tile = Some(tile);
         }
         tick(app);
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.tap = false;
+            input.tap(false);
             input.cursor_tile = None;
         }
     }
@@ -4907,11 +4907,11 @@ mod tests {
             .expect("the junction stands somewhere");
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.tap = true;
+            input.tap(true);
             input.world_cursor_position = Some(at);
         }
         tick(app);
-        app.world_mut().resource_mut::<PlayerInput>().tap = false;
+        app.world_mut().resource_mut::<PlayerInput>().tap(false);
         junction
     }
 
@@ -5552,14 +5552,14 @@ mod tests {
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
             input.ground_cursor_position = Some(at);
-            input.secondary_tap = true;
-            input.finish = true;
+            input.secondary_tap(true);
+            input.finish(true);
         }
         tick(app);
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.secondary_tap = false;
-            input.finish = false;
+            input.secondary_tap(false);
+            input.finish(false);
         }
         tick(app);
     }
