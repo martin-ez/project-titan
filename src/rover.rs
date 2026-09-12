@@ -1654,14 +1654,11 @@ mod tests {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
             input.ground_cursor_position = Some(middle_of_the_middle_arc());
             input.secondary_tap(true);
-            input.finish(true);
         }
         advance(app, SHORT_FRAME);
-        {
-            let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.secondary_tap(false);
-            input.finish(false);
-        }
+        app.world_mut()
+            .resource_mut::<PlayerInput>()
+            .secondary_tap(false);
         advance(app, SHORT_FRAME);
     }
 

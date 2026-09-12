@@ -3482,6 +3482,13 @@ mod tests {
         assert_eq!(segments_in_the_world(&mut app), 0);
     }
 
+    /// Take the next click for the interface, as whatever notices a press on a panel would.
+    fn claim_the_click(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<PlayerInput>()
+            .claimed_by_the_interface = true;
+    }
+
     /// Click on `node`, and take the frame that reads the click.
     fn click_at(app: &mut App, node: LatticeNode) {
         {
@@ -3550,6 +3557,30 @@ mod tests {
         let mut app = app_holding(PlayerAction::EditRoads);
 
         click_at(&mut app, nodes(&STRAIGHT)[0]);
+
+        assert_eq!(roads_in_the_world(&mut app), 0);
+        assert_eq!(placing(&mut app), 1);
+    }
+
+    #[test]
+    fn a_click_the_interface_claimed_places_no_node() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+
+        claim_the_click(&mut app);
+        click_at(&mut app, nodes(&STRAIGHT)[0]);
+
+        assert_eq!(placing(&mut app), 0);
+    }
+
+    #[test]
+    fn a_right_click_the_interface_claimed_finishes_no_road() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        let path = nodes(&STRAIGHT);
+        click_at(&mut app, path[0]);
+        click_at(&mut app, path[1]);
+
+        claim_the_click(&mut app);
+        right_click_at(&mut app, path[1].world_position());
 
         assert_eq!(roads_in_the_world(&mut app), 0);
         assert_eq!(placing(&mut app), 1);
@@ -5553,14 +5584,11 @@ mod tests {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
             input.ground_cursor_position = Some(at);
             input.secondary_tap(true);
-            input.finish(true);
         }
         tick(app);
-        {
-            let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.secondary_tap(false);
-            input.finish(false);
-        }
+        app.world_mut()
+            .resource_mut::<PlayerInput>()
+            .secondary_tap(false);
         tick(app);
     }
 
@@ -5607,6 +5635,19 @@ mod tests {
             .query_filtered::<Entity, With<Road>>()
             .iter(app.world())
             .collect()
+    }
+
+    #[test]
+    fn a_right_click_the_interface_claimed_removes_no_arc() {
+        let mut app = app_holding(PlayerAction::EditRoads);
+        spawn_road(&mut app, &STRAIGHT);
+        tick(&mut app);
+
+        claim_the_click(&mut app);
+        right_click_at(&mut app, middle_of(&STRAIGHT, 1));
+
+        assert_eq!(roads_in_the_world(&mut app), 1);
+        assert!(a_road_runs_through(&mut app, &STRAIGHT));
     }
 
     #[test]

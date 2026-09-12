@@ -120,21 +120,27 @@ pub struct PlayerInput {
     pub movement_vector: Vec3,
     /// Whether the player just asked to turn what they are about to place
     pub turn: bool,
+    /// Whether the interface took this frame's click, leaving nothing in the world to act on it
+    ///
+    /// Set by whatever draws the interface, that being the only side of the screen able to tell a
+    /// press on a panel from a press on the ground, and let go of at the end of the frame it was
+    /// set on. Nothing in the world sets it: a click is read there through `Res`, and the systems
+    /// that act on one never hold the resource by the end that could.
+    pub claimed_by_the_interface: bool,
     tap: bool,
     secondary_tap: bool,
     finish_key: bool,
-    claimed: bool,
 }
 
 impl PlayerInput {
     /// Whether the player just clicked on the world.
     pub fn tapped(&self) -> bool {
-        self.tap && !self.claimed
+        self.tap && !self.claimed_by_the_interface
     }
 
     /// Whether the player just clicked on the world with the secondary mouse button.
     pub fn secondary_tapped(&self) -> bool {
-        self.secondary_tap && !self.claimed
+        self.secondary_tap && !self.claimed_by_the_interface
     }
 
     /// Whether the player just asked to finish placing what they are part way through.
@@ -143,15 +149,6 @@ impl PlayerInput {
     /// without reaching for one — so a click the interface took stops asking and a key never does.
     pub fn asked_to_finish(&self) -> bool {
         self.finish_key || self.secondary_tapped()
-    }
-
-    /// Take this frame's click for the interface, so nothing in the world acts on it.
-    ///
-    /// The interface's alone: it is the only side of the screen that can tell a press on what it
-    /// drew from a press on the ground. Everything in the world reads a click through `Res`, so
-    /// claiming one from there means widening a signature where a reader can see it happen.
-    pub fn claim_the_click(&mut self) {
-        self.claimed = true;
     }
 
     #[cfg(test)]
@@ -309,7 +306,7 @@ fn read_the_commands<C: Copy + PartialEq + Send + Sync + 'static>(
 
 /// Let go of the interface's claim on the click, the frame it was made on being over.
 fn forget_the_claim(mut player_input: ResMut<PlayerInput>) {
-    player_input.claimed = false;
+    player_input.claimed_by_the_interface = false;
 }
 
 /// Forget what the player asked for, the frame they asked on being over.
@@ -728,7 +725,7 @@ mod tests {
     fn claim_the_click(app: &mut App) {
         app.world_mut()
             .resource_mut::<PlayerInput>()
-            .claim_the_click();
+            .claimed_by_the_interface = true;
     }
 
     #[test]
