@@ -945,7 +945,7 @@ mod tests {
         let lines = legend_lines(&mut app);
 
         assert!(
-            lines.iter().any(|line| line == "Road tool (held)"),
+            lines.iter().any(|line| line == "▸ Road tool (held)"),
             "{lines:?}"
         );
         assert!(
@@ -978,7 +978,7 @@ mod tests {
         let lines = legend_lines(&mut app);
 
         assert!(
-            lines.iter().any(|line| line == "Building tool (2)"),
+            lines.iter().any(|line| line == "▸ Building tool (2)"),
             "{lines:?}"
         );
         assert!(
@@ -1003,7 +1003,7 @@ mod tests {
 
         let lines = legend_lines(&mut app);
 
-        assert!(lines.iter().any(|line| line == "Tools"), "{lines:?}");
+        assert!(lines.iter().any(|line| line == "▸ Tools"), "{lines:?}");
         assert!(
             lines.iter().any(|line| line == "Building tool"),
             "{lines:?}"
@@ -1019,7 +1019,7 @@ mod tests {
         let lines = legend_lines(&mut app);
 
         assert!(
-            lines.iter().any(|line| line == "Select tool (held, 2)"),
+            lines.iter().any(|line| line == "▸ Select tool (held, 2)"),
             "{lines:?}"
         );
         assert!(
@@ -1151,7 +1151,7 @@ mod tests {
         let legend = shown_legend(&mut app);
 
         assert!(!legend.contains("Pick the setting below"), "{legend}");
-        assert!(legend.contains("Panels (6)"), "{legend}");
+        assert!(legend.contains("Panels (9)"), "{legend}");
     }
 
     #[test]
@@ -1181,6 +1181,269 @@ mod tests {
             "{drawn} lines: {:?}",
             legend_lines(&mut app)
         );
+    }
+
+    /// Press `key` and let go again, which is one command asked for.
+    fn press_once(app: &mut App, key: KeyCode) {
+        press_key(app, key);
+        tick(app);
+        release_key(app, key);
+        tick(app);
+    }
+
+    /// A legend over a game holding the select tool, with three categories to walk between.
+    ///
+    /// `Tools` and the building tool's own come off the bindings declared here, and `Panels` off
+    /// the legend's own keys, so the list the picked category walks is `Tools`, `Building tool`,
+    /// `Panels`.
+    fn legend_over_several_categories() -> App {
+        let mut app = legend_app_holding(PlayerAction::Select);
+        declare(
+            &mut app,
+            [
+                Binding {
+                    input: BindingInput::Key(KeyCode::Digit3),
+                    action: "Building tool",
+                    category: BindingCategory::Tools,
+                },
+                Binding {
+                    input: BindingInput::Key(KeyCode::KeyQ),
+                    action: "Choose the type before this one",
+                    category: BindingCategory::Tool(PlayerAction::EditBuildings),
+                },
+            ],
+        );
+        app
+    }
+
+    /// What `which` panel has written on it, for a test reading one the legend is beside.
+    fn panel_lines(app: &mut App, which: Panel) -> Vec<String> {
+        let on_screen: Vec<(Entity, Panel)> = app
+            .world_mut()
+            .query::<(Entity, &Panel)>()
+            .iter(app.world())
+            .map(|(entity, panel)| (entity, *panel))
+            .collect();
+        let panel = on_screen
+            .into_iter()
+            .find(|(_, panel)| *panel == which)
+            .map(|(entity, _)| entity)
+            .expect("that panel is on screen");
+        let mut lines = Vec::new();
+        collect_text(app.world(), panel, &mut lines);
+        lines
+    }
+
+    #[test]
+    fn the_legend_marks_the_category_its_keys_are_holding() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        let lines = legend_lines(&mut app);
+
+        assert!(lines.iter().any(|line| line == "▸ Tools"), "{lines:?}");
+    }
+
+    #[test]
+    fn picking_walks_the_mark_down_the_categories() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        press_once(&mut app, PICK_DOWN_KEY);
+
+        let lines = legend_lines(&mut app);
+        assert!(
+            lines.iter().any(|line| line == "▸ Building tool (1)"),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|line| line == "Tools"), "{lines:?}");
+    }
+
+    #[test]
+    fn picking_stops_at_the_last_category_rather_than_wrapping() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        for _ in 0..5 {
+            press_once(&mut app, PICK_DOWN_KEY);
+        }
+
+        let lines = legend_lines(&mut app);
+        assert!(
+            lines.iter().any(|line| line.starts_with("▸ Panels")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn picking_stops_at_the_first_category_rather_than_wrapping() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        press_once(&mut app, PICK_UP_KEY);
+
+        let lines = legend_lines(&mut app);
+        assert!(lines.iter().any(|line| line == "▸ Tools"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_category_the_situation_leaves_closed_opens_on_the_key() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        press_once(&mut app, PICK_DOWN_KEY);
+        press_once(&mut app, SHOW_CATEGORY_KEY);
+
+        let lines = legend_lines(&mut app);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Choose the type before this one"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_category_opened_by_hand_closes_again_on_the_same_key() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+        press_once(&mut app, PICK_DOWN_KEY);
+        press_once(&mut app, SHOW_CATEGORY_KEY);
+
+        press_once(&mut app, SHOW_CATEGORY_KEY);
+
+        let lines = legend_lines(&mut app);
+        assert!(
+            lines.iter().any(|line| line == "▸ Building tool (1)"),
+            "{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line == "Choose the type before this one"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_category_opened_by_hand_stays_open_when_another_tool_is_picked_up() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+        press_once(&mut app, PICK_DOWN_KEY);
+        press_once(&mut app, SHOW_CATEGORY_KEY);
+
+        hold_the_tool(&mut app, PlayerAction::EditRoads);
+
+        let lines = legend_lines(&mut app);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Choose the type before this one"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_category_closed_by_hand_stays_closed_when_its_tool_is_picked_up() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+        press_once(&mut app, PICK_DOWN_KEY);
+        press_once(&mut app, SHOW_CATEGORY_KEY);
+        press_once(&mut app, SHOW_CATEGORY_KEY);
+
+        hold_the_tool(&mut app, PlayerAction::EditBuildings);
+
+        let lines = legend_lines(&mut app);
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line == "Choose the type before this one"),
+            "{lines:?}"
+        );
+    }
+
+    /// Put `tool` in the player's hand, which is one of the situations a category reads.
+    fn hold_the_tool(app: &mut App, tool: PlayerAction) {
+        app.world_mut()
+            .resource_mut::<NextState<PlayerAction>>()
+            .set(tool);
+        tick(app);
+        tick(app);
+    }
+
+    #[test]
+    fn a_category_with_nothing_to_show_does_not_open_by_hand() {
+        let mut app = picking_legend_app();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        press_once(&mut app, SHOW_CATEGORY_KEY);
+
+        let lines = legend_lines(&mut app);
+        assert!(
+            lines.iter().any(|line| line == "▸ Select tool (held, 2)"),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with("Take a rover")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn only_the_settings_panel_answers_an_arrow_while_both_are_open() {
+        let mut app = every_plugin_that_declares_a_binding();
+        tick(&mut app);
+        show_a_legend(&mut app);
+        open_the_settings_panel(&mut app);
+
+        press_once(&mut app, KeyCode::ArrowDown);
+
+        let settings = panel_lines(&mut app, Panel::Settings);
+        assert!(
+            settings.iter().any(|line| line == "▸ Orbit the camera"),
+            "{settings:?}"
+        );
+        let legend = legend_lines(&mut app);
+        assert!(legend.iter().any(|line| line == "▸ Tools"), "{legend:?}");
+    }
+
+    #[test]
+    fn the_legend_says_what_opens_a_category() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        let lines = legend_lines(&mut app);
+
+        assert!(lines.iter().any(|line| line == HOW_TO_OPEN), "{lines:?}");
+    }
+
+    #[test]
+    fn the_keys_that_open_a_category_are_rows_like_any_other_binding() {
+        let mut app = legend_over_several_categories();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        for _ in 0..2 {
+            press_once(&mut app, PICK_DOWN_KEY);
+        }
+        press_once(&mut app, SHOW_CATEGORY_KEY);
+
+        let lines = legend_lines(&mut app);
+        assert!(
+            lines.iter().any(|line| line == "Open or close the category"),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|line| line == "Page Down"), "{lines:?}");
     }
 
     #[test]
