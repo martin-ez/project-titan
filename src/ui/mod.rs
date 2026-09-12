@@ -45,6 +45,12 @@ pub const KEYED_TEXT: Color = Color::srgb(0.98, 0.90, 0.66);
 /// The colour the body of a row is written in
 pub const BODY_TEXT: Color = Color::srgb(0.86, 0.87, 0.90);
 
+/// What marks the row a panel's keys are holding, and what stands in its place on the rest.
+///
+/// Indexed by whether the row is the one held, so the two are the same width and a column of them
+/// does not step in and out as the player walks down it.
+pub const PICKED_OUT: [&str; 2] = ["  ", "▸ "];
+
 /// Which panel this is, carried by the panel while it is on screen.
 ///
 /// A binding that only answers while its panel is up says which one it belongs to, and the legend

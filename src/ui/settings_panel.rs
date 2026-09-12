@@ -16,6 +16,7 @@ use crate::input::{DeclareCommands, PlayerCommand, Requested};
 use crate::ui::legend::{BindingCategory, BindingCondition, BindingInput};
 use crate::ui::{
     panel, panel_row, panel_text, Panel, PanelCorner, BODY_TEXT, HEADING_TEXT, KEYED_TEXT,
+    PICKED_OUT,
 };
 use bevy::prelude::*;
 use std::ops::Range;
@@ -66,9 +67,6 @@ const PANEL_WIDTH: f32 = 260.0;
 
 /// How wide the column naming a setting is, in logical pixels
 const NAME_COLUMN_WIDTH: f32 = 180.0;
-
-/// What marks the row the player picked out, and what stands in its place otherwise
-const PICKED_OUT: [&str; 2] = ["  ", "▸ "];
 
 /// What the panel calls the group of settings it carries
 const HEADING: &str = "Camera sensitivity";
