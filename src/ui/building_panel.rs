@@ -263,12 +263,12 @@ fn rovers(count: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::building::{BuildingPlugin, BuildingTiles, ChosenBuildingType};
+    use crate::building::{BuildingPlugin, BuildingTiles, CatalogueEntry, ChosenBuilding};
     use crate::common::cleanup::CleanupPlugin;
     use crate::diagnostics::DebugGizmosPlugin;
     use crate::fleet::FleetPlugin;
     use crate::input::{PlayerAction, PlayerInput};
-    use crate::map::{Deposit, HexCoordinates, MapTile, TileCorner};
+    use crate::map::{Deposit, HexCoordinates, MapTile, RawMaterial, TileCorner};
     use crate::road::{Road, RoadEndpoint, RoadPlugin};
     use crate::testing::{headless_app, press_key, release_key, tick};
     use crate::ui::selection::SelectionPlugin;
@@ -290,7 +290,7 @@ mod tests {
     const BARE: (i32, i32) = (6, 0);
 
     /// How far through the catalogue the first assembler sits: one item in, one out.
-    const MELTER: isize = 5;
+    const MELTER: isize = 1;
 
     /// The corner a melter's intake stands on, which is `INTAKE_CORNERS[0]` unturned.
     const INTAKE: TileCorner = TileCorner::SouthWest;
@@ -347,30 +347,26 @@ mod tests {
             .id()
     }
 
-    /// Lay under `tile` the ground the type the tool is holding needs, an extractor standing
-    /// nowhere but a deposit of what it draws.
+    /// Lay under `tile` the ground the entry the tool is holding needs, an extractor standing
+    /// nowhere but a deposit and drawing whatever it finds there.
     fn ground_for_the_chosen_type(app: &mut App, tile: Entity) {
-        let BuildingType::Extractor(material) =
-            app.world().resource::<ChosenBuildingType>().chosen()
-        else {
+        if app.world().resource::<ChosenBuilding>().chosen() != CatalogueEntry::Extractor {
             return;
-        };
+        }
         app.world_mut().entity_mut(tile).insert(Deposit {
-            material,
+            material: RawMaterial::Ice,
             richness: 1,
         });
     }
 
     /// Put the `steps`th type of the catalogue on `offsets`, answering with it and its tile.
     fn place(app: &mut App, offsets: (i32, i32), steps: isize) -> (Entity, Entity) {
-        app.world_mut()
-            .resource_mut::<ChosenBuildingType>()
-            .step(steps);
+        app.world_mut().resource_mut::<ChosenBuilding>().step(steps);
         let tile = spawn_tile(app, offsets);
         ground_for_the_chosen_type(app, tile);
         click_at(app, tile, tile_of(offsets).world_position());
         app.world_mut()
-            .resource_mut::<ChosenBuildingType>()
+            .resource_mut::<ChosenBuilding>()
             .step(-steps);
         let building = app
             .world()

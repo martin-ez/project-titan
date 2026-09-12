@@ -234,9 +234,9 @@ mod tests {
 
     /// How far through the catalogue a type taking one item in and putting one out sits.
     ///
-    /// The first assembler of `BuildingType::ALL`: an extractor takes nothing in, so it stands no
+    /// The first assembler of `CatalogueEntry::ALL`: an extractor takes nothing in, so it stands no
     /// intake, and an intake is what a fleet is given to.
-    const MELTER: isize = 5;
+    const MELTER: isize = 1;
 
     /// The corner the melter's intake stands on, which is `INTAKE_CORNERS[0]` unturned.
     const INTAKE: TileCorner = TileCorner::SouthWest;
@@ -281,7 +281,7 @@ mod tests {
     fn place_a_melter(app: &mut App, offsets: (i32, i32)) -> Entity {
         for _ in 0..MELTER {
             app.world_mut()
-                .resource_mut::<crate::building::ChosenBuildingType>()
+                .resource_mut::<crate::building::ChosenBuilding>()
                 .step(1);
         }
         let tile = spawn_tile(app, offsets);

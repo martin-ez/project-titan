@@ -3127,11 +3127,11 @@ fn draw_the_lanes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::building::{BuildingPlugin, BuildingType, ChosenBuildingType};
+    use crate::building::{BuildingPlugin, CatalogueEntry, ChosenBuilding};
     use crate::common::cleanup::CleanupPlugin;
     use crate::common::initialize::InitializationFailed;
     use crate::diagnostics::DebugGizmosPlugin;
-    use crate::map::{Deposit, MAP_TILE_SIZE};
+    use crate::map::{Deposit, RawMaterial, MAP_TILE_SIZE};
     use crate::testing::{ask_for, headless_app, press_key, release_key, tick};
     use crate::ui::selection::SelectionPlugin;
     use std::collections::HashSet;
@@ -3835,16 +3835,14 @@ mod tests {
     ///
     /// The building tool is what places one, so the test picks it up the way a player does rather
     /// than writing the building into the world behind the rule that refuses it.
-    /// Lay under `tile` the ground the type the tool is holding needs, an extractor standing
-    /// nowhere but a deposit of what it draws.
+    /// Lay under `tile` the ground the entry the tool is holding needs, an extractor standing
+    /// nowhere but a deposit and drawing whatever it finds there.
     fn ground_for_the_chosen_type(app: &mut App, tile: Entity) {
-        let BuildingType::Extractor(material) =
-            app.world().resource::<ChosenBuildingType>().chosen()
-        else {
+        if app.world().resource::<ChosenBuilding>().chosen() != CatalogueEntry::Extractor {
             return;
-        };
+        }
         app.world_mut().entity_mut(tile).insert(Deposit {
-            material,
+            material: RawMaterial::Ice,
             richness: 1,
         });
     }

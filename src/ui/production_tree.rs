@@ -1,6 +1,6 @@
 //! The production tree on screen, and the chain one item of it names.
 //!
-//! Every step the game can run and every good it moves, read off [`BuildingType::ALL`] — the same
+//! Every step the game can run and every good it moves, read off the catalogue — the same
 //! definitions the tick runs — rather than copied beside them. A step is a node of its own, so one
 //! that splits draws as a single step with both its products coming off it rather than as two
 //! recipes the player could build separately.
@@ -13,7 +13,7 @@
 //! Nothing here writes the world. Focus is the panel's own record and lives on the frame, and
 //! what a step is making is read off the tick that counted it rather than measured again here.
 
-use crate::building::{BuildingType, Item};
+use crate::building::{BuildingType, CatalogueEntry, Item};
 use crate::input::{DeclareCommands, PlayerCommand, Requested};
 use crate::production::{Output, OUTPUT_WINDOW};
 use crate::ui::legend::{BindingCategory, BindingCondition, BindingInput};
@@ -143,7 +143,7 @@ struct ClearTheFocus;
 
 impl Plugin for ProductionTreePlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(Tree::of(&BuildingType::ALL))
+        app.insert_resource(Tree::of(&CatalogueEntry::every_building()))
             .init_resource::<Focus>()
             .declare_commands([PlayerCommand {
                 input: BindingInput::Key(TREE_KEY),
@@ -620,7 +620,7 @@ mod tests {
     /// The step the tests place, written the same way in [`A_CATALOGUE`] and in the real catalogue.
     ///
     /// A [`Recipe`] compares by what it holds, so a melter built from this one is read out on the
-    /// node the panel drew for the melter in [`BuildingType::ALL`].
+    /// node the panel drew for the melter in [`CatalogueEntry::every_building`].
     const MELTER: BuildingType = A_CATALOGUE[1];
 
     /// How many ticks a measured run of the production tick lasts, longer than several runs.
@@ -762,9 +762,9 @@ mod tests {
 
     #[test]
     fn the_tree_is_drawn_from_the_catalogue_the_game_places_from() {
-        let tree = Tree::of(&BuildingType::ALL);
+        let tree = Tree::of(&CatalogueEntry::every_building());
 
-        assert_eq!(tree.recipes, BuildingType::ALL.to_vec());
+        assert_eq!(tree.recipes, CatalogueEntry::every_building());
         assert!(tree.items.contains(&Item::Electronics));
     }
 
@@ -808,7 +808,7 @@ mod tests {
 
     #[test]
     fn a_chain_that_loops_back_on_itself_is_selected_once() {
-        let tree = Tree::of(&BuildingType::ALL);
+        let tree = Tree::of(&CatalogueEntry::every_building());
 
         let chain = chain_around(&tree, Item::Oxygen);
 
@@ -834,7 +834,7 @@ mod tests {
 
     #[test]
     fn a_loop_still_leaves_every_step_deeper_than_what_it_takes() {
-        let tree = Tree::of(&BuildingType::ALL);
+        let tree = Tree::of(&CatalogueEntry::every_building());
 
         let depths = tree.depths();
 
@@ -880,7 +880,7 @@ mod tests {
 
         step_focus(&mut app, 1);
 
-        let first = BuildingType::ALL[0].recipe().outputs[0].item;
+        let first = CatalogueEntry::every_building()[0].recipe().outputs[0].item;
         assert_eq!(app.world().resource::<Focus>().0, Some(0));
         assert!(
             says(&mut app, &format!("Focused on {}", first.name())),
