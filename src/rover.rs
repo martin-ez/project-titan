@@ -5,8 +5,8 @@ use crate::diagnostics::DebugGizmos;
 use crate::map::MAP_TILE_SIZE;
 use crate::road::{
     EndsAtJunction, JunctionLegs, JunctionPolicy, NextSegment, PlaceOnTheRoad, RoadEndpoint,
-    RoadNetwork, RoadSegment, RoadsLaid, SegmentCut, ServedBy, Signal, ROVER_ROOM,
-    STRAIGHT_SPEED_LIMIT,
+    RoadNetwork, RoadSegment, RoadsLaid, SegmentCut, ServedBy, Signal, ROVER_ACCELERATION,
+    ROVER_ROOM, STRAIGHT_SPEED_LIMIT,
 };
 use crate::simulation::{Simulation, Ticks};
 use bevy::ecs::system::SystemParam;
@@ -28,14 +28,6 @@ const ROVER_HEIGHT: f32 = MAP_TILE_SIZE / 10.;
 /// other way round. It is here so that a lane of segments too short to spend a whole tick on
 /// cannot spin the driver, rather than to cap how fast anything goes.
 const HANDOVERS_PER_TICK: usize = 8;
-
-/// How much a rover's speed may change from one tick to the next, in world units a tick a tick.
-///
-/// A forty-eighth of the open road's limit, settled by play testing: a rover pulls away from a
-/// port over forty-eight ticks and three eighths of a tile, which reads as a machine getting under
-/// way rather than as one starting late. Per tick and not per second, because running the world
-/// faster runs more ticks rather than longer ones (invariant 2).
-const ROVER_ACCELERATION: f32 = STRAIGHT_SPEED_LIMIT / 48.;
 
 /// How much road a rover travelling at the open road's limit needs to brake to a stop.
 ///
@@ -1019,11 +1011,13 @@ mod tests {
     use crate::input::{PlayerAction, PlayerInput};
     use crate::map::{HexCoordinates, LatticeNode, MAP_TILE_INRADIUS};
     use crate::road::{
-        EndsAtJunction, JunctionLegs, Road, RoadEndpoint, RoadPlugin, ServedBy, ROVER_ROOM,
+        EndsAtJunction, JunctionLegs, Road, RoadEndpoint, RoadNetwork, RoadPlugin, ServedBy,
+        ROVER_ROOM,
     };
     use crate::simulation::{SimulationPlugin, Ticks};
     use crate::testing::{advance, headless_app, tick, trace};
-    use std::time::Duration;
+    use bevy::ecs::system::RunSystemOnce;
+    use std::time::{Duration, Instant};
 
     /// How closely two world positions have to agree to be the same place.
     const TOLERANCE: f32 = 1e-3;
@@ -1280,6 +1274,18 @@ mod tests {
     /// The tile the longer arm of the fork heads for, in offset-row coordinates.
     const THE_LONG_WAY: (i32, i32) = (1, 2);
 
+    /// The roads built across the fork's quicker arm, as the tiles each runs between.
+    ///
+    /// Two, because one junction does not cost the arm the time that separates it from the other,
+    /// and they cross it a long way apart so that neither crossing stands too near the other or
+    /// near the junctions the arms already meet at.
+    const CROSSINGS_OF_THE_QUICKER_ARM: [((i32, i32), (i32, i32)); 4] = [
+        ((-1, 1), (1, 1)),
+        ((1, 0), (1, 4)),
+        ((3, 0), (3, 4)),
+        ((2, 1), (4, 1)),
+    ];
+
     /// How many roads run each way across the network a route is looked for over.
     const ROADS_EACH_WAY: i32 = 11;
 
@@ -1297,6 +1303,21 @@ mod tests {
 
     /// How many segments a network has to hold to be worth looking for a route across.
     const A_LARGE_NETWORK: usize = 2000;
+
+    /// How far from the ticks a rover spends driving a route the search may cost it, as a
+    /// fraction of the drive.
+    ///
+    /// A twentieth. The cost is the trapezoid a rover drives and a rover drives it a tick at a
+    /// time, so a part-spent tick rounds at every change of pace along the way; what is left over
+    /// is the hand-over at a junction, which is a rover waiting rather than driving.
+    const COSTED_WITHIN: f32 = 0.05;
+
+    /// How long the search may spend costing one route across a network of thousands of segments.
+    ///
+    /// Measured at 1.4 to 2.4 ms over this fixture's 4358 segments from a cold start, so this is
+    /// twenty times the figure it is guarding: it catches a cost that walks the network again for
+    /// every stretch it prices, and not a machine that was busy elsewhere.
+    const COSTING_A_LARGE_NETWORK: Duration = Duration::from_millis(40);
 
     /// How much a rover carries on a delivery under test.
     const LOAD: u32 = 3;
@@ -3449,7 +3470,76 @@ mod tests {
         (app, collection, delivery)
     }
 
-    /// How long the stretch of lane from `way_out` to the next junction is, and how long it takes.
+    /// The fork, with roads built across the arm that covers more road and costs less time.
+    ///
+    /// Every crossing is a stop, so the arm that wins on length over its speed limits is the one a
+    /// rover now spends the longest on. Which way the search sends a delivery is then the whole of
+    /// whether it counts what a stop costs.
+    fn a_fork_whose_quicker_arm_is_crossed() -> (App, Entity, Entity) {
+        let mut app = rover_app();
+        lay_a_road_of_the_fork(&mut app, &the_stem(), false);
+        lay_a_road_of_the_fork(&mut app, &an_arm(&THE_SHORT_ARM), false);
+        lay_a_road_of_the_fork(&mut app, &an_arm(&THE_LONG_ARM), false);
+        lay_a_road_of_the_fork(&mut app, &the_run_out(), false);
+        cross_the_quicker_arm(&mut app);
+        let (collection, delivery) = endpoints_of_the_fork(&mut app);
+        (app, collection, delivery)
+    }
+
+    /// Lay the roads that cross the fork's quicker arm.
+    fn cross_the_quicker_arm(app: &mut App) {
+        for (from, to) in CROSSINGS_OF_THE_QUICKER_ARM {
+            lay_road_between(app, from, to);
+        }
+    }
+
+    /// The fork with one of its arms left off, so a delivery has one way round to drive.
+    ///
+    /// What each arm costs on its own, which is what the search is choosing between when both are
+    /// there and the only way to measure either as the ticks a rover actually spends on it.
+    fn a_fork_down_one_arm(arm: &[(i32, i32)], crossed: bool) -> (App, Entity, Entity) {
+        let mut app = rover_app();
+        lay_a_road_of_the_fork(&mut app, &the_stem(), false);
+        lay_a_road_of_the_fork(&mut app, &an_arm(arm), false);
+        lay_a_road_of_the_fork(&mut app, &the_run_out(), false);
+        if crossed {
+            cross_the_quicker_arm(&mut app);
+        }
+        let (collection, delivery) = endpoints_of_the_fork(&mut app);
+        (app, collection, delivery)
+    }
+
+    /// How many ticks a delivery spends driving a fork that has only `arm` to go round.
+    fn ticks_down_one_arm(arm: &[(i32, i32)], crossed: bool) -> f32 {
+        let (mut app, collection, delivery) = a_fork_down_one_arm(arm, crossed);
+        ticks_to_deliver(&mut app, collection, delivery)
+    }
+
+    /// How many ticks a rover sent from `collection` spends getting a load to `delivery`.
+    fn ticks_to_deliver(app: &mut App, collection: Entity, delivery: Entity) -> f32 {
+        let set_off = app.world().resource::<Ticks>().0;
+        send_from(app, collection, delivery);
+        let landed = tick_delivered_on(app, delivery).expect("the delivery lands");
+        (landed - set_off) as f32
+    }
+
+    /// What the search costs the quickest route from `collection` to `delivery` at, in ticks.
+    fn ticks_costed(app: &mut App, collection: Entity, delivery: Entity) -> f32 {
+        let from = served_place(app, collection);
+        app.world_mut()
+            .run_system_once(move |mut network: RoadNetwork| {
+                network.ticks_to_reach(from.segment, from.along, delivery)
+            })
+            .expect("the search ran")
+            .expect("the route is drivable")
+    }
+
+    /// How long the stretch of lane from `way_out` to the next junction is, and how long driving it
+    /// at its speed limits throughout would take.
+    ///
+    /// Its limits and nothing else, which is less than a rover spends on it: what this separates is
+    /// the arm that covers less road from the arm that holds a rover to a lower speed, so the trade
+    /// a fork offers is a fact of the shape the player drew rather than of what the search counts.
     fn arm_from(app: &App, way_out: Entity) -> (f32, f32) {
         let (mut length, mut time) = (0., 0.);
         let mut at = way_out;
@@ -3888,6 +3978,101 @@ mod tests {
             "a route across the network with nothing to choose in it"
         );
         assert!(!is_stranded(&app, rover));
+    }
+
+    #[test]
+    fn a_route_is_costed_at_the_ticks_a_rover_takes_to_drive_it() {
+        let (mut app, collection, delivery) = a_road_between_endpoints();
+        let costed = ticks_costed(&mut app, collection, delivery);
+        let set_off = app.world().resource::<Ticks>().0;
+        set_off_from(&mut app, collection, delivery, Vec::new());
+
+        let landed = tick_delivered_on(&mut app, delivery).expect("the delivery lands");
+
+        let driven = (landed - set_off) as f32;
+        assert!(
+            (costed - driven).abs() <= driven * COSTED_WITHIN,
+            "a route costed at {costed} ticks took {driven} ticks to drive"
+        );
+    }
+
+    #[test]
+    fn a_route_through_a_junction_is_costed_for_the_stop_at_it() {
+        let (mut app, collection, across) = a_crossroads_between_endpoints();
+        let arriving = arriving_from(&mut app, COLLECTION);
+        let turn = way_out_towards(&app, arriving, ACROSS_TO);
+        let costed = ticks_costed(&mut app, collection, across);
+        let set_off = app.world().resource::<Ticks>().0;
+        set_off_from(&mut app, collection, across, vec![turn]);
+
+        let landed = tick_delivered_on(&mut app, across).expect("the delivery lands");
+
+        let driven = (landed - set_off) as f32;
+        assert!(
+            (costed - driven).abs() <= driven * COSTED_WITHIN,
+            "a route through a junction costed at {costed} ticks took {driven} ticks to drive"
+        );
+    }
+
+    #[test]
+    fn the_quicker_arm_is_passed_over_once_stops_are_built_across_it() {
+        let round_the_short_arm = ticks_down_one_arm(&THE_SHORT_ARM, false);
+        let round_the_crossed_arm = ticks_down_one_arm(&THE_LONG_ARM, true);
+        assert!(
+            round_the_short_arm < round_the_crossed_arm,
+            "the crossed arm is still the quicker drive: {round_the_crossed_arm} ticks round it \
+             against {round_the_short_arm} round the other"
+        );
+        let (mut app, collection, delivery) = a_fork_whose_quicker_arm_is_crossed();
+        let arriving = arriving_from(&mut app, FORK_FROM);
+        let short_way = way_out_towards(&app, arriving, THE_SHORT_WAY);
+
+        let rover = send_from(&mut app, collection, delivery);
+        tick(&mut app);
+
+        assert_eq!(
+            route_of(&app, rover).as_deref().and_then(<[Entity]>::first),
+            Some(&short_way),
+            "the rover was sent round the crossed arm, which takes {round_the_crossed_arm} ticks \
+             to drive against {round_the_short_arm} the other way"
+        );
+    }
+
+    #[test]
+    fn costing_a_route_does_not_depend_on_what_the_road_is_carrying() {
+        let (mut app, collection, delivery) = a_road_between_endpoints();
+        let clear = ticks_costed(&mut app, collection, delivery);
+        let from = served_place(&app, collection);
+
+        jam_the_lane_from(&mut app, from.segment);
+        tick(&mut app);
+
+        assert_eq!(ticks_costed(&mut app, collection, delivery), clear);
+    }
+
+    #[test]
+    fn a_route_across_a_network_of_thousands_of_segments_is_costed_as_quickly_as_ever() {
+        let (mut app, collection, delivery) = a_large_network();
+        assert!(
+            segments_in_the_world(&mut app) > A_LARGE_NETWORK,
+            "the network is too small to say anything about a large one"
+        );
+        let from = served_place(&app, collection);
+
+        let began = Instant::now();
+        let costed = app
+            .world_mut()
+            .run_system_once(move |mut network: RoadNetwork| {
+                network.ticks_to_reach(from.segment, from.along, delivery)
+            })
+            .expect("the search ran");
+        let spent = began.elapsed();
+
+        assert!(costed.is_some(), "no route across the network to cost");
+        assert!(
+            spent < COSTING_A_LARGE_NETWORK,
+            "costing one route took {spent:?}, over the {COSTING_A_LARGE_NETWORK:?} allowed"
+        );
     }
 
     #[test]

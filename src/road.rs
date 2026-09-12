@@ -124,6 +124,16 @@ const STRAIGHT_REACH: f32 = 1e-3;
 /// than longer ones, and this is untouched by that.
 pub const STRAIGHT_SPEED_LIMIT: f32 = MAP_TILE_SIZE / 64.;
 
+/// How much a rover's speed may change from one tick to the next, in world units a tick a tick.
+///
+/// A forty-eighth of the open road's limit, settled by play testing: a rover pulls away from a
+/// port over forty-eight ticks and three eighths of a tile, which reads as a machine getting under
+/// way rather than as one starting late. Per tick and not per second, because running the world
+/// faster runs more ticks rather than longer ones (invariant 2). Here beside the limit and the
+/// room a rover takes, because what a stretch costs the search is worked out from it: what driving
+/// a stretch takes and what the network thinks it takes are one number rather than two.
+pub const ROVER_ACCELERATION: f32 = STRAIGHT_SPEED_LIMIT / 48.;
+
 /// The tightest curve still driven at the straight-road limit, as a radius in world units.
 ///
 /// Four tiles across. The sixty-degree corner between neighbouring tiles fits arcs of about one
@@ -496,9 +506,11 @@ pub struct ServedBy {
 ///
 /// A segment leads to the segments the junction at its end permits rather than to every segment
 /// touching it, so a one-way road and a junction that refuses a turn take edges out of the graph
-/// rather than being checked around it. What a stretch costs is its length over its speed limit
-/// and a turn costs nothing of its own, which is what leaves the shortest way through and the
-/// quickest way through two different answers.
+/// rather than being checked around it. What a stretch costs is the ticks a rover spends driving
+/// it, gaining and shedding speed included, which is what leaves the shortest way through and the
+/// quickest way through two different answers. The costed rover sets off from rest and stops at
+/// the door, which is what a delivery is; nothing here reads the speed of the rover asking, or
+/// what the road is carrying while it asks.
 #[derive(SystemParam)]
 pub struct RoadNetwork<'w, 's> {
     segments: Query<
@@ -565,6 +577,26 @@ struct RoadInitializeParams<'w, 's> {
     occupied: ResMut<'w, RoadTiles>,
 }
 
+/// How many ticks a rover spends over `length` of a stretch limited to `limit`, entering it at
+/// `entering` and down to `leaving` by the end of it.
+///
+/// The run a rover drives: it gains `ROVER_ACCELERATION` a tick up to the limit, holds it, and
+/// sheds it at the same rate into whatever the end of the stretch asks for. Where the stretch is
+/// too short to reach the limit the gaining and the shedding meet at a peak below it and there is
+/// no holding at all, which is the same expression rather than a second case.
+fn ticks_to_cross(length: f32, limit: f32, entering: f32, leaving: f32) -> f32 {
+    let peak = ((entering * entering + leaving * leaving) / 2. + ROVER_ACCELERATION * length)
+        .sqrt()
+        .min(limit);
+    let gaining = (peak - entering).max(0.) / ROVER_ACCELERATION;
+    let shedding = (peak - leaving).max(0.) / ROVER_ACCELERATION;
+    let holding = length - gaining * (peak + entering) / 2. - shedding * (peak + leaving) / 2.;
+    if holding <= 0. {
+        return gaining + shedding;
+    }
+    gaining + shedding + holding / peak
+}
+
 impl RoadNetwork<'_, '_> {
     /// The ways out a rover standing `along` `from` takes to reach whatever serves `to` soonest.
     ///
@@ -598,12 +630,13 @@ impl RoadNetwork<'_, '_> {
             .get(to)
             .ok()
             .and_then(RoadEndpoint::served_by)?;
-        let (setting_off, ..) = self.segments.get(from).ok()?;
-        let limit = setting_off.speed_limit();
-        let left_of_it = (setting_off.ends_at() - along).max(0.);
+        let stretch = self.segments.get(from).ok()?;
+        let limit = stretch.0.speed_limit();
         if from == served.segment && along <= served.along {
-            return Some(((served.along - along) / limit, None));
+            return Some((ticks_to_cross(served.along - along, limit, 0., 0.), None));
         }
+        let left_of_it = (stretch.0.ends_at() - along).max(0.);
+        let carrying_on = self.speed_leaving(stretch);
 
         self.walked.clear();
         self.frontier.clear();
@@ -616,7 +649,7 @@ impl RoadNetwork<'_, '_> {
             endpoint: to,
         });
         let mut found = 0;
-        let set_off = left_of_it / limit;
+        let set_off = ticks_to_cross(left_of_it, limit, 0., carrying_on);
         self.open(from, None, set_off, &mut found);
 
         while let Some(Reverse(reached)) = self.frontier.pop() {
@@ -653,9 +686,10 @@ impl RoadNetwork<'_, '_> {
     /// over in is the whole of the tie and nothing here is settled by the order the world stores
     /// its entities in (invariant 2).
     pub fn quickest_of(&mut self, from: Entity, along: f32, among: &[Entity]) -> Option<Entity> {
-        let (setting_off, ..) = self.segments.get(from).ok()?;
-        let (starts_at, ends_at) = (setting_off.starts_at(), setting_off.ends_at());
-        let speed_limit = setting_off.speed_limit();
+        let stretch = self.segments.get(from).ok()?;
+        let ends_at = stretch.0.ends_at();
+        let speed_limit = stretch.0.speed_limit();
+        let carrying_on = self.speed_leaving(stretch);
 
         self.sought.clear();
         *self.reached_soonest = None;
@@ -681,13 +715,9 @@ impl RoadNetwork<'_, '_> {
         self.walked.clear();
         self.frontier.clear();
         let mut found = 0;
-        self.reach(from, (starts_at - along) / speed_limit);
-        self.open(
-            from,
-            None,
-            (ends_at - along).max(0.) / speed_limit,
-            &mut found,
-        );
+        self.reach(from, along, 0., 0.);
+        let set_off = ticks_to_cross((ends_at - along).max(0.), speed_limit, 0., carrying_on);
+        self.open(from, None, set_off, &mut found);
 
         while let Some(Reverse(reached)) = self.frontier.pop() {
             let beaten = self
@@ -714,30 +744,48 @@ impl RoadNetwork<'_, '_> {
         self.reached_soonest.take().map(|soonest| soonest.endpoint)
     }
 
-    /// Score against the soonest reached so far every sought place `segment` serves, having spent
-    /// `entry` to get to where that segment starts.
+    /// How fast a rover is still going as it leaves `stretch`, which is what it carries onto
+    /// whatever the lane runs on to.
     ///
-    /// A place behind the rover on the stretch it is already standing on scores less than nothing
-    /// and is passed over: it is reached by driving round to it, which the walk costs when it
-    /// offers that stretch a place of its own.
-    fn reach(&mut self, segment: Entity, entry: f32) {
+    /// Nothing where that is a junction or the end of the lane, a rover stopping at both. One
+    /// number for the boundary, read by the stretch before it as what it has to shed down to and
+    /// by the stretch after it as what it sets off at.
+    fn speed_leaving(
+        &self,
+        stretch: (&RoadSegment, Option<&NextSegment>, Option<&EndsAtJunction>),
+    ) -> f32 {
+        let (segment, next, junction) = stretch;
+        next.filter(|_| junction.is_none())
+            .and_then(|next| self.segments.get(next.0).ok())
+            .map_or(0., |(beyond, ..)| {
+                segment.speed_limit().min(beyond.speed_limit())
+            })
+    }
+
+    /// Score against the soonest reached so far every sought place `segment` serves, for a rover
+    /// that has spent `entry` reaching `from_along` on it at `going`.
+    ///
+    /// A place behind that one on the stretch is passed over: it is reached by driving round to it,
+    /// which the walk costs when it offers that stretch a place of its own. A rover brakes to a
+    /// stop at the door, so what it loses stopping there is part of what the route costs.
+    fn reach(&mut self, segment: Entity, from_along: f32, entry: f32, going: f32) {
         if self.sought.is_empty() {
             return;
         }
         let Ok((piece, ..)) = self.segments.get(segment) else {
             return;
         };
-        let (starts_at, speed_limit) = (piece.starts_at(), piece.speed_limit());
+        let speed_limit = piece.speed_limit();
         for index in 0..self.sought.len() {
             let sought = self.sought[index];
-            if sought.segment != segment {
+            if sought.segment != segment || sought.along < from_along {
                 continue;
             }
-            let cost = entry + (sought.along - starts_at) / speed_limit;
+            let cost = entry + ticks_to_cross(sought.along - from_along, speed_limit, going, 0.);
             let sooner = self.reached_soonest.as_ref().is_none_or(|soonest| {
                 cost < soonest.cost || (cost == soonest.cost && sought.rank < soonest.rank)
             });
-            if cost >= 0. && sooner {
+            if sooner {
                 *self.reached_soonest = Some(Arrival {
                     cost,
                     rank: sought.rank,
@@ -753,13 +801,15 @@ impl RoadNetwork<'_, '_> {
     /// not, so a turn a junction refuses and a lane that runs one way are edges the graph does not
     /// have rather than edges walked and then rejected.
     fn open(&mut self, leaving: Entity, came_from: Option<Entity>, spent: f32, found: &mut usize) {
-        let Ok((_, next, junction)) = self.segments.get(leaving) else {
+        let Ok(stretch) = self.segments.get(leaving) else {
             return;
         };
+        let (_, next, junction) = stretch;
+        let carrying_on = self.speed_leaving(stretch);
         let onward = next.map(|next| next.0);
         let Some(junction) = junction.copied() else {
             if let Some(onward) = onward {
-                self.offer(onward, came_from, spent, false, found);
+                self.offer(onward, came_from, spent, carrying_on, false, found);
             }
             return;
         };
@@ -770,24 +820,32 @@ impl RoadNetwork<'_, '_> {
             .map(|legs| legs.exits_from(junction.leg))
             .unwrap_or_default();
         for onward in ways_out {
-            self.offer(onward, came_from, spent, true, found);
+            self.offer(onward, came_from, spent, carrying_on, true, found);
         }
     }
 
     /// Offer `onward` a place in the search, unless it has already been reached for as little.
+    ///
+    /// What it costs is what a rover entering it at `setting_off` spends crossing it, down to
+    /// whatever its own far end asks for — so a stop at either end of a stretch is costed by the
+    /// stretch it falls on and the whole route comes to the sum of its stretches.
     fn offer(
         &mut self,
         onward: Entity,
         came_from: Option<Entity>,
         spent: f32,
+        setting_off: f32,
         through_a_junction: bool,
         found: &mut usize,
     ) {
-        let Ok((segment, ..)) = self.segments.get(onward) else {
+        let Ok(stretch) = self.segments.get(onward) else {
             return;
         };
-        let cost = spent + segment.length() / segment.speed_limit();
-        self.reach(onward, spent);
+        let segment = stretch.0;
+        let (length, limit, starts_at) =
+            (segment.length(), segment.speed_limit(), segment.starts_at());
+        let cost = spent + ticks_to_cross(length, limit, setting_off, self.speed_leaving(stretch));
+        self.reach(onward, starts_at, spent, setting_off);
         if self
             .walked
             .get(&onward)
