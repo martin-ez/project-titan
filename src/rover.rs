@@ -587,29 +587,39 @@ fn put_the_rovers_back_on_the_road_that_survived(
     }
 }
 
-/// How much road stands ahead of a rover before something it must be at rest for, and how fast
-/// that something is going.
+/// How fast a rover may be going now to be down to `going` in `room` of road.
 ///
-/// Walked along the lane rather than read off the stretch under the rover, because what it has to
-/// brake for is usually further off than that stretch is long. What ends the walk is the rover
-/// ahead, the door it was sent to, a junction, the lane running out, or traffic further down; one
-/// clear of all of them by a braking distance says so.
+/// The rate settles the distance, so making a rover brake harder makes it brake later and nothing
+/// has to be brought back into line beside it. A wall is this with `going` of nothing, which is
+/// what lets one expression answer for a stop and for a bend alike.
+fn braking_to(going: f32, room: f32) -> f32 {
+    (going * going + 2. * ROVER_ACCELERATION * room).sqrt()
+}
+
+/// The fastest a rover may be going on this tick for the road in front of it.
 ///
-/// The speed comes back with the room because an obstacle that is itself moving is not a wall: a
-/// rover may run nose to tail behind one going as fast as it is.
-fn road_ahead_of(
+/// Walked along the lane rather than read off the stretch under the rover, because what it brakes
+/// for is usually further off than that stretch is long. Two kinds of thing bind and both come
+/// back as a speed: a place it must be at rest for or running level with — the rover ahead, the
+/// door it was sent to, a junction, the lane running out — and the limit of each bend it passes,
+/// which it must already be down to on the tick it crosses onto.
+///
+/// The stretch under the rover is left out, `drive_the_rovers` pacing each part of a tick by the
+/// stretch it is spent on. A junction ends the walk, a rover stopping at every one.
+fn the_speed_the_road_ahead_allows(
     standing: (Entity, f32),
     ahead: (f32, f32),
     stops_at: Option<ServedBy>,
     segments: &Query<(&RoadSegment, Option<&NextSegment>, Option<&EndsAtJunction>)>,
     traffic: &Traffic,
-) -> (f32, f32) {
+) -> f32 {
     let (mut on, mut at) = standing;
     let mut leader = Some(ahead).filter(|&(along, _)| along.is_finite());
     let mut room = 0.;
+    let mut allows = f32::INFINITY;
     for _ in 0..LOOKAHEAD_SEGMENTS {
         let Ok((segment, next, junction)) = segments.get(on) else {
-            return (room, 0.);
+            return allows.min(braking_to(0., room));
         };
         let arriving = stops_at
             .filter(|served| served.segment == on && served.along >= at)
@@ -624,34 +634,36 @@ fn road_ahead_of(
         .flatten()
         .min_by(|one, other| one.0.total_cmp(&other.0));
         if let Some((stop, going)) = stopping {
-            return (room + (stop - at).max(0.), going);
+            return allows.min(braking_to(going, room + (stop - at).max(0.)));
         }
 
         let onward = next
             .filter(|_| junction.is_none())
             .and_then(|next| segments.get(next.0).ok().map(|(road, ..)| (next.0, road)));
         let Some((onward, road)) = onward else {
-            return (room + segment.ends_at() - at, 0.);
+            return allows.min(braking_to(0., room + segment.ends_at() - at));
         };
         room += segment.ends_at() - at;
         if let Some((rear, going)) = traffic.reaches_back_to(onward) {
-            return ((room + rear - ROVER_ROOM - road.starts_at()).max(0.), going);
+            let closing = (room + rear - ROVER_ROOM - road.starts_at()).max(0.);
+            return allows.min(braking_to(going, closing));
         }
+        allows = allows.min(braking_to(road.speed_limit(), room));
         if room >= BRAKING_REACH {
-            return (f32::INFINITY, 0.);
+            return allows;
         }
         on = onward;
         at = road.starts_at();
     }
-    (room, 0.)
+    allows.min(braking_to(0., room))
 }
 
 /// Drive every rover along its lane, at a speed it carries from one tick to the next.
 ///
 /// It gains `ROVER_ACCELERATION` a tick and no more, held under the limit of the stretch under it
-/// and under whatever leaves it able to stop in the road `road_ahead_of` found, which turns every
-/// place a rover comes to rest into one it brakes to. What it does not do is slow for a bend it
-/// has not reached, so running onto a slower stretch still sheds speed in one tick.
+/// and under whatever `the_speed_the_road_ahead_allows` found, which turns every place a rover
+/// comes to rest into one it brakes to and every bend into one it is already down to the limit of
+/// on the tick it crosses onto.
 ///
 /// A tick still buys time rather than ground, spent segment by segment, so a stretch crossed part
 /// way through one is driven at its own pace for that part, and the ground that went under the
@@ -711,15 +723,14 @@ fn drive_the_rovers(
             }
         };
 
-        let (room, closing_on) = road_ahead_of(
+        let allows = the_speed_the_road_ahead_allows(
             (rover.segment, rover.along),
             ahead,
             stops_at,
             &segments,
             &traffic,
         );
-        let braking = (closing_on * closing_on + 2. * ROVER_ACCELERATION * room).sqrt();
-        let target = (rover.speed + ROVER_ACCELERATION).min(braking);
+        let target = (rover.speed + ROVER_ACCELERATION).min(allows);
 
         let mut left = 1.;
         let mut covered = 0.;
@@ -1132,6 +1143,12 @@ mod tests {
 
     /// How many ticks a rover is watched over to see it pull away from a standing start.
     const TICKS_OFF_THE_MARK: u32 = 4;
+
+    /// How many ticks a rover already up to speed is watched cruising for.
+    ///
+    /// Short enough that it stays well clear of the turn joining the two sides of a two-way lane,
+    /// which is a bend and one a rover is right to brake for: what is watched is the road between.
+    const TICKS_CRUISING: u32 = 48;
 
     /// How many ticks of a run onto a bend are spent on the bend itself.
     ///
@@ -2315,7 +2332,12 @@ mod tests {
     /// The tick it crosses on is in the run rather than left out of it, because a rover cut to the
     /// limit of the arc it runs onto is cut on exactly that tick: a reading that stopped at the
     /// boundary would leave out the drop it was taken to find.
-    fn ground_covered_onto(app: &mut App, rover: Entity, reaching: Entity, from: Entity) -> Vec<f32> {
+    fn ground_covered_onto(
+        app: &mut App,
+        rover: Entity,
+        reaching: Entity,
+        from: Entity,
+    ) -> Vec<f32> {
         let mut covered = Vec::new();
         let mut driven = driven_from(app, rover, from);
         let mut on_it = 0;
@@ -2401,18 +2423,36 @@ mod tests {
         );
     }
 
+    /// How much ground `rover` covers on each tick of the run down the lane from `from`, once it
+    /// is up to speed.
+    ///
+    /// The ticks it spent pulling away are cut off the front, because a rover is entitled to be
+    /// slower there: what is left is the stretch where nothing stands between it and the limit.
+    fn ground_covered_cruising(app: &mut App, rover: Entity, from: Entity) -> Vec<f32> {
+        let mut covered = Vec::new();
+        let mut driven = driven_from(app, rover, from);
+        for _ in 0..TICKS_UP_TO_SPEED + TICKS_CRUISING {
+            tick(app);
+            let reached = driven_from(app, rover, from);
+            covered.push(reached - driven);
+            driven = reached;
+        }
+        covered.split_off(TICKS_UP_TO_SPEED as usize)
+    }
+
     #[test]
     fn a_rover_on_a_road_that_does_not_turn_does_not_slow_for_a_bend_that_is_not_there() {
         let (mut app, rover, first) = road_with_a_driver(&STRAIGHT);
-        let onward = next_of(&app, first).expect("the lane runs on");
         let open_road = the_open_road();
 
-        let covered = ground_covered_on(&mut app, rover, onward);
+        let covered = ground_covered_cruising(&mut app, rover, first);
 
         assert!(
             covered.iter().all(|&step| step >= open_road - AT_REST),
-            "{} of road on a stretch with no bend ahead of it, against the {open_road} it allows",
-            covered.iter().fold(f32::INFINITY, |least, &step| least.min(step))
+            "{} of road on a lane with no bend anywhere on it, against the {open_road} it allows",
+            covered
+                .iter()
+                .fold(f32::INFINITY, |least, &step| least.min(step))
         );
     }
 
