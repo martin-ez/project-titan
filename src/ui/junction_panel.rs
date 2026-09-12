@@ -10,9 +10,12 @@
 //! than showing a timing that is not running.
 //!
 //! Nothing here writes. The keys that put a signal on and time it are declared by `crate::road`,
-//! beside the component they change (invariant 4).
+//! beside the component they change (invariant 4), and the control this panel carries asks for
+//! that same command rather than reaching the signal itself — a widget is another way to a
+//! command, never a second way to the thing the command changes.
 
-use crate::road::{Junction, JunctionLegs, JunctionPolicy, Signal, Signalled};
+use crate::road::{Junction, JunctionLegs, JunctionPolicy, Signal, SignalTheJunction, Signalled};
+use crate::ui::pointer::{widget, DeclareWidgets};
 use crate::ui::selection::{Picked, Selection};
 use crate::ui::{
     panel, panel_row, panel_text, Panel, PanelCorner, BODY_TEXT, HEADING_TEXT, KEYED_TEXT,
@@ -45,6 +48,9 @@ const ARMS_JOINED: &str = " – ";
 
 /// What the panel says of a junction the player has put no signal on
 const NO_SIGNAL: &str = "No signal";
+
+/// What the control that walks the signal round the junction is labelled
+const SIGNAL_CONTROL: &str = "Move the signal on";
 
 /// The panel reading out the junction the player picked out.
 pub struct JunctionPanelPlugin;
@@ -83,7 +89,8 @@ struct Reading {
 
 impl Plugin for JunctionPanelPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, redraw_the_panel.after(Picked).after(Signalled));
+        app.declare_widgets::<SignalTheJunction>()
+            .add_systems(Update, redraw_the_panel.after(Picked).after(Signalled));
     }
 }
 
@@ -223,6 +230,15 @@ fn fill_the_panel(panel: &mut ChildSpawnerCommands, reading: &Reading) {
     if let Some(right_of_way) = &reading.right_of_way {
         panel.spawn(panel_text(right_of_way.clone(), BODY_TEXT, Val::Auto));
     }
+    panel
+        .spawn(widget(SignalTheJunction))
+        .with_children(|control| {
+            control.spawn(panel_text(
+                SIGNAL_CONTROL.to_string(),
+                KEYED_TEXT,
+                Val::Auto,
+            ));
+        });
 }
 
 #[cfg(test)]
@@ -234,7 +250,8 @@ mod tests {
     use crate::input::{PlayerAction, PlayerInput};
     use crate::map::{HexCoordinates, LatticeNode};
     use crate::road::{JunctionSignalPlugin, Road, RoadPlugin};
-    use crate::testing::{headless_app, press_key, tick};
+    use crate::testing::{headless_app, point_at, press_key, press_mouse, tick};
+    use crate::ui::pointer::{PointerPlugin, Widget};
     use crate::ui::selection::SelectionPlugin;
 
     /// The tiles the road running east and west is laid through, in offset-row coordinates.
@@ -274,6 +291,7 @@ mod tests {
                 DebugGizmosPlugin,
                 JunctionPanelPlugin,
                 JunctionSignalPlugin,
+                PointerPlugin,
                 RoadPlugin,
                 SelectionPlugin,
             ));
@@ -374,6 +392,54 @@ mod tests {
             .get::<Signal>(junction)
             .expect("a signal is on the junction")
             .clone()
+    }
+
+    /// The control the panel draws for walking the signal round the junction.
+    fn the_signal_control(app: &mut App) -> Entity {
+        app.world_mut()
+            .query_filtered::<Entity, With<Widget>>()
+            .iter(app.world())
+            .next()
+            .expect("the panel carries a control")
+    }
+
+    /// Press the panel's signal control, the way a player aiming at it would.
+    fn press_the_signal_control(app: &mut App) {
+        let control = the_signal_control(app);
+        press_mouse(app, MouseButton::Left);
+        point_at(app, control);
+        tick(app);
+    }
+
+    #[test]
+    fn pressing_the_signal_control_signals_the_junction() {
+        let (mut app, junction, _) = a_crossroads();
+
+        press_the_signal_control(&mut app);
+
+        assert!(app.world().get::<Signal>(junction).is_some());
+    }
+
+    #[test]
+    fn pressing_the_signal_control_walks_the_green_on() {
+        let (mut app, junction, along) = a_crossroads();
+        signal(&mut app, junction, along);
+
+        press_the_signal_control(&mut app);
+
+        assert_ne!(the_signal(&app, junction).favours(), along);
+    }
+
+    #[test]
+    fn pressing_the_signal_control_leaves_the_junction_picked_out() {
+        let (mut app, junction, _) = a_crossroads();
+
+        press_the_signal_control(&mut app);
+
+        assert_eq!(
+            app.world().resource::<Selection>().junction(),
+            Some(junction)
+        );
     }
 
     fn panels(app: &mut App) -> usize {

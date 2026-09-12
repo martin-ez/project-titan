@@ -9,6 +9,7 @@
 
 use crate::input::Requested;
 use crate::simulation::Simulation;
+use crate::ui::pointer::Pointer;
 use bevy::asset::AssetPlugin;
 use bevy::gizmos::GizmoAsset;
 use bevy::input::keyboard::{Key, KeyboardInput, NativeKey};
@@ -180,4 +181,20 @@ pub fn trace<T: Send + Sync + 'static>(
     );
     traced.truncate(ticks);
     traced
+}
+
+/// Aim the pointer at `widget`, without the window and the layout that would otherwise put it
+/// there, to be seen on this tick.
+///
+/// What the pointer is over is a fact about the frame, like a request, so this one is seen by the
+/// very next call to `tick` and forgotten at the end of it.
+pub fn point_at(app: &mut App, widget: Entity) {
+    app.world_mut().resource_mut::<Pointer>().point_at(widget);
+}
+
+/// Aim the pointer at a panel but at no widget on it, to be seen on this tick.
+pub fn point_at_the_interface(app: &mut App) {
+    app.world_mut()
+        .resource_mut::<Pointer>()
+        .point_at_the_interface();
 }

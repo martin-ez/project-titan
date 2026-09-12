@@ -92,8 +92,11 @@ const GREEN_KEYS: [(KeyCode, GreenStep, &str); 2] = [
 ];
 
 /// What the player asks for to put a signal on the junction they picked out, or move it on.
+///
+/// A panel reading a junction out offers it as a widget as well, so the command it asks for is the
+/// same one the key reaches rather than a second way in (invariant 4).
 #[derive(Clone, Copy, PartialEq)]
-struct SignalTheJunction;
+pub struct SignalTheJunction;
 
 /// How many rovers' turns the player asked to add to a junction's green, negative to take some.
 #[derive(Clone, Copy, PartialEq)]
