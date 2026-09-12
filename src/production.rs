@@ -10,6 +10,9 @@
 //! is worked out again only for a building whose stock moved and for one whose run came due. An
 //! idle building nothing has delivered to is not looked at at all, which is what keeps the tick's
 //! cost proportional to what is happening rather than to what is built.
+//!
+//! What every step makes is counted here as it is made and published over a window of ticks, so a
+//! panel can read out what the base is doing at a number the world's speed cannot change.
 
 use crate::building::{BuildingType, Flow, Holding, Item, Port, Recipe, Stack, PORT_CAPACITY};
 use crate::fleet::FleetsServed;
@@ -17,6 +20,18 @@ use crate::rover::RoversDriven;
 use crate::simulation::{Simulation, Ticks};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
+
+/// How many ticks of finished runs a step of the production tree is read over.
+///
+/// One run of the longest recipe in the game, so the slowest step still reads a run of its own
+/// rather than reading the nothing a chain that has stalled reads.
+pub const OUTPUT_WINDOW: u32 = 1024;
+
+/// How many parts the window is counted in, and so how often the reading moves.
+const OUTPUT_PARTS: usize = 8;
+
+/// How many ticks one part of the window holds.
+const PART_TICKS: u64 = OUTPUT_WINDOW as u64 / OUTPUT_PARTS as u64;
 
 /// Runs each building's recipe on the simulation tick.
 pub struct ProductionPlugin;
@@ -61,17 +76,47 @@ pub enum WaitingOn {
 #[derive(Message)]
 struct StockMoved(Entity);
 
+/// What every step of the production tree has made over the last [`OUTPUT_WINDOW`] ticks.
+///
+/// Finished runs rather than anything weighed against a clock: a tick is countable, so the number
+/// is the same however fast the player is running the world (invariant 2). It is an aggregate over
+/// every building of a type, because the tree draws one node per recipe and what is read off it is
+/// what the whole chain is yielding — which particular building is starved is a question the
+/// building panel already answers.
+#[derive(Resource, Default)]
+pub struct Output(Vec<Step>);
+
+/// One step of the tree as a panel reads it.
+struct Step {
+    kind: BuildingType,
+    standing: bool,
+    made: u32,
+}
+
+/// What each step made in each part of the window, which [`Output`] is the sum of.
+///
+/// Kept apart from what is published because the two move at different rates: this changes on
+/// every run that lands, and a panel redrawing off that would redraw on very nearly every tick.
+#[derive(Resource, Default)]
+struct Counting {
+    rings: Vec<(BuildingType, [u32; OUTPUT_PARTS])>,
+    part: usize,
+}
+
 /// Everything running a recipe reads and writes: what a building is, and what stands at its ports.
 #[derive(SystemParam)]
 struct Machinery<'w, 's> {
     commands: Commands<'w, 's>,
     kinds: Query<'w, 's, (&'static BuildingType, &'static Children)>,
     ports: Query<'w, 's, (&'static Port, &'static mut Holding)>,
+    counting: ResMut<'w, Counting>,
 }
 
 impl Plugin for ProductionPlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<StockMoved>()
+            .init_resource::<Output>()
+            .init_resource::<Counting>()
             .configure_sets(
                 FixedUpdate,
                 RecipesRun
@@ -84,6 +129,7 @@ impl Plugin for ProductionPlugin {
                 (
                     note_the_buildings_whose_stock_moved,
                     run_the_buildings_that_can_run,
+                    publish_what_the_window_holds,
                 )
                     .chain()
                     .in_set(RecipesRun),
@@ -146,9 +192,11 @@ fn put_down_what_the_run_made(building: Entity, machinery: &mut Machinery) {
     let Ok((kind, _)) = machinery.kinds.get(building) else {
         return;
     };
+    let kind = *kind;
     for stack in kind.recipe().outputs {
         machinery.put_out(building, *stack);
     }
+    machinery.counting.ran(kind);
     machinery.commands.entity(building).remove::<Running>();
 }
 
@@ -198,6 +246,88 @@ fn what_stops_a_run(building: Entity, recipe: Recipe, machinery: &Machinery) -> 
         }
     }
     None
+}
+
+/// Publish what the window holds, whenever a part of it has closed.
+///
+/// Which buildings stand is counted here rather than watched for as they are placed and taken off:
+/// what reads this only redraws when it changes, which is on this same cadence, so an observer
+/// would buy no notice and a subtraction that must never go under.
+fn publish_what_the_window_holds(
+    ticks: Res<Ticks>,
+    standing: Query<&BuildingType>,
+    mut counting: ResMut<Counting>,
+    mut output: ResMut<Output>,
+) {
+    if !ticks.0.is_multiple_of(PART_TICKS) {
+        return;
+    }
+
+    let output = output.as_mut();
+    output.0.clear();
+    for kind in &standing {
+        output.stand(*kind);
+    }
+    for (kind, ring) in &counting.rings {
+        output.record(*kind, ring.iter().sum());
+    }
+    counting.roll();
+}
+
+impl Output {
+    /// How many runs of `kind` finished over the window, and nothing where none of it is built.
+    ///
+    /// The two are different questions rather than two spellings of zero: a step nothing is built
+    /// for is a chain the player has not started, and a step built and making nothing is one that
+    /// has stalled. Those want opposite responses, which is the distinction `WaitingOn` already
+    /// draws for a single building.
+    pub fn of(&self, kind: BuildingType) -> Option<u32> {
+        let step = self.0.iter().find(|step| step.kind == kind)?;
+        step.standing.then_some(step.made)
+    }
+
+    fn stand(&mut self, kind: BuildingType) {
+        if !self.0.iter().any(|step| step.kind == kind) {
+            self.0.push(Step {
+                kind,
+                standing: true,
+                made: 0,
+            });
+        }
+    }
+
+    fn record(&mut self, kind: BuildingType, made: u32) {
+        match self.0.iter_mut().find(|step| step.kind == kind) {
+            Some(step) => step.made = made,
+            None => self.0.push(Step {
+                kind,
+                standing: false,
+                made,
+            }),
+        }
+    }
+}
+
+impl Counting {
+    fn ran(&mut self, kind: BuildingType) {
+        let part = self.part;
+        match self.rings.iter_mut().find(|(held, _)| *held == kind) {
+            Some((_, ring)) => ring[part] += 1,
+            None => {
+                let mut ring = [0; OUTPUT_PARTS];
+                ring[part] = 1;
+                self.rings.push((kind, ring));
+            }
+        }
+    }
+
+    /// Move on to the next part of the window, emptying what that part held a window ago.
+    fn roll(&mut self) {
+        self.part = (self.part + 1) % OUTPUT_PARTS;
+        for (_, ring) in &mut self.rings {
+            ring[self.part] = 0;
+        }
+    }
 }
 
 impl Machinery<'_, '_> {
@@ -325,6 +455,12 @@ mod tests {
     /// How many runs the rate claim is measured over, which is what makes it a count.
     const RUNS_MEASURED: u32 = 10;
 
+    /// How many runs of [`MELTER`] a whole window holds, the first tick going on being noticed.
+    const RUNS_A_WINDOW: u32 = (OUTPUT_WINDOW - NOTICED_ON) / A_RUN;
+
+    /// A supply that runs out well inside the window, so what it made can fall out of the far end.
+    const A_FINITE_SUPPLY: u32 = 6;
+
     /// How many ticks a run at a steady frame rate is traced over, longer than several runs.
     const TICKS_TRACED: usize = 400;
 
@@ -435,6 +571,17 @@ mod tests {
         for _ in 0..ticks {
             tick(app);
         }
+    }
+
+    /// Run until the simulation has carried `ticks` ticks, however many a frame turns out to hold.
+    fn run_to_tick(app: &mut App, ticks: u64) {
+        while app.world().resource::<Ticks>().0 < ticks {
+            tick(app);
+        }
+    }
+
+    fn output(app: &App) -> &Output {
+        app.world().resource::<Output>()
     }
 
     fn waiting_on(app: &App, building: Entity) -> Option<WaitingOn> {
@@ -598,5 +745,66 @@ mod tests {
         let melter = build(&mut app, MELTER);
         served_by(&mut app, melter, Flow::Outlet, Item::Water, Hauled);
         app
+    }
+
+    #[test]
+    fn a_step_nothing_is_built_for_is_making_nothing_at_all() {
+        let mut app = production_app();
+
+        run_to_tick(&mut app, u64::from(OUTPUT_WINDOW));
+
+        assert_eq!(output(&app).of(MELTER), None);
+    }
+
+    #[test]
+    fn a_step_built_but_starved_reads_no_runs_rather_than_nothing_built() {
+        let mut app = production_app();
+        build(&mut app, MELTER);
+
+        run_to_tick(&mut app, u64::from(OUTPUT_WINDOW));
+
+        assert_eq!(output(&app).of(MELTER), Some(0));
+    }
+
+    #[test]
+    fn a_step_reads_out_the_runs_of_every_building_running_it() {
+        let mut app = production_app();
+        for _ in 0..2 {
+            let melter = build(&mut app, MELTER);
+            served_by(&mut app, melter, Flow::Intake, ICE, Stocked);
+            served_by(&mut app, melter, Flow::Outlet, Item::Water, Hauled);
+        }
+
+        run_to_tick(&mut app, u64::from(OUTPUT_WINDOW));
+
+        assert_eq!(output(&app).of(MELTER), Some(2 * RUNS_A_WINDOW));
+    }
+
+    #[test]
+    fn a_step_that_stopped_fades_out_of_the_window_it_is_counted_over() {
+        let mut app = production_app();
+        let melter = build(&mut app, MELTER);
+        stand(&mut app, melter, Flow::Intake, ICE, A_FINITE_SUPPLY);
+        run_to_tick(&mut app, u64::from(OUTPUT_WINDOW));
+        let whole = output(&app).of(MELTER);
+
+        run_to_tick(&mut app, u64::from(OUTPUT_WINDOW) + PART_TICKS);
+
+        assert_eq!(whole, Some(A_FINITE_SUPPLY));
+        assert_eq!(output(&app).of(MELTER), Some(A_FINITE_SUPPLY / 2));
+    }
+
+    #[test]
+    fn a_step_reads_as_nothing_built_once_the_last_building_of_it_is_taken_off() {
+        let mut app = production_app();
+        let melter = build(&mut app, MELTER);
+        served_by(&mut app, melter, Flow::Intake, ICE, Stocked);
+        served_by(&mut app, melter, Flow::Outlet, Item::Water, Hauled);
+        run_to_tick(&mut app, u64::from(OUTPUT_WINDOW));
+
+        app.world_mut().entity_mut(melter).despawn();
+        run_to_tick(&mut app, u64::from(OUTPUT_WINDOW) + PART_TICKS);
+
+        assert_eq!(output(&app).of(MELTER), None);
     }
 }

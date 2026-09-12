@@ -10,10 +10,12 @@
 //! for, and it is worked out from the edges each redraw rather than stored, so it cannot drift
 //! from the tree it is a fact about.
 //!
-//! Nothing here writes the world. Focus is the panel's own record and lives on the frame.
+//! Nothing here writes the world. Focus is the panel's own record and lives on the frame, and
+//! what a step is making is read off the tick that counted it rather than measured again here.
 
 use crate::building::{BuildingType, Item};
 use crate::input::{DeclareCommands, PlayerCommand, Requested};
+use crate::production::{Output, OUTPUT_WINDOW};
 use crate::ui::legend::{BindingCategory, BindingCondition, BindingInput};
 use crate::ui::{overlay, panel_text, Panel, BODY_TEXT, HEADING_TEXT, KEYED_TEXT};
 use bevy::prelude::*;
@@ -44,11 +46,14 @@ const HEADING: &str = "Production tree";
 /// What the panel says under the heading while no item is in focus
 const NOTHING_FOCUSED: &str = "Z and X focus an item, C clears it";
 
+/// What a step reads where no building of it stands anywhere on the map
+const NONE_BUILT: &str = "none built";
+
 /// How wide a node of the tree is drawn, in logical pixels
 const NODE_WIDTH: f32 = 104.0;
 
-/// How tall a node of the tree is drawn, in logical pixels
-const NODE_HEIGHT: f32 = 30.0;
+/// How tall a node of the tree is drawn, in logical pixels, a step standing two lines of text
+const NODE_HEIGHT: f32 = 40.0;
 
 /// How much space sits between one depth of the tree and the next, in logical pixels
 const DEPTH_GAP: f32 = 22.0;
@@ -358,6 +363,7 @@ fn toggle_the_tree(
     asked_for: Res<Requested<ShowTheTree>>,
     tree: Res<Tree>,
     focus: Res<Focus>,
+    output: Res<Output>,
     panels: Query<Entity, With<ProductionTree>>,
 ) {
     if !asked_for.asked(ShowTheTree) {
@@ -371,7 +377,7 @@ fn toggle_the_tree(
         None => {
             commands
                 .spawn((ProductionTree, overlay(Panel::ProductionTree)))
-                .with_children(|sheet| fill_the_sheet(sheet, &tree, focus.0));
+                .with_children(|sheet| fill_the_sheet(sheet, &tree, focus.0, &output));
         }
     }
 }
@@ -412,17 +418,19 @@ fn clear_the_focus(
     focus.0 = None;
 }
 
-/// Draw the tree again whenever the focus has moved under it.
+/// Draw the tree again whenever the focus or what the base is making has moved under it.
 ///
 /// The sheet keeps its entity and only what is on it is built again, so a tree already on screen
-/// stays the one on screen rather than blinking out and back.
+/// stays the one on screen rather than blinking out and back. [`Output`] moves only when a part of
+/// its window closes, which is what keeps a run landing on the tick from redrawing the sheet.
 fn redraw_the_tree(
     mut commands: Commands,
     tree: Res<Tree>,
     focus: Res<Focus>,
+    output: Res<Output>,
     panels: Query<Entity, With<ProductionTree>>,
 ) {
-    if !focus.is_changed() {
+    if !focus.is_changed() && !output.is_changed() {
         return;
     }
 
@@ -430,14 +438,20 @@ fn redraw_the_tree(
         commands
             .entity(standing)
             .despawn_related::<Children>()
-            .with_children(|sheet| fill_the_sheet(sheet, &tree, focus.0));
+            .with_children(|sheet| fill_the_sheet(sheet, &tree, focus.0, &output));
     }
 }
 
 /// Write the heading, then lay the tree out under it with the focused chain picked out.
-fn fill_the_sheet(sheet: &mut ChildSpawnerCommands, tree: &Tree, focus: Option<usize>) {
+fn fill_the_sheet(
+    sheet: &mut ChildSpawnerCommands,
+    tree: &Tree,
+    focus: Option<usize>,
+    output: &Output,
+) {
     sheet.spawn(panel_text(HEADING.to_string(), HEADING_TEXT, Val::Auto));
     sheet.spawn(panel_text(focused_on(tree, focus), BODY_TEXT, Val::Auto));
+    sheet.spawn(panel_text(counted_over(), BODY_TEXT, Val::Auto));
 
     let chain = focus.map(|place| tree.chain_from(TreeNode::Item(place)));
     let lit = |node: TreeNode| chain.as_ref().is_none_or(|chain| chain.contains(&node));
@@ -460,13 +474,38 @@ fn fill_the_sheet(sheet: &mut ChildSpawnerCommands, tree: &Tree, focus: Option<u
                     .spawn(drawn_node(places.of(node), lit(node)))
                     .with_children(|box_of| {
                         box_of.spawn(panel_text(
-                            tree.label_of(node),
+                            written_on(tree, node, output),
                             text_colour(node, lit(node)),
                             Val::Auto,
                         ));
                     });
             }
         });
+}
+
+/// What the panel says its readings are counted over, said once rather than on all of the steps.
+fn counted_over() -> String {
+    format!("Runs counted over the last {OUTPUT_WINDOW} ticks")
+}
+
+/// What a node is written with: its own label, and under a step what it has lately been making.
+fn written_on(tree: &Tree, node: TreeNode, output: &Output) -> String {
+    let label = tree.label_of(node);
+    match made_by(tree, node, output) {
+        Some(reading) => format!("{label}\n{reading}"),
+        None => label,
+    }
+}
+
+/// How much `node` has lately made, and nothing at all for a node that is a good and not a step.
+fn made_by(tree: &Tree, node: TreeNode, output: &Output) -> Option<String> {
+    let TreeNode::Recipe(place) = node else {
+        return None;
+    };
+    Some(match output.of(tree.recipes[place]) {
+        Some(runs) => format!("{runs} runs"),
+        None => NONE_BUILT.to_string(),
+    })
 }
 
 /// What the panel says the focus is on, which is what a chain the player is reading is named by.
@@ -526,7 +565,7 @@ mod tests {
     use crate::building::{Flow, Holding, Port, Recipe, Stack};
     use crate::map::RawMaterial;
     use crate::production::ProductionPlugin;
-    use crate::simulation::SimulationPlugin;
+    use crate::simulation::{SimulationPlugin, Ticks};
     use crate::testing::{ask_for, headless_app, tick};
 
     const ICE: Item = Item::Raw(RawMaterial::Ice);
@@ -578,16 +617,40 @@ mod tests {
     /// Where the electrolyser sits in [`A_CATALOGUE`], being the step that makes two things.
     const ELECTROLYSER: usize = 2;
 
+    /// The step the tests place, written the same way in [`A_CATALOGUE`] and in the real catalogue.
+    ///
+    /// A [`Recipe`] compares by what it holds, so a melter built from this one is read out on the
+    /// node the panel drew for the melter in [`BuildingType::ALL`].
+    const MELTER: BuildingType = A_CATALOGUE[1];
+
     /// How many ticks a measured run of the production tick lasts, longer than several runs.
     const TICKS_MEASURED: u32 = 200;
 
     /// How much stock a measured run is given to work through.
     const A_SUPPLY: u32 = 6;
 
+    /// An app carrying the tree and the tick it reads what the base is making off.
+    ///
+    /// The frame `Time<Real>` takes its baseline on is spent up front, so every tick a test counts
+    /// afterwards is one the simulation actually ran and the warp it is asked for has been applied.
     fn tree_app() -> App {
         let mut app = headless_app();
-        app.add_plugins(ProductionTreePlugin);
+        app.add_plugins((SimulationPlugin, ProductionPlugin, ProductionTreePlugin));
+        tick(&mut app);
         app
+    }
+
+    /// Run until the simulation has carried `ticks` ticks, however many a frame turns out to hold.
+    fn run_to_tick(app: &mut App, ticks: u64) {
+        while app.world().resource::<Ticks>().0 < ticks {
+            tick(app);
+        }
+    }
+
+    fn run_fast(app: &mut App, speed: f32) {
+        app.world_mut()
+            .resource_mut::<Time<Virtual>>()
+            .set_relative_speed(speed);
     }
 
     fn item_at(tree: &Tree, item: Item) -> TreeNode {
@@ -859,6 +922,64 @@ mod tests {
     }
 
     #[test]
+    fn a_step_of_the_tree_says_how_many_runs_the_base_has_finished() {
+        let mut app = tree_app();
+        let melter = build(&mut app, MELTER);
+        stand(&mut app, melter, Flow::Intake, ICE, A_SUPPLY);
+        run_to_tick(&mut app, u64::from(OUTPUT_WINDOW));
+
+        open_the_tree(&mut app);
+
+        assert!(
+            says(&mut app, &format!("{A_SUPPLY} runs")),
+            "{:?}",
+            sheet_lines(&mut app)
+        );
+    }
+
+    #[test]
+    fn a_step_nothing_is_built_for_says_so_rather_than_reading_no_runs() {
+        let mut app = tree_app();
+        run_to_tick(&mut app, u64::from(OUTPUT_WINDOW));
+
+        open_the_tree(&mut app);
+
+        assert!(says(&mut app, NONE_BUILT), "{:?}", sheet_lines(&mut app));
+        assert!(!says(&mut app, "0 runs"), "{:?}", sheet_lines(&mut app));
+    }
+
+    #[test]
+    fn the_tree_reads_the_same_rate_however_fast_the_world_is_run() {
+        let real_time = what_the_tree_says_at(1.0);
+
+        let warped = what_the_tree_says_at(4.0);
+
+        assert_eq!(warped, real_time);
+        assert!(
+            real_time
+                .iter()
+                .any(|line| line.contains(&format!("{A_SUPPLY} runs"))),
+            "{real_time:?}"
+        );
+    }
+
+    /// What the whole sheet reads after a melter has worked through its supply, at `speed`.
+    ///
+    /// The same ticks either way rather than the same frames: a part of the window closes on a
+    /// tick that divides it, so two runs reaching the same tick have closed the same parts.
+    fn what_the_tree_says_at(speed: f32) -> Vec<String> {
+        let mut app = tree_app();
+        run_fast(&mut app, speed);
+        let melter = build(&mut app, MELTER);
+        stand(&mut app, melter, Flow::Intake, ICE, A_SUPPLY);
+        run_to_tick(&mut app, u64::from(OUTPUT_WINDOW));
+
+        open_the_tree(&mut app);
+
+        sheet_lines(&mut app)
+    }
+
+    #[test]
     fn a_chain_makes_the_same_total_with_the_tree_open_as_with_it_shut() {
         let shut = what_a_melter_made(false);
 
@@ -873,9 +994,7 @@ mod tests {
     /// the panel on screen.
     fn what_a_melter_made(with_the_tree_up: bool) -> u32 {
         let mut app = tree_app();
-        app.add_plugins((SimulationPlugin, ProductionPlugin));
-        tick(&mut app);
-        let melter = build(&mut app, A_CATALOGUE[1]);
+        let melter = build(&mut app, MELTER);
         stand(&mut app, melter, Flow::Intake, ICE, A_SUPPLY);
         if with_the_tree_up {
             open_the_tree(&mut app);
