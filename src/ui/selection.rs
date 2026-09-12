@@ -176,7 +176,7 @@ fn settle_on_what_the_player_clicked(
     pointed: PointedAt,
     mut selection: ResMut<Selection>,
 ) {
-    if !input.tap || *action.get() != PlayerAction::Select {
+    if !input.tapped() || *action.get() != PlayerAction::Select {
         return;
     }
     selection.set_if_neq(pointed.under_the_cursor());
@@ -293,12 +293,19 @@ mod tests {
     fn click_at(app: &mut App, tile: Option<Entity>, point: Vec3) {
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.tap = true;
+            input.tap(true);
             input.cursor_tile = tile;
             input.world_cursor_position = Some(point);
         }
         tick(app);
-        app.world_mut().resource_mut::<PlayerInput>().tap = false;
+        app.world_mut().resource_mut::<PlayerInput>().tap(false);
+    }
+
+    /// Take the next click for the interface, as whatever notices a press on a panel would.
+    fn claim_the_click(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<PlayerInput>()
+            .claimed_by_the_interface = true;
     }
 
     fn selected(app: &App) -> Selection {
@@ -398,6 +405,19 @@ mod tests {
         tick(&mut app);
 
         assert_eq!(selected(&app).junction(), None);
+    }
+
+    #[test]
+    fn a_click_the_interface_claimed_moves_the_selection_nowhere() {
+        let mut app = selection_app();
+        let tile = place_a_melter(&mut app, STANDING);
+        hold(&mut app, PlayerAction::Select);
+        let before = selected(&app);
+
+        claim_the_click(&mut app);
+        click_at(&mut app, Some(tile), tile_of(STANDING).world_position());
+
+        assert_eq!(selected(&app), before);
     }
 
     #[test]

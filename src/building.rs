@@ -721,7 +721,7 @@ fn place_building_system(
     mut buildings: ResMut<BuildingTiles>,
     tiles: Query<(&MapTile, Option<&Deposit>)>,
 ) {
-    if !player_input.tap || *action.get() != PlayerAction::EditBuildings {
+    if !player_input.tapped() || *action.get() != PlayerAction::EditBuildings {
         return;
     }
     let Some(entity) = player_input.cursor_tile else {
@@ -782,7 +782,7 @@ fn remove_building_system(
     buildings: Res<BuildingTiles>,
     tiles: Query<&MapTile>,
 ) {
-    if !player_input.secondary_tap || *action.get() != PlayerAction::EditBuildings {
+    if !player_input.secondary_tapped() || *action.get() != PlayerAction::EditBuildings {
         return;
     }
     let Some(entity) = player_input.cursor_tile else {
@@ -1020,26 +1020,35 @@ mod tests {
         tile
     }
 
+    /// Take the next click for the interface, as whatever notices a press on a panel would.
+    fn claim_the_click(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<PlayerInput>()
+            .claimed_by_the_interface = true;
+    }
+
     /// Click on `tile`, then let the tap go, so a second frame is not a second click.
     fn tap_on(app: &mut App, tile: Option<Entity>) {
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.tap = true;
+            input.tap(true);
             input.cursor_tile = tile;
         }
         tick(app);
-        app.world_mut().resource_mut::<PlayerInput>().tap = false;
+        app.world_mut().resource_mut::<PlayerInput>().tap(false);
     }
 
     /// Right-click on `tile`, then let the button go, so a second frame is not a second click.
     fn secondary_tap_on(app: &mut App, tile: Option<Entity>) {
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.secondary_tap = true;
+            input.secondary_tap(true);
             input.cursor_tile = tile;
         }
         tick(app);
-        app.world_mut().resource_mut::<PlayerInput>().secondary_tap = false;
+        app.world_mut()
+            .resource_mut::<PlayerInput>()
+            .secondary_tap(false);
     }
 
     fn still_there(app: &App, entity: Entity) -> bool {
@@ -1611,6 +1620,29 @@ mod tests {
             .entity(building)
             .get::<Children>()
             .is_some_and(|children| !children.is_empty()));
+    }
+
+    #[test]
+    fn a_click_the_interface_claimed_places_no_building() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        let tile = spawn_tile(&mut app, 0, 0);
+
+        claim_the_click(&mut app);
+        tap_on(&mut app, Some(tile));
+
+        assert!(buildings(&mut app).is_empty());
+    }
+
+    #[test]
+    fn a_click_the_interface_claimed_takes_no_building_down() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+        let tile = spawn_tile(&mut app, 0, 0);
+        tap_on(&mut app, Some(tile));
+
+        claim_the_click(&mut app);
+        secondary_tap_on(&mut app, Some(tile));
+
+        assert_eq!(buildings(&mut app).len(), 1);
     }
 
     #[test]
