@@ -18,6 +18,7 @@ use bevy::prelude::*;
 pub mod building_panel;
 pub mod junction_panel;
 pub mod legend;
+pub mod production_tree;
 pub mod selection;
 pub mod settings_panel;
 
@@ -29,6 +30,9 @@ const PANEL_PADDING: f32 = 10.0;
 const PANEL_RADIUS: f32 = 4.0;
 /// What a panel is drawn on, dark enough to read text over whatever the world puts behind it
 const PANEL_BACKGROUND: Color = Color::srgba(0.04, 0.04, 0.06, 0.85);
+/// What a full-screen sheet is drawn on, darker than a panel because it covers the game rather
+/// than sitting in a corner of it
+const SHEET_BACKGROUND: Color = Color::srgba(0.03, 0.03, 0.05, 0.96);
 /// How much space sits between one row of a panel and the next, in logical pixels
 const ROW_GAP: f32 = 2.0;
 /// How large a panel's text is, in logical pixels
@@ -56,6 +60,8 @@ pub enum Panel {
     Building,
     /// The reading of the junction the player picked out.
     Junction,
+    /// The tree of everything the game can make.
+    ProductionTree,
 }
 
 /// The corner of the screen a panel is pinned to.
@@ -93,6 +99,27 @@ pub fn panel(which: Panel, corner: PanelCorner, width: Val) -> impl Bundle {
             ..default()
         },
         BackgroundColor(PANEL_BACKGROUND),
+    )
+}
+
+/// The full-screen sheet `which` panel is drawn on, for one too large to pin to a corner.
+///
+/// It stacks downward like a panel, so a heading sits above whatever the panel lays out under it.
+pub fn overlay(which: Panel) -> impl Bundle {
+    (
+        which,
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(0.0),
+            left: Val::Px(0.0),
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
+            flex_direction: FlexDirection::Column,
+            padding: UiRect::all(Val::Px(PANEL_PADDING)),
+            row_gap: Val::Px(ROW_GAP),
+            ..default()
+        },
+        BackgroundColor(SHEET_BACKGROUND),
     )
 }
 
