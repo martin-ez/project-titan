@@ -32,6 +32,7 @@ fn main() {
         .add_plugins(simulation::SimulationPlugin)
         .add_plugins(ui::building_panel::BuildingPanelPlugin)
         .add_plugins(ui::legend::LegendPlugin)
+        .add_plugins(ui::production_tree::ProductionTreePlugin)
         .add_plugins(ui::selection::SelectionPlugin)
         .add_plugins(ui::settings_panel::SettingsPanelPlugin)
         .add_systems(Startup, setup_test_scene)
