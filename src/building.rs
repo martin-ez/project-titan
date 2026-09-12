@@ -1,8 +1,8 @@
 //! What the player puts on a tile, and the rule about which tile will have it.
 //!
 //! A tile takes one building, and only where the ground suits it. A deposit tile is reserved
-//! ground: it takes an extractor drawing the material under it and refuses everything else,
-//! rather than letting a factory bury a deposit and leave the player to remember it is down
+//! ground: it takes the extractor, which draws whatever lies under it, and refuses everything
+//! else, rather than letting a factory bury a deposit and leave the player to remember it is down
 //! there. A map laid out to be read before it is built on rewards reading only if what it says
 //! is binding, and covering a deposit over is otherwise a mistake the game gives no sign of.
 //!
@@ -240,9 +240,9 @@ pub enum BuildingType {
 /// One row of the catalogue the building tool steps through.
 ///
 /// Not a [`BuildingType`], because an entry names no material and a placed extractor must: a
-/// deposit holds one material and an extractor standing on it can draw no other, so which one it
-/// is is a fact of the tile rather than a choice the player is asked for. What a tap puts down is
-/// the entry resolved against the ground it lands on, by [`CatalogueEntry::placed_on`].
+/// deposit holds one material and an extractor standing on it can draw no other, so the material
+/// is a fact of the tile rather than a choice the player is asked for. What a tap puts down is the
+/// entry resolved against the ground it lands on, by [`CatalogueEntry::placed_on`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CatalogueEntry {
     /// An extractor, drawing whatever lies under the tile it is placed on.

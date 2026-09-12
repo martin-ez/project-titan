@@ -361,9 +361,7 @@ mod tests {
 
     /// Put the `steps`th type of the catalogue on `offsets`, answering with it and its tile.
     fn place(app: &mut App, offsets: (i32, i32), steps: isize) -> (Entity, Entity) {
-        app.world_mut()
-            .resource_mut::<ChosenBuilding>()
-            .step(steps);
+        app.world_mut().resource_mut::<ChosenBuilding>().step(steps);
         let tile = spawn_tile(app, offsets);
         ground_for_the_chosen_type(app, tile);
         click_at(app, tile, tile_of(offsets).world_position());

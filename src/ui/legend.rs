@@ -12,8 +12,8 @@
 //! a row is a pair of text nodes, which is what lets a column line up under a heading.
 
 use crate::building::{CatalogueEntry, ChosenBuilding, Flow, Port};
-use crate::map::{Deposit, RawMaterial};
 use crate::input::{DeclareCommands, PlayerAction, PlayerCommand, PlayerInput, Requested};
+use crate::map::{Deposit, RawMaterial};
 use crate::ui::selection::Selection;
 use crate::ui::{
     panel, panel_font, panel_row, panel_text, Panel, PanelCorner, BODY_TEXT, HEADING_TEXT,
@@ -444,7 +444,9 @@ fn heading(category: BindingCategory, situation: &Situation, closed: Option<usiz
         (false, None, _) => label,
         (false, Some(under), _) => format!("{label} ({under})"),
         (true, Some(under), _) => format!("{label} (held, {under})"),
-        (true, None, Some(placing)) => format!("{label} (held) — {}", placing.label_over(situation.over)),
+        (true, None, Some(placing)) => {
+            format!("{label} (held) — {}", placing.label_over(situation.over))
+        }
         (true, None, None) => format!("{label} (held)"),
     }
 }
@@ -508,7 +510,7 @@ mod tests {
     use super::*;
     use crate::building::{Item, Port};
     use crate::input::{PlayerInput, TURN_KEY};
-    use crate::map::{Deposit, RawMaterial};
+    use crate::map::{Deposit, HexCoordinates, MapTile, RawMaterial};
     use crate::testing::{ask_for, headless_app, press_key, release_key, tick};
     use crate::ui::selection::Selection;
 
@@ -753,18 +755,22 @@ mod tests {
         app
     }
 
-    /// Put the cursor over a tile holding `material`, which is what an extractor is named for.
-    fn point_at_a_deposit(app: &mut App, material: RawMaterial) {
+    /// Put the cursor over a tile holding `material`, which is the ground an extractor is named
+    /// for.
+    fn point_at_ground(app: &mut App, material: Option<RawMaterial>) {
         let tile = app
             .world_mut()
-            .spawn(Deposit {
-                material,
-                richness: 1,
+            .spawn(MapTile {
+                coordinates: HexCoordinates::from_offset_row(0, 0),
             })
             .id();
-        app.world_mut()
-            .resource_mut::<PlayerInput>()
-            .cursor_tile = Some(tile);
+        if let Some(material) = material {
+            app.world_mut().entity_mut(tile).insert(Deposit {
+                material,
+                richness: 1,
+            });
+        }
+        app.world_mut().resource_mut::<PlayerInput>().cursor_tile = Some(tile);
     }
 
     #[test]
@@ -773,7 +779,7 @@ mod tests {
         tick(&mut app);
         show_a_legend(&mut app);
 
-        point_at_a_deposit(&mut app, RawMaterial::CobaltOre);
+        point_at_ground(&mut app, Some(RawMaterial::CobaltOre));
         tick(&mut app);
 
         let legend = shown_legend(&mut app);
@@ -785,6 +791,9 @@ mod tests {
         let mut app = building_legend_app();
         tick(&mut app);
         show_a_legend(&mut app);
+
+        point_at_ground(&mut app, None);
+        tick(&mut app);
 
         let legend = shown_legend(&mut app);
 
