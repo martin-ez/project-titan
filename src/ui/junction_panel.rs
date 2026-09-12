@@ -310,12 +310,12 @@ mod tests {
     fn click_at(app: &mut App, point: Vec3) {
         {
             let mut input = app.world_mut().resource_mut::<PlayerInput>();
-            input.tap = true;
+            input.tap(true);
             input.cursor_tile = None;
             input.world_cursor_position = Some(point);
         }
         tick(app);
-        app.world_mut().resource_mut::<PlayerInput>().tap = false;
+        app.world_mut().resource_mut::<PlayerInput>().tap(false);
     }
 
     fn the_junction(app: &mut App) -> (Entity, Vec3) {
