@@ -387,10 +387,10 @@ fn update_player_action(
 /// The cursor points nowhere without a window to point in, and nowhere without a camera to point
 /// from, but a key and a click are still a key and a click: neither half stops the other.
 ///
-/// A node is named from where the ray meets the ground plane rather than from the surface it
-/// landed on. The lattice lies in that plane, and a point taken above it stands towards the camera
-/// of the node under it by the height it was taken at, which over a building is wider than a tile
-/// (invariant 3).
+/// A node is named from where the ray meets the ground plane, not from the surface it landed on.
+/// Both the lattice and a tile's own surface lie in that plane, while a point taken above it
+/// stands towards the camera of the node beneath by the height it was taken at — over a building,
+/// wider than a tile (invariant 3).
 fn update_player_input(
     mut player_input: ResMut<PlayerInput>,
     input: Res<ButtonInput<KeyCode>>,
@@ -514,7 +514,6 @@ mod tests {
     };
     use bevy::camera::RenderTargetInfo;
     use bevy::math::DVec2;
-    use std::f32::consts::FRAC_PI_2;
 
     const SURFACE_RADIUS: f32 = 10.;
     const WINDOW_SIZE: UVec2 = UVec2::new(1280, 720);
@@ -533,31 +532,14 @@ mod tests {
 
     /// An app whose cursor sits at the middle of the window, under a camera looking straight down.
     ///
-    /// A headless camera has no render target to size a viewport from, so the test gives it one.
-    /// The ray it casts through the middle of that viewport falls down the world's Y axis.
+    /// The ray it casts through the middle of that viewport falls down the world's Y axis, which
+    /// is a camera aimed at the origin from directly overhead.
     fn app_looking_down_at_the_origin() -> App {
-        let mut app = input_app();
-        let mut camera = Camera::default();
-        camera.computed.target_info = Some(RenderTargetInfo {
-            physical_size: WINDOW_SIZE,
-            scale_factor: 1.,
-        });
-        app.world_mut().spawn((
-            camera,
-            Camera3d::default(),
-            Transform::from_xyz(0., 50., 0.).with_rotation(Quat::from_rotation_x(-FRAC_PI_2)),
-        ));
-
-        let mut window = Window::default();
-        window.set_physical_cursor_position(Some(DVec2::new(
-            WINDOW_SIZE.x as f64 / 2.,
-            WINDOW_SIZE.y as f64 / 2.,
-        )));
-        app.world_mut().spawn(window);
-
-        tick(&mut app);
-        app
+        app_aimed_at(Vec3::ZERO, 0., STRAIGHT_DOWN)
     }
+
+    /// The pitch of a camera looking straight down, in degrees.
+    const STRAIGHT_DOWN: f32 = 90.;
 
     fn spawn_surface_of(app: &mut App, centre: Vec3, radius: f32, height: f32) -> Entity {
         app.world_mut()
@@ -984,6 +966,10 @@ mod tests {
     const TILE_RADIUS: f32 = MAP_TILE_SIZE / 2.;
 
     /// How far a building's surface stands above the tile it covers.
+    ///
+    /// The same height as the building plugin's own `BUILDING_HEIGHT`, which is private to it. The
+    /// displacement these tests are about is proportional to it, so they measure what the player
+    /// meets only while the two agree.
     const A_BUILDING_TALL: f32 = 4.;
 
     /// The pitch the camera starts on.
@@ -992,8 +978,8 @@ mod tests {
     /// How far back along its own forward the camera aiming fixture stands.
     const AIMED_FROM: f32 = 50.;
 
-    /// A turn of the camera in sixths, which carries each corner of a tile in turn to the far side.
-    const YAWS: [f32; 6] = [0., 60., 120., 180., 240., 300.];
+    /// The five facings a turn of the camera in sixths reaches besides the one it starts on.
+    const YAWS: [f32; 5] = [60., 120., 180., 240., 300.];
 
     /// Pitches spanning what the camera allows, the range itself being the camera's own to hold.
     const PITCHES: [f32; 3] = [20., 45., 89.];
@@ -1075,6 +1061,23 @@ mod tests {
                 "aiming at {corner:?} named another node"
             );
         }
+    }
+
+    /// The corner of `origin_tile()` that faces away from a camera at a yaw of zero.
+    const CORNER_FACING_AWAY: TileCorner = TileCorner::South;
+
+    #[test]
+    fn the_road_tool_settles_the_cursor_on_its_node_rather_than_over_it() {
+        let node = CORNER_FACING_AWAY.node_of(origin_tile());
+        let mut app = app_aimed_at(node.world_position(), 0., DEFAULT_PITCH);
+        spawn_a_building_on_the_tile_at(&mut app, CORNER_FACING_AWAY);
+
+        hold_tool(&mut app, tool_key(PlayerAction::EditRoads));
+
+        assert_lands_on(
+            player_input(&app).world_cursor_position,
+            node.world_position(),
+        );
     }
 
     #[test]
