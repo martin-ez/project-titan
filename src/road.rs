@@ -573,22 +573,50 @@ impl RoadNetwork<'_, '_> {
     /// serving the destination and short of where it stops has nothing to choose at all. Where no
     /// drivable way exists nothing comes back, rather than the part of one that does.
     pub fn fastest_way(&mut self, from: Entity, along: f32, to: Entity) -> Option<Vec<Entity>> {
+        match self.walk_to(from, along, to)? {
+            (_, None) => Some(Vec::new()),
+            (_, Some(arrived)) => Some(self.ways_out_to(arrived)),
+        }
+    }
+
+    /// How many ticks a rover standing `along` `from` spends driving to whatever serves `to`.
+    ///
+    /// The cost the search walked to find its way, rather than a second sum over the way it
+    /// found: what a route is costed at and which route is chosen are then one answer.
+    #[cfg(test)]
+    pub fn ticks_to_reach(&mut self, from: Entity, along: f32, to: Entity) -> Option<f32> {
+        self.walk_to(from, along, to).map(|(ticks, _)| ticks)
+    }
+
+    /// Walk to whatever serves `to`, for what it costs and the stretch a rover arrives on.
+    ///
+    /// Nothing comes back as the stretch where the rover is already standing on the one serving
+    /// the destination and short of where it stops, that being a journey with no junction in it.
+    fn walk_to(&mut self, from: Entity, along: f32, to: Entity) -> Option<(f32, Option<Entity>)> {
         let served = self
             .endpoints
             .get(to)
             .ok()
             .and_then(RoadEndpoint::served_by)?;
         let (setting_off, ..) = self.segments.get(from).ok()?;
+        let limit = setting_off.speed_limit();
+        let left_of_it = (setting_off.ends_at() - along).max(0.);
         if from == served.segment && along <= served.along {
-            return Some(Vec::new());
+            return Some(((served.along - along) / limit, None));
         }
 
         self.walked.clear();
         self.frontier.clear();
         self.sought.clear();
+        *self.reached_soonest = None;
+        self.sought.push(Sought {
+            segment: served.segment,
+            along: served.along,
+            rank: 0,
+            endpoint: to,
+        });
         let mut found = 0;
-        let left_of_it = (setting_off.ends_at() - along).max(0.);
-        let set_off = left_of_it / setting_off.speed_limit();
+        let set_off = left_of_it / limit;
         self.open(from, None, set_off, &mut found);
 
         while let Some(Reverse(reached)) = self.frontier.pop() {
@@ -600,7 +628,11 @@ impl RoadNetwork<'_, '_> {
             }
             step.expanded = true;
             if reached.segment == served.segment {
-                return Some(self.ways_out_to(reached.segment));
+                let arrived = self
+                    .reached_soonest
+                    .as_ref()
+                    .map_or(reached.cost, |arrival| arrival.cost);
+                return Some((arrived, Some(reached.segment)));
             }
             self.open(
                 reached.segment,
