@@ -1407,7 +1407,9 @@ impl Initialize<RoadInitializeParams<'_, '_>> for Road {
         if along.is_empty() {
             return Err("a road of no arcs".into());
         }
-        params.occupied.claim(*entity, tiles_walked_by(&along));
+        params
+            .occupied
+            .claim(*entity, tiles_walked_by(&self.nodes, &along));
         let forth = spawn_lane(&mut params.commands, *entity, &along)?;
         if self.one_way {
             return Ok(());
@@ -1433,15 +1435,23 @@ fn release_the_tiles_of_a_removed_road(removed: On<Remove, Road>, mut occupied: 
     occupied.release(removed.entity);
 }
 
-/// The tiles `arcs` run over, each of them reported once.
+/// The tiles the arcs through `nodes` run over, each of them reported once.
 ///
-/// Both ends of every arc are stood on exactly rather than merely walked near, so a road is always
-/// found under the tiles its own nodes stand on: a node is where one arc ends and the next begins.
-fn tiles_walked_by(arcs: &[Arc]) -> Vec<HexCoordinates> {
+/// A node is judged by its integers: a tile's middle stands on that tile, and a corner on none of
+/// the three sharing it, which rounding a point exactly on one would settle by float noise
+/// (invariant 3). Only the ground between two nodes is walked, and the stretch leaving a corner
+/// falls on a tile sharing it, so a road is still found under a tile sharing every node it has.
+fn tiles_walked_by(nodes: &[LatticeNode], arcs: &[Arc]) -> Vec<HexCoordinates> {
     let mut walked: Vec<HexCoordinates> = Vec::new();
-    for arc in arcs {
-        for at in walk_of(arc) {
-            let tile = HexCoordinates::from_world_position(arc.position(at));
+    for (arc, ends) in arcs.iter().zip(nodes.windows(2)) {
+        let between = walk_between_the_ends_of(arc)
+            .map(|at| HexCoordinates::from_world_position(arc.position(at)));
+        let tiles = ends[0]
+            .middle_of()
+            .into_iter()
+            .chain(between)
+            .chain(ends[1].middle_of());
+        for tile in tiles {
             if !walked.contains(&tile) {
                 walked.push(tile);
             }
@@ -1450,11 +1460,11 @@ fn tiles_walked_by(arcs: &[Arc]) -> Vec<HexCoordinates> {
     walked
 }
 
-/// How far along `arc` each place it is stood on stands, its far end included.
-fn walk_of(arc: &Arc) -> impl Iterator<Item = f32> {
+/// How far along `arc` each place strictly between its two ends stands, the ends being nodes.
+fn walk_between_the_ends_of(arc: &Arc) -> impl Iterator<Item = f32> {
     let length = arc.length;
     let steps = (length / TILE_SAMPLE_STEP).ceil().max(1.);
-    (0..=steps as usize).map(move |step| length * step as f32 / steps)
+    (1..steps as usize).map(move |step| length * step as f32 / steps)
 }
 
 /// The arcs running through `nodes`, each leaving the one before it at the same tangent.
@@ -1565,7 +1575,7 @@ fn place_a_node(
     };
 
     let Some(mut placing) = placing.iter_mut().next() else {
-        if stands_on_a_building(target.world_position(), &buildings) {
+        if a_building_stands_on(target, &buildings) {
             return;
         }
         commands.spawn(DrawnRoad {
@@ -1639,38 +1649,43 @@ fn proposed_arc(
     laid: &[Arc],
     crossings: &[Vec3],
 ) -> Option<Arc> {
-    let standing = placing.nodes.last()?.world_position();
-    let target = target.world_position();
+    let from = *placing.nodes.last()?;
+    let standing = from.world_position();
+    let reaching = target.world_position();
     let arcs = arcs_through(&placing.nodes, placing.leaving);
     let tangent = match arcs.last() {
         Some(arc) => arc.tangent_at(arc.length),
         None => placing
             .leaving
-            .unwrap_or_else(|| (target - standing).normalize_or_zero()),
+            .unwrap_or_else(|| (reaching - standing).normalize_or_zero()),
     };
 
-    let arc = Arc::through(standing, tangent, target);
+    let arc = Arc::through(standing, tangent, reaching);
     (arc.curvature.abs() * MIN_TURN_RADIUS <= 1.
-        && nothing_stands_under(&arc, buildings)
+        && nothing_stands_under([from, target], &arc, buildings)
         && leaves_room_for_its_turns(&arc, laid, crossings))
     .then_some(arc)
 }
 
-/// Whether the tiles `arc` would take are clear of buildings.
+/// Whether the tiles `arc` would take, running between the nodes `ends`, are clear of buildings.
 ///
 /// The arc is walked the way the tiles it claims are walked once it is laid, so what the road tool
 /// refuses and what the road would occupy are the same tiles rather than two measurements of it.
 /// It is asked of an arc that does not exist yet, which is why it walks one rather than reading a
 /// road's claim back.
-fn nothing_stands_under(arc: &Arc, buildings: &BuildingTiles) -> bool {
-    !walk_of(arc).any(|at| stands_on_a_building(arc.position(at), buildings))
+fn nothing_stands_under(ends: [LatticeNode; 2], arc: &Arc, buildings: &BuildingTiles) -> bool {
+    !tiles_walked_by(&ends, std::slice::from_ref(arc))
+        .into_iter()
+        .any(|tile| buildings.building_on(tile).is_some())
 }
 
-/// Whether a building stands on the tile `position` falls on.
-fn stands_on_a_building(position: Vec3, buildings: &BuildingTiles) -> bool {
-    buildings
-        .building_on(HexCoordinates::from_world_position(position))
-        .is_some()
+/// Whether a building stands on `node`, which only the middle of the tile it stands on can.
+///
+/// A corner is where a building's ports stand, shared by three tiles and the property of none,
+/// so it is judged by its integers rather than by the tile its position rounds to (invariant 3).
+fn a_building_stands_on(node: LatticeNode, buildings: &BuildingTiles) -> bool {
+    node.middle_of()
+        .is_some_and(|tile| buildings.building_on(tile).is_some())
 }
 
 /// The direction a road already at `node` sets off from it, where `node` is an end of one.
@@ -3949,7 +3964,7 @@ mod tests {
         assert_eq!(placing(&mut app), 0);
     }
 
-    /// The middle of a tile sharing `corner` of `BUILT_ON` that no building stands on.
+    /// The middle of a tile sharing `corner` of `BUILT_ON`, other than `BUILT_ON` itself.
     fn beside_the_building(corner: TileCorner) -> LatticeNode {
         corner
             .node_of(tile(BUILT_ON))
@@ -3995,6 +4010,32 @@ mod tests {
             .collect();
 
         assert!(refused.is_empty(), "no road could be laid onto {refused:?}");
+    }
+
+    #[test]
+    fn a_road_reaching_a_corner_of_a_tile_leaves_it_free_to_build_on() {
+        let refused: Vec<TileCorner> = TileCorner::ALL
+            .into_iter()
+            .filter(|&corner| {
+                let mut app = app_holding(PlayerAction::EditRoads);
+                place_road(
+                    &mut app,
+                    &[beside_the_building(corner), corner.node_of(tile(BUILT_ON))],
+                );
+
+                put_a_building_on(&mut app, BUILT_ON);
+
+                app.world()
+                    .resource::<BuildingTiles>()
+                    .building_on(tile(BUILT_ON))
+                    .is_none()
+            })
+            .collect();
+
+        assert!(
+            refused.is_empty(),
+            "a road reaching {refused:?} kept a building off the tile"
+        );
     }
 
     #[test]

@@ -1491,6 +1491,64 @@ mod tests {
         );
     }
 
+    /// Lay a road onto `node` from the middle of `from` with the road tool, the way a player
+    /// clicks one out, rather than writing it into the world behind the rules the tool keeps.
+    fn lay_road_with_the_tool(app: &mut App, from: HexCoordinates, node: LatticeNode) {
+        app.world_mut()
+            .resource_mut::<NextState<PlayerAction>>()
+            .set(PlayerAction::EditRoads);
+        tick(app);
+        for clicked in [LatticeNode::from_tile(from), node] {
+            {
+                let mut input = app.world_mut().resource_mut::<PlayerInput>();
+                input.cursor_node = Some(clicked);
+                input.tap(true);
+            }
+            tick(app);
+            app.world_mut().resource_mut::<PlayerInput>().tap(false);
+        }
+        app.world_mut().resource_mut::<PlayerInput>().finish(true);
+        tick(app);
+        app.world_mut().resource_mut::<PlayerInput>().finish(false);
+        tick(app);
+    }
+
+    #[test]
+    fn the_road_tool_serves_every_port_of_a_building_at_every_facing() {
+        let mut unserved = Vec::new();
+        for facing in 0..TileCorner::ALL.len() {
+            for flow in [Flow::Intake, Flow::Outlet] {
+                let mut app = building_app(PlayerAction::EditBuildings);
+                turn_the_tool(&mut app, facing);
+                let building = place_building_at(&mut app, MELTER, PORTED);
+                let port = port_of(&mut app, building, flow);
+                let node = app
+                    .world()
+                    .entity(port)
+                    .get::<RoadEndpoint>()
+                    .expect("a port stands on the road lattice")
+                    .standing_on();
+                let beside = node
+                    .tiles_sharing()
+                    .expect("a port stands on a corner")
+                    .into_iter()
+                    .find(|&sharing| sharing != tile_at(PORTED))
+                    .expect("a corner has a tile beside the building");
+
+                lay_road_with_the_tool(&mut app, beside, node);
+
+                if !is_served(&app, port) {
+                    unserved.push((facing, flow));
+                }
+            }
+        }
+
+        assert!(
+            unserved.is_empty(),
+            "the road tool left {unserved:?} off the network"
+        );
+    }
+
     /// How much a rover carries to a port in these tests.
     const LOAD: u32 = 3;
 
