@@ -75,6 +75,15 @@ pub enum RawMaterial {
 }
 
 impl RawMaterial {
+    /// Every material the ground holds, which is every material an extractor can be asked to draw.
+    pub const ALL: [Self; 5] = [
+        Self::Ice,
+        Self::CarbonMonoxide,
+        Self::Nitrogen,
+        Self::Silicon,
+        Self::CobaltOre,
+    ];
+
     /// What the player is told this material is called.
     pub fn name(self) -> &'static str {
         match self {

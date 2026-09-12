@@ -496,7 +496,8 @@ fn mouse_label(button: MouseButton) -> String {
 mod tests {
     use super::*;
     use crate::building::{Item, Port};
-    use crate::input::TURN_KEY;
+    use crate::input::{PlayerInput, TURN_KEY};
+    use crate::map::{Deposit, RawMaterial};
     use crate::testing::{ask_for, headless_app, press_key, release_key, tick};
     use crate::ui::selection::Selection;
 
@@ -728,6 +729,7 @@ mod tests {
         let mut app = headless_app();
         app.insert_state(PlayerAction::EditBuildings)
             .init_resource::<ChosenBuildingType>()
+            .insert_resource(PlayerInput::default())
             .add_plugins(LegendPlugin);
         declare(
             &mut app,
@@ -738,6 +740,47 @@ mod tests {
             }],
         );
         app
+    }
+
+    /// Put the cursor over a tile holding `material`, which is what an extractor is named for.
+    fn point_at_a_deposit(app: &mut App, material: RawMaterial) {
+        let tile = app
+            .world_mut()
+            .spawn(Deposit {
+                material,
+                richness: 1,
+            })
+            .id();
+        app.world_mut()
+            .resource_mut::<PlayerInput>()
+            .cursor_tile = Some(tile);
+    }
+
+    #[test]
+    fn the_legend_names_the_material_of_the_deposit_under_the_cursor() {
+        let mut app = building_legend_app();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        point_at_a_deposit(&mut app, RawMaterial::CobaltOre);
+        tick(&mut app);
+
+        let legend = shown_legend(&mut app);
+        assert!(legend.contains("Cobalt Ore Extractor"), "{legend}");
+    }
+
+    #[test]
+    fn the_legend_names_no_material_over_ground_holding_none() {
+        let mut app = building_legend_app();
+        tick(&mut app);
+        show_a_legend(&mut app);
+
+        let legend = shown_legend(&mut app);
+
+        assert!(legend.contains("Extractor"), "{legend}");
+        for material in RawMaterial::ALL {
+            assert!(!legend.contains(material.name()), "{legend}");
+        }
     }
 
     #[test]

@@ -1935,6 +1935,72 @@ mod tests {
         assert_eq!(buildings(&mut app), [HexCoordinates::from_offset_row(0, 0)]);
     }
 
+    /// Put the extractor the catalogue offers on a deposit of `material` at `offset`.
+    fn extract_from(app: &mut App, material: RawMaterial, offset: (i32, i32)) -> Entity {
+        choose(app, ICE_EXTRACTOR);
+        let tile = spawn_deposit_tile(app, offset.0, offset.1, material);
+        tap_on(app, Some(tile));
+        app.world()
+            .resource::<BuildingTiles>()
+            .building_on(tile_at(offset))
+            .expect("the tap placed a building")
+    }
+
+    /// What the ports `building` stands move one way, taken off the ports themselves.
+    fn items_at(app: &mut App, building: Entity, flow: Flow) -> Vec<Item> {
+        ports_of(app, building)
+            .into_iter()
+            .filter(|(port, _)| port.flow == flow)
+            .map(|(port, _)| port.item)
+            .collect()
+    }
+
+    #[test]
+    fn the_extractor_draws_the_material_of_the_deposit_it_stands_on() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+
+        let ice = extract_from(&mut app, RawMaterial::Ice, (0, 0));
+        let cobalt = extract_from(&mut app, RawMaterial::CobaltOre, (3, 0));
+
+        assert_eq!(
+            items_at(&mut app, ice, Flow::Outlet),
+            [Item::Raw(RawMaterial::Ice)]
+        );
+        assert_eq!(
+            items_at(&mut app, cobalt, Flow::Outlet),
+            [Item::Raw(RawMaterial::CobaltOre)]
+        );
+    }
+
+    /// The ticks `docs/production_tree.md` gives ice and cobalt ore, which are the two ends of the
+    /// range an extractor runs at.
+    const ICE_TICKS: u32 = 32;
+    const COBALT_ORE_TICKS: u32 = 256;
+
+    #[test]
+    fn the_extractor_runs_at_the_rate_of_the_material_it_drew() {
+        let mut app = building_app(PlayerAction::EditBuildings);
+
+        let ice = extract_from(&mut app, RawMaterial::Ice, (0, 0));
+        let cobalt = extract_from(&mut app, RawMaterial::CobaltOre, (3, 0));
+
+        assert_eq!(recipe_of(&app, ice).map(|it| it.ticks), Some(ICE_TICKS));
+        assert_eq!(
+            recipe_of(&app, cobalt).map(|it| it.ticks),
+            Some(COBALT_ORE_TICKS)
+        );
+    }
+
+    #[test]
+    fn the_catalogue_offers_one_extractor() {
+        let extractors = BuildingType::ALL
+            .iter()
+            .filter(|entry| matches!(entry, BuildingType::Extractor(_)))
+            .count();
+
+        assert_eq!(extractors, 1);
+    }
+
     /// What `kind` moves through its ports one way, taken off the ports it stands.
     fn items_through(kind: BuildingType, flow: Flow) -> Vec<Item> {
         kind.ports()
