@@ -286,7 +286,11 @@ impl LatticeNode {
         Some([sharing.next()?, sharing.next()?, sharing.next()?])
     }
 
-    fn middle_of(&self) -> Option<HexCoordinates> {
+    /// The tile this node is the middle of, or nothing when it is a corner.
+    ///
+    /// A corner belongs to none of the three tiles sharing it, so this is the one exact answer to
+    /// which tile a node stands on; rounding its world position settles a corner by float noise.
+    pub fn middle_of(&self) -> Option<HexCoordinates> {
         ((self.i - self.j).rem_euclid(3) == 0).then(|| HexCoordinates {
             q: (self.i - self.j) / 3,
             r: (self.i + 2 * self.j) / 3,
